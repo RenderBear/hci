@@ -24,14 +24,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from dhed.L0 import (
+from hce.L0 import (
     load_image,
     compute_l0_rgb,
     compute_interior,
 )
-from dhed.L1 import z_from_l0_harmonics, pad_for_patch_grid, run_l1
-from dhed.seed import RhoSeedModule
-from dhed.renderer import (
+from hce.L1 import z_from_l0_harmonics, pad_for_patch_grid, run_l1
+from hce.seed import RhoSeedModule
+from hce.renderer import (
     ModulationRenderer,
     compute_render_features,
     render_boundary_map_torch,

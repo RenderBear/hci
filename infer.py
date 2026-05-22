@@ -18,16 +18,16 @@ import torch
 from PIL import Image
 
 from params import L0, L1, RENDER, INFER, SEED
-from dhed.L0 import compute_l0_rgb, compute_interior
-from dhed.L1 import z_from_l0_harmonics, pad_for_patch_grid, run_l1
-from dhed.renderer import (
+from hce.L0 import compute_l0_rgb, compute_interior
+from hce.L1 import z_from_l0_harmonics, pad_for_patch_grid, run_l1
+from hce.renderer import (
     compute_render_features,
     render_boundary_map_torch,
     proj_to_device,
     ridge_nms,
     upgrade_renderer_state_dict,
 )
-from dhed.diagnostics_viz import (
+from hce.diagnostics_viz import (
     viz_infer_l0_pinwheel,
     viz_infer_l1_lambdas,
     viz_infer_cell_photo,
