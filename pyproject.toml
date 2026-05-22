@@ -1,5 +1,5 @@
 [project]
-name = "Distributed Harmonic Edge Detection"
+name = "dhed"
 version = "0.1.0"
 description = ""
 readme = "README.md"
