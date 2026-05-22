@@ -39,7 +39,7 @@ SEED = SimpleNamespace(
     ETA_RHO_INIT=0.1,
 )
 
-# ── Render: Gaussian-line splat + MLP thinning (see hce/renderer.py) ────────
+# ── Render: Gaussian-line splat + collinear coherence + thinning ─────────────
 RENDER = SimpleNamespace(
     CELL_HIDDEN=16,
     PIXEL_HIDDEN=6,
@@ -57,6 +57,10 @@ RENDER = SimpleNamespace(
     SMOOTH_SIGMA_INIT=2.0,
     SMOOTH_RADIUS=3,
     PRE_SMOOTH_RADIUS=3,
+    COL_RADIUS=12,
+    COL_K_BINS=24,
+    COL_SIGMA_D=None,       # default: R/2
+    COL_SIGMA_T=1.0,
 )
 
 # ── Training ─────────────────────────────────────────────────────────────────
