@@ -579,7 +579,6 @@ def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
         else:
             print(f"    {label}: |grad|={t.grad.abs().mean().item():.2e}")
     for label, t in (
-        ("sigma_perp", model.renderer._sigma_perp_raw),
         ("s_t", model.renderer.s_t),
         ("s_n", model.renderer.s_n),
     ):
@@ -659,12 +658,11 @@ def format_renderer_param_lines(r: ModulationRenderer, *, indent: str = "  ") ->
     n_th = sum(p.numel() for p in r.thinning.parameters())
     sig_d = r.col_sigma_d if r.col_sigma_d is not None else r.col_radius / 2.0
     return [
-        f"{indent}splat:  σ⊥={r.sigma_perp.item():.3f}  (softplus, px)",
+        f"{indent}harmonic-native:  h2m · gate(MLP)  (no Gaussian splat)",
         f"{indent}stencil spacings:  s_t={r.s_t.item():.3f}  s_n={r.s_n.item():.3f}",
-        f"{indent}thinning head:  16→12→1 MLP  ({n_th} params)  "
-        f"[+s_photo, h2m_lum, h2m_chr, κ_col]",
+        f"{indent}thinning head:  17→16→1 MLP  ({n_th} params)",
         f"{indent}collinear:  R={r.col_radius}  K={r.col_k_bins}  "
-        f"σ_d={sig_d:.1f}  σ_t={r.col_sigma_t:.1f}  (fixed kernels)",
+        f"σ_d={sig_d:.1f}  σ_t={r.col_sigma_t:.1f}",
     ]
 
 
@@ -688,8 +686,8 @@ def format_model_param_counts(model: HarmonicContourE2E):
 def _format_render_params(model: HarmonicContourE2E):
     r = model.renderer
     n_r = sum(p.numel() for p in r.parameters())
-    return (f"renderer={n_r} params  (σ⊥, s_t, s_n, thinning 16→12→1, "
-            f"collinear R={r.col_radius} K={r.col_k_bins})")
+    return (f"renderer={n_r} params  (harmonic-native, s_t, s_n, "
+            f"thinning 17→16→1, collinear R={r.col_radius})")
 
 
 def save_checkpoint(model, path):
@@ -777,8 +775,8 @@ def main():
         f"ρ = NR_pool(λ₁/(z₀+η_z)) × tile_interior  (learned η_z, η_ρ; no dynamics)"
     )
     print(
-        f"Render: Gaussian-line splat + collinear coherence (R={RENDER.COL_RADIUS}, "
-        f"K={RENDER.COL_K_BINS}) + photometric thinning 16→12→1"
+        f"Render: harmonic-native h2m·gate + collinear coherence "
+        f"(R={RENDER.COL_RADIUS}, K={RENDER.COL_K_BINS})"
     )
     print(
         f"Loss: λ_dice·soft-Dice + λ_bce·BCE (η± edge band)  "

@@ -1,26 +1,30 @@
-r"""Renderer — Gaussian-line splat + collinear coherence + photometric thinning.
+r"""Renderer — harmonic-native gating + collinear coherence.
 
 Pipeline:
-  1. Cell grid: ρ-weighted θ combing → ρ-gated anchor smoothing.
-  2. Collinear coherence κ_col on cell grid (binned-θ conv, radius R).  (NEW)
-  3. Gaussian-line splat of ρ★ → ρ̄(p), θ★(p).
-  4. Splat s_photo, κ_col to pixel resolution.
-  5. Per-pixel feature vector F_p ∈ R¹⁶:
-       [ρ̄, s̄_photo, h2m_lum, h2m_chr, κ̄_col, coh, tang5(5), norm5(5)]
-  6. Thinning head: B̂(p) = ρ̄(p) · σ(W₂ ReLU(W₁ F_p + b₁) + b₂).
-     16→12→1 MLP with structural priors.
+  1. Cell grid: ρ-weighted θ combing (unchanged).
+  2. Collinear coherence κ_col on cell grid (binned-θ conv, radius R).
+  3. Bilinear interpolation of cell-grid fields (ρ, θ, κ_col, s_photo,
+     coh) to pixel coordinates — no scatter-add splat.
+  4. Per-pixel feature vector F_p ∈ R¹⁷:
+       [h2m_lum, h2m_chr, ρ̄, θ̄_cos2, θ̄_sin2, κ̄_col, s̄_photo, coh,
+        tang5(5), norm5(5)]
+     where tang5/norm5 are sampled from h2m (pixel-native), not from a
+     splatted ρ̄ field.
+  5. Thinning head: B̂(p) = h2m(p) · σ(W₂ ReLU(W₁ F_p + b₁) + b₂).
+     17→16→1 MLP.
 
-Collinear coherence (Step 2):
-  For each cell c, measure orientation agreement with cells along c's
-  tangent direction within radius R on the cell grid.  θ is quantized
-  into K bins; each bin has a precomputed (2R+1)² kernel encoding
-  Gaussian distance weighting × Gaussian tangent-line selectivity.
-  Two convolutions per bin (cos2θ, sin2θ channels) → per-cell κ_col.
-  Reinforces straight co-oriented edges; suppresses isolated/noisy cells.
+The edge map is the pixel-native second-harmonic magnitude h2m, gated
+by the thinning MLP.  Cell-grid features inform the gate via bilinear
+interpolation (F.grid_sample) instead of Gaussian scatter-add.  This
+eliminates the cell-grid staircase artifacts that plagued the splat
+renderer.
 
-Learned: σ⊥ (1), s_t (1), s_n (1), ThinningHead 16→12→1 (217 params).
-Fixed: collinear kernels (precomputed from R, σ_d, σ_t, K).
-Total: 220 learned scalars.
+Collinear coherence is unchanged: binned-θ convolution on the cell
+grid with Gaussian distance × tangent-selectivity kernels.
+
+Learned: s_t (1), s_n (1), ThinningHead 17→16→1 (17·16+16 + 16·1+1 = 305).
+Fixed: collinear kernels.
+Total: 307 learned scalars.
 """
 
 from __future__ import annotations
@@ -48,7 +52,7 @@ _SPLAT_HALF_W_PERP = getattr(RENDER, "SPLAT_HALF_W_PERP", 3)
 # Collinear coherence defaults
 _COL_RADIUS = getattr(RENDER, "COL_RADIUS", 5)
 _COL_K_BINS = getattr(RENDER, "COL_K_BINS", 24)
-_COL_SIGMA_D = getattr(RENDER, "COL_SIGMA_D", None)   # default: R/2
+_COL_SIGMA_D = getattr(RENDER, "COL_SIGMA_D", None)
 _COL_SIGMA_T = getattr(RENDER, "COL_SIGMA_T", 1.0)
 
 
@@ -57,7 +61,7 @@ def _inv_softplus(x: float) -> float:
 
 
 # ═══════════════════════════════════════════════════════════════
-# Cell-grid smoothing  (unchanged)
+# Cell-grid θ combing (unchanged)
 # ═══════════════════════════════════════════════════════════════
 
 def _smooth_theta_rho_double_angle(
@@ -90,66 +94,24 @@ def _smooth_theta_rho_double_angle(
     return th
 
 
-def _smooth_anchors_rho_gated(
-    cx: torch.Tensor, cy: torch.Tensor,
-    theta: torch.Tensor, rho: torch.Tensor,
-    is_border: torch.Tensor,
-    nH: int, nW: int, eps: float = 1e-6,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    cx_g, cy_g = cx.reshape(nH, nW), cy.reshape(nH, nW)
-    th_g, rh_g = theta.reshape(nH, nW), rho.reshape(nH, nW)
-    ib = is_border.reshape(nH, nW)
-    pad = lambda t: F.pad(t[None, None], (1, 1, 1, 1)).squeeze(0).squeeze(0)
-    cx_p, cy_p, th_p, rh_p = pad(cx_g), pad(cy_g), pad(th_g), pad(rh_g)
-    sum_wcx = torch.zeros_like(cx_g)
-    sum_wcy = torch.zeros_like(cy_g)
-    sum_w = torch.zeros_like(cx_g)
-    for dy in (-1, 0, 1):
-        for dx in (-1, 0, 1):
-            s = slice(1 + dy, 1 + dy + nH), slice(1 + dx, 1 + dx + nW)
-            gate = torch.cos(2.0 * (th_p[s] - th_g)).pow(2)
-            w = rh_p[s] * gate
-            sum_wcx += w * cx_p[s]
-            sum_wcy += w * cy_p[s]
-            sum_w += w
-    fallback = sum_w < 0.5 * rh_g.clamp_min(0.0)
-    cx_new = torch.where(fallback | ib, cx_g, sum_wcx / sum_w.clamp_min(eps))
-    cy_new = torch.where(fallback | ib, cy_g, sum_wcy / sum_w.clamp_min(eps))
-    return cx_new.reshape(-1), cy_new.reshape(-1)
-
-
 # ═══════════════════════════════════════════════════════════════
 # Collinear coherence (binned-θ convolution on cell grid)
 # ═══════════════════════════════════════════════════════════════
 
 def _build_collinear_kernels(
-    R: int,
-    K: int,
-    sigma_d: float | None,
-    sigma_t: float,
-    device: torch.device,
-    dtype: torch.dtype = torch.float32,
+    R: int, K: int, sigma_d: float | None, sigma_t: float,
+    device: torch.device, dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Precompute K kernels of shape (2R+1, 2R+1).
-
-    For bin k with angle θ_k = k·π/K:
-      W_k(di, dj) = w_d(di,dj) · w_t(di,dj; θ_k)
-      w_d = exp(-(di²+dj²) / 2σ_d²)
-      w_t = exp(-d_perp² / 2σ_t²)   where d_perp = dj·cos(θ_k) - di·sin(θ_k)
-
-    Centre pixel (0,0) is excluded (self not counted).
-
     Returns: (K, 1, 2R+1, 2R+1) ready for F.conv2d.
     """
     if sigma_d is None:
         sigma_d = max(R / 2.0, 0.5)
     offsets = torch.arange(-R, R + 1, device=device, dtype=dtype)
-    di, dj = torch.meshgrid(offsets, offsets, indexing="ij")  # (2R+1, 2R+1)
+    di, dj = torch.meshgrid(offsets, offsets, indexing="ij")
     dist_sq = di * di + dj * dj
     w_d = torch.exp(-dist_sq / (2.0 * sigma_d * sigma_d))
-    # Zero the centre
     w_d[R, R] = 0.0
-    # Zero outside radius
     w_d[dist_sq > R * R] = 0.0
 
     kernels = torch.zeros(K, 2 * R + 1, 2 * R + 1, device=device, dtype=dtype)
@@ -158,8 +120,7 @@ def _build_collinear_kernels(
         d_perp = dj * math.cos(theta_k) - di * math.sin(theta_k)
         w_t = torch.exp(-d_perp * d_perp / (2.0 * sigma_t * sigma_t))
         kernels[k] = w_d * w_t
-
-    return kernels.unsqueeze(1)  # (K, 1, 2R+1, 2R+1)
+    return kernels.unsqueeze(1)
 
 
 def compute_collinear_coherence(
@@ -172,210 +133,89 @@ def compute_collinear_coherence(
     sigma_t: float = _COL_SIGMA_T,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Compute per-cell collinear coherence κ_col on the cell grid.
-
-    θ is quantized into K bins. For each bin, a precomputed (2R+1)²
-    kernel encodes distance × tangent-selectivity weighting.  The
-    double-angle fields ρ·cos(2θ) and ρ·sin(2θ) are convolved with
-    each bin's kernel; each cell reads from its θ-bin's output.
-
-    Args:
-        theta_grid: (nH, nW) orientations in [0, π)
-        rho_grid:   (nH, nW) cell strengths
-        is_border_grid: (nH, nW) bool
-        R, K, sigma_d, sigma_t: kernel parameters
-
-    Returns:
-        kappa_col: (nH, nW) collinear coherence in [0, 1]
-    """
+    """Per-cell collinear coherence κ_col ∈ [0, 1] on the cell grid."""
     device, dtype = theta_grid.device, theta_grid.dtype
     nH, nW = theta_grid.shape
 
-    # Mask borders
     rho_m = torch.where(is_border_grid, torch.zeros_like(rho_grid), rho_grid)
+    u = rho_m * torch.cos(2.0 * theta_grid)
+    v = rho_m * torch.sin(2.0 * theta_grid)
 
-    # Double-angle representation (handles π-periodicity)
-    u = rho_m * torch.cos(2.0 * theta_grid)  # ρ·cos(2θ)
-    v = rho_m * torch.sin(2.0 * theta_grid)  # ρ·sin(2θ)
-
-    # Build kernels: (K, 1, 2R+1, 2R+1)
     kernels = _build_collinear_kernels(R, K, sigma_d, sigma_t, device, dtype)
 
-    # Reshape for conv2d: (1, 1, nH, nW)
     u_4d = u.unsqueeze(0).unsqueeze(0)
     v_4d = v.unsqueeze(0).unsqueeze(0)
     rho_4d = rho_m.unsqueeze(0).unsqueeze(0)
 
-    # Convolve: each bin k gives the weighted sum over the neighborhood
-    # using that bin's tangent-selective kernel.
-    # Output: (1, K, nH, nW)
-    conv_u = F.conv2d(u_4d, kernels, padding=R)   # (1, K, nH, nW)
-    conv_v = F.conv2d(v_4d, kernels, padding=R)   # (1, K, nH, nW)
-    conv_rho = F.conv2d(rho_4d, kernels, padding=R)  # (1, K, nH, nW)
+    conv_u = F.conv2d(u_4d, kernels, padding=R)
+    conv_v = F.conv2d(v_4d, kernels, padding=R)
+    conv_rho = F.conv2d(rho_4d, kernels, padding=R)
 
-    # Assign each cell to its θ-bin
-    # θ ∈ [0, π) → bin index ∈ [0, K)
     bin_idx = ((theta_grid % math.pi) * (K / math.pi)).long().clamp(0, K - 1)
-    # (nH, nW)
-
-    # Gather from the K channels using each cell's bin index
-    # conv_u is (1, K, nH, nW), we need to pick channel bin_idx[i,j] at each (i,j)
-    bin_idx_4d = bin_idx.unsqueeze(0).unsqueeze(0)  # (1, 1, nH, nW)
-    sum_u = torch.gather(conv_u, 1, bin_idx_4d).squeeze(0).squeeze(0)  # (nH, nW)
+    bin_idx_4d = bin_idx.unsqueeze(0).unsqueeze(0)
+    sum_u = torch.gather(conv_u, 1, bin_idx_4d).squeeze(0).squeeze(0)
     sum_v = torch.gather(conv_v, 1, bin_idx_4d).squeeze(0).squeeze(0)
     sum_rho = torch.gather(conv_rho, 1, bin_idx_4d).squeeze(0).squeeze(0)
 
-    # κ_col = |weighted double-angle vector| / (weighted ρ sum)
-    # This measures how well neighbors along the tangent agree on orientation.
-    # |Σ w·ρ·exp(2iθ)| / Σ w·ρ  ∈ [0, 1]
     agreement_mag = (sum_u * sum_u + sum_v * sum_v).sqrt()
     kappa_col = agreement_mag / sum_rho.clamp_min(eps)
     kappa_col = kappa_col.clamp(0.0, 1.0)
-
-    # Zero borders
     kappa_col = torch.where(is_border_grid, torch.zeros_like(kappa_col), kappa_col)
-
     return kappa_col
 
 
 # ═══════════════════════════════════════════════════════════════
-# Gaussian-line splat (vectorized scatter_add) — unchanged
+# Bilinear interpolation: cell grid → pixel coordinates
 # ═══════════════════════════════════════════════════════════════
 
-def _gaussian_line_splat(
-    values: torch.Tensor,
-    cx: torch.Tensor, cy: torch.Tensor,
-    theta: torch.Tensor, is_border: torch.Tensor,
-    sigma_perp: torch.Tensor,
-    H: int, W: int, S: int,
-    radius_sigmas: float = _SPLAT_RADIUS_SIGMAS,
-    half_w_perp: int = _SPLAT_HALF_W_PERP,
-    eps: float = 1e-6,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Deposit values + compute dominant θ★ per pixel (scatter-max by ρ★φ).
-
-    Returns: (rho_bar, theta_star) both (H, W).
-    """
-    device, dtype = values.device, values.dtype
-    sig = sigma_perp.to(dtype=dtype, device=device).clamp(min=0.3, max=_SIGMA_PERP_MAX)
-    foot_r = max(int(math.ceil(radius_sigmas * S)), half_w_perp + 1)
-
-    active = (~is_border) & (values.abs() > eps)
-    active_idx = active.nonzero(as_tuple=True)[0]
-    A = active_idx.shape[0]
-    if A == 0:
-        return (torch.zeros(H, W, device=device, dtype=dtype),
-                torch.zeros(H, W, device=device, dtype=dtype))
-
-    val_a = values[active_idx]
-    cx_a, cy_a = cx[active_idx], cy[active_idx]
-    cos_a = torch.cos(theta[active_idx])
-    sin_a = torch.sin(theta[active_idx])
-    th_a = theta[active_idx]
-
-    offsets = torch.arange(-foot_r, foot_r + 1, device=device, dtype=dtype)
-    oy, ox = torch.meshgrid(offsets, offsets, indexing="ij")
-    oy, ox = oy.reshape(-1), ox.reshape(-1)
-    P = oy.shape[0]
-
-    sum_wv = torch.zeros(H * W, device=device, dtype=dtype)
-    sum_w = torch.zeros(H * W, device=device, dtype=dtype)
-    max_rho_phi = torch.full((H * W,), -1.0, device=device, dtype=dtype)
-    theta_star = torch.zeros(H * W, device=device, dtype=dtype)
-
-    max_batch = max(1, 4_000_000 // P)
-    for b0 in range(0, A, max_batch):
-        b1 = min(b0 + max_batch, A)
-        py_b = cy_a[b0:b1].unsqueeze(1) + oy.unsqueeze(0)
-        px_b = cx_a[b0:b1].unsqueeze(1) + ox.unsqueeze(0)
-        d_perp = (ox.unsqueeze(0) * cos_a[b0:b1].unsqueeze(1)
-                  - oy.unsqueeze(0) * sin_a[b0:b1].unsqueeze(1))
-        valid = ((py_b >= 0) & (py_b < H) &
-                 (px_b >= 0) & (px_b < W) &
-                 (d_perp.abs() <= (half_w_perp + 0.5)))
-        phi = torch.exp(-d_perp * d_perp / (2.0 * sig * sig + eps)) * valid.to(dtype=dtype)
-        flat_idx = (py_b.long() * W + px_b.long()).clamp(0, H * W - 1)
-        wv = val_a[b0:b1].unsqueeze(1) * phi
-        sum_wv.scatter_add_(0, flat_idx.reshape(-1), wv.reshape(-1))
-        sum_w.scatter_add_(0, flat_idx.reshape(-1), phi.reshape(-1))
-
-        rho_phi = val_a[b0:b1].unsqueeze(1) * phi
-        th_expand = th_a[b0:b1].unsqueeze(1).expand_as(rho_phi)
-        rp_flat = rho_phi.reshape(-1)
-        th_flat = th_expand.reshape(-1)
-        fi_flat = flat_idx.reshape(-1)
-        update = rp_flat > max_rho_phi[fi_flat]
-        update_idx = fi_flat[update]
-        if update_idx.numel() > 0:
-            max_rho_phi[update_idx] = rp_flat[update]
-            theta_star[update_idx] = th_flat[update]
-
-    rho_bar = (sum_wv / (sum_w + eps)).reshape(H, W)
-    return rho_bar, theta_star.reshape(H, W)
-
-
-# ═══════════════════════════════════════════════════════════════
-# Splat a scalar cell field to pixel resolution
-# ═══════════════════════════════════════════════════════════════
-
-def _splat_cell_scalar(
-    values: torch.Tensor,
-    cx: torch.Tensor, cy: torch.Tensor,
-    theta: torch.Tensor, is_border: torch.Tensor,
-    sigma_perp: torch.Tensor,
-    H: int, W: int, S: int,
-    radius_sigmas: float = _SPLAT_RADIUS_SIGMAS,
-    half_w_perp: int = _SPLAT_HALF_W_PERP,
-    eps: float = 1e-6,
+def _interp_cell_to_pixel(
+    field_grid: torch.Tensor,
+    nH: int, nW: int,
+    H: int, W: int,
+    S: int, P: int,
 ) -> torch.Tensor:
-    """Splat an arbitrary per-cell scalar to pixel grid (weighted average).
+    """Bilinear-interpolate a (nH, nW) or (nH, nW, C) cell-grid field
+    to (H, W) or (H, W, C) pixel resolution.
 
-    Returns: (H, W) field.
+    Cell centres sit at pixel coords (j*S + P/2, i*S + P/2).
     """
-    device, dtype = values.device, values.dtype
-    sig = sigma_perp.to(dtype=dtype, device=device).clamp(min=0.3, max=_SIGMA_PERP_MAX)
-    foot_r = max(int(math.ceil(radius_sigmas * S)), half_w_perp + 1)
+    device, dtype = field_grid.device, field_grid.dtype
+    half_P = P / 2.0
 
-    active = (~is_border) & (values.abs() > eps)
-    active_idx = active.nonzero(as_tuple=True)[0]
-    A = active_idx.shape[0]
-    if A == 0:
-        return torch.zeros(H, W, device=device, dtype=dtype)
+    if field_grid.ndim == 2:
+        field_4d = field_grid.unsqueeze(0).unsqueeze(0)  # (1,1,nH,nW)
+    else:
+        # (nH, nW, C) -> (1, C, nH, nW)
+        field_4d = field_grid.permute(2, 0, 1).unsqueeze(0)
 
-    val_a = values[active_idx]
-    cx_a, cy_a = cx[active_idx], cy[active_idx]
-    cos_a = torch.cos(theta[active_idx])
-    sin_a = torch.sin(theta[active_idx])
+    # Pixel coords -> normalised grid coords for grid_sample
+    # Cell i is at pixel y = i*S + half_P, cell j at pixel x = j*S + half_P
+    # grid_sample wants coords in [-1, 1]
+    py = torch.arange(H, device=device, dtype=dtype)
+    px = torch.arange(W, device=device, dtype=dtype)
+    gy, gx = torch.meshgrid(py, px, indexing="ij")
 
-    offsets = torch.arange(-foot_r, foot_r + 1, device=device, dtype=dtype)
-    oy, ox = torch.meshgrid(offsets, offsets, indexing="ij")
-    oy, ox = oy.reshape(-1), ox.reshape(-1)
-    P = oy.shape[0]
+    # Map pixel coords to cell-grid coords (fractional cell index)
+    cell_j = (gx - half_P) / max(S, 1)  # fractional column in cell grid
+    cell_i = (gy - half_P) / max(S, 1)  # fractional row in cell grid
 
-    sum_wv = torch.zeros(H * W, device=device, dtype=dtype)
-    sum_w = torch.zeros(H * W, device=device, dtype=dtype)
+    # Normalise to [-1, 1] for grid_sample (align_corners=True)
+    norm_x = 2.0 * cell_j / max(nW - 1, 1) - 1.0
+    norm_y = 2.0 * cell_i / max(nH - 1, 1) - 1.0
+    grid = torch.stack([norm_x, norm_y], dim=-1).unsqueeze(0)  # (1, H, W, 2)
 
-    max_batch = max(1, 4_000_000 // P)
-    for b0 in range(0, A, max_batch):
-        b1 = min(b0 + max_batch, A)
-        py_b = cy_a[b0:b1].unsqueeze(1) + oy.unsqueeze(0)
-        px_b = cx_a[b0:b1].unsqueeze(1) + ox.unsqueeze(0)
-        d_perp = (ox.unsqueeze(0) * cos_a[b0:b1].unsqueeze(1)
-                  - oy.unsqueeze(0) * sin_a[b0:b1].unsqueeze(1))
-        valid = ((py_b >= 0) & (py_b < H) &
-                 (px_b >= 0) & (px_b < W) &
-                 (d_perp.abs() <= (half_w_perp + 0.5)))
-        phi = torch.exp(-d_perp * d_perp / (2.0 * sig * sig + eps)) * valid.to(dtype=dtype)
-        flat_idx = (py_b.long() * W + px_b.long()).clamp(0, H * W - 1)
-        wv = val_a[b0:b1].unsqueeze(1) * phi
-        sum_wv.scatter_add_(0, flat_idx.reshape(-1), wv.reshape(-1))
-        sum_w.scatter_add_(0, flat_idx.reshape(-1), phi.reshape(-1))
+    out = F.grid_sample(
+        field_4d, grid, mode="bilinear", padding_mode="border", align_corners=True,
+    )
 
-    return (sum_wv / (sum_w + eps)).reshape(H, W)
+    if field_grid.ndim == 2:
+        return out.squeeze(0).squeeze(0)  # (H, W)
+    else:
+        return out.squeeze(0).permute(1, 2, 0)  # (H, W, C)
 
 
 # ═══════════════════════════════════════════════════════════════
-# Bilinear sampling for stencil taps  (unchanged)
+# Bilinear sampling for stencil taps
 # ═══════════════════════════════════════════════════════════════
 
 def _bilinear_sample_2d(
@@ -407,7 +247,7 @@ def _sample_stencil_5(
     sp = spacing.to(dtype=dtype, device=device)
     if direction == "tangent":
         dr, dc = torch.cos(theta), torch.sin(theta)
-    else:  # normal
+    else:
         dr, dc = -torch.sin(theta), torch.cos(theta)
     taps = []
     for k in range(-2, 3):
@@ -418,79 +258,17 @@ def _sample_stencil_5(
 
 
 # ═══════════════════════════════════════════════════════════════
-# Coherence diagnostic  (unchanged)
-# ═══════════════════════════════════════════════════════════════
-
-def _compute_coherence(
-    rho_bar: torch.Tensor,
-    theta_star: torch.Tensor,
-    values: torch.Tensor,
-    cx: torch.Tensor, cy: torch.Tensor,
-    theta: torch.Tensor, is_border: torch.Tensor,
-    sigma_perp: torch.Tensor,
-    H: int, W: int, S: int,
-    eps: float = 1e-6,
-) -> torch.Tensor:
-    """coh(p) = Σ_c ρ★_c cos²(θ_c − θ★_p) / (Σ_c ρ★_c + ε), within splat footprint."""
-    device, dtype = values.device, values.dtype
-    sig = sigma_perp.to(dtype=dtype, device=device).clamp(min=0.3, max=_SIGMA_PERP_MAX)
-    foot_r = max(int(math.ceil(_SPLAT_RADIUS_SIGMAS * S)), _SPLAT_HALF_W_PERP + 1)
-
-    active = (~is_border) & (values.abs() > eps)
-    active_idx = active.nonzero(as_tuple=True)[0]
-    A = active_idx.shape[0]
-    if A == 0:
-        return torch.zeros(H, W, device=device, dtype=dtype)
-
-    val_a = values[active_idx]
-    cx_a, cy_a = cx[active_idx], cy[active_idx]
-    cos_a = torch.cos(theta[active_idx])
-    sin_a = torch.sin(theta[active_idx])
-    th_a = theta[active_idx]
-
-    offsets = torch.arange(-foot_r, foot_r + 1, device=device, dtype=dtype)
-    oy, ox = torch.meshgrid(offsets, offsets, indexing="ij")
-    oy, ox = oy.reshape(-1), ox.reshape(-1)
-    P = oy.shape[0]
-
-    sum_rho_cos2 = torch.zeros(H * W, device=device, dtype=dtype)
-    sum_rho = torch.zeros(H * W, device=device, dtype=dtype)
-
-    max_batch = max(1, 4_000_000 // P)
-    for b0 in range(0, A, max_batch):
-        b1 = min(b0 + max_batch, A)
-        py_b = cy_a[b0:b1].unsqueeze(1) + oy.unsqueeze(0)
-        px_b = cx_a[b0:b1].unsqueeze(1) + ox.unsqueeze(0)
-        d_perp = (ox.unsqueeze(0) * cos_a[b0:b1].unsqueeze(1)
-                  - oy.unsqueeze(0) * sin_a[b0:b1].unsqueeze(1))
-        valid = ((py_b >= 0) & (py_b < H) &
-                 (px_b >= 0) & (px_b < W) &
-                 (d_perp.abs() <= (_SPLAT_HALF_W_PERP + 0.5)))
-        phi = torch.exp(-d_perp * d_perp / (2.0 * sig * sig + eps)) * valid.to(dtype=dtype)
-        flat_idx = (py_b.long() * W + px_b.long()).clamp(0, H * W - 1)
-
-        th_star_at_pix = theta_star.reshape(-1)[flat_idx]
-        cos2_diff = torch.cos(th_a[b0:b1].unsqueeze(1) - th_star_at_pix).pow(2)
-
-        rho_phi = val_a[b0:b1].unsqueeze(1) * phi
-        sum_rho_cos2.scatter_add_(0, flat_idx.reshape(-1), (rho_phi * cos2_diff).reshape(-1))
-        sum_rho.scatter_add_(0, flat_idx.reshape(-1), rho_phi.reshape(-1))
-
-    return (sum_rho_cos2 / (sum_rho + eps)).reshape(H, W)
-
-
-# ═══════════════════════════════════════════════════════════════
-# Thinning head (16 → 12 → 1 MLP)
+# Thinning head (17 → 16 → 1 MLP)
 # ═══════════════════════════════════════════════════════════════
 
 class ThinningHead(nn.Module):
-    """16→12→1 MLP: σ(W₂ ReLU(W₁ F + b₁) + b₂).
+    """17→16→1 MLP: σ(W₂ ReLU(W₁ F + b₁) + b₂).
 
-    F = [ρ̄, s̄_photo, h2m_lum, h2m_chr, κ̄_col, coh, tang5(5), norm5(5)] ∈ R¹⁶.
-    Initialised with structural priors.
+    F = [h2m_lum, h2m_chr, ρ̄, θ̄_cos2, θ̄_sin2, κ̄_col, s̄_photo,
+         tang5(5), norm5(5)] ∈ R¹⁷.
     """
 
-    def __init__(self, in_dim: int = 16, hidden: int = 12):
+    def __init__(self, in_dim: int = 17, hidden: int = 16):
         super().__init__()
         self.in_dim = in_dim
         self.hidden = hidden
@@ -504,56 +282,65 @@ class ThinningHead(nn.Module):
             self.fc1.bias.zero_()
             self.fc2.weight.zero_()
 
-            # Feature layout (in_dim=16):
-            #   0: ρ̄
-            #   1: s̄_photo
-            #   2: h2m_lum
-            #   3: h2m_chr
-            #   4: κ̄_col      (collinear coherence)
-            #   5: coh
-            #   6-10: tang5
-            #   11-15: norm5
+            # Feature layout (in_dim=17):
+            #   0: h2m_lum
+            #   1: h2m_chr
+            #   2: ρ̄  (interpolated from cell grid)
+            #   3: θ̄_cos2  (cos(2θ) interpolated)
+            #   4: θ̄_sin2  (sin(2θ) interpolated)
+            #   5: κ̄_col
+            #   6: s̄_photo
+            #   7-11: tang5 (on h2m)
+            #   12-16: norm5 (on h2m)
 
-            # Unit 0: Mexican-hat on norm5 (channels 11–15)
+            # Unit 0: Mexican-hat on norm5 (channels 12–16)
             mex_hat = torch.tensor([-0.25, -0.25, 1.0, -0.25, -0.25])
-            self.fc1.weight[0, 11:16] = mex_hat
+            self.fc1.weight[0, 12:17] = mex_hat
 
-            # Unit 0: flat smoothing on tang5 (channels 6–10)
-            self.fc1.weight[0, 6:11] = 0.2
+            # Unit 0: flat smoothing on tang5 (channels 7–11)
+            self.fc1.weight[0, 7:12] = 0.2
 
-            # Unit 1: s_photo × ρ̄ agreement
-            self.fc1.weight[1, 0] = 0.5   # ρ̄
-            self.fc1.weight[1, 1] = 0.5   # s̄_photo
+            # Unit 1: ρ̄ — cell-grid edge strength
+            self.fc1.weight[1, 2] = 1.0
 
-            # Unit 2: h2m evidence
-            self.fc1.weight[2, 2] = 0.5   # h2m_lum
-            self.fc1.weight[2, 3] = 0.5   # h2m_chr
+            # Unit 2: s_photo × ρ̄ agreement
+            self.fc1.weight[2, 2] = 0.5
+            self.fc1.weight[2, 6] = 0.5
 
-            # Unit 3: collinear coherence boosts confidence
-            self.fc1.weight[3, 4] = 1.0   # κ̄_col
+            # Unit 3: h2m evidence
+            self.fc1.weight[3, 0] = 0.5
+            self.fc1.weight[3, 1] = 0.5
 
-            # b₂ = 2 so σ(0 + 2) ≈ 0.88 — near-identity gate at t=0
+            # Unit 4: collinear coherence
+            self.fc1.weight[4, 5] = 1.0
+
+            # b₂ = 2 → σ(2) ≈ 0.88 near-identity gate at init
             self.fc2.bias.fill_(2.0)
-            self.fc2.weight[0, 1] = 0.3
-            self.fc2.weight[0, 2] = 0.2
-            self.fc2.weight[0, 3] = 0.3   # collinear unit gets positive weight
+            # Positive weights on ρ̄, photometry, collinear units
+            self.fc2.weight[0, 1] = 0.3  # ρ̄ unit
+            self.fc2.weight[0, 2] = 0.2  # s_photo unit
+            self.fc2.weight[0, 4] = 0.3  # collinear unit
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
-        """features: (N, 16). Returns: (N,) gate in (0, 1)."""
+        """features: (N, 17). Returns: (N,) gate in (0, 1)."""
         h = F.relu(self.fc1(features))
         return torch.sigmoid(self.fc2(h).squeeze(-1))
 
 
 # ═══════════════════════════════════════════════════════════════
-# ModulationRenderer
+# ModulationRenderer — harmonic-native
 # ═══════════════════════════════════════════════════════════════
 
 class ModulationRenderer(nn.Module):
-    """Gaussian splat + collinear coherence + photometric thinning.
+    """Harmonic-native renderer: h2m · gate(MLP(F_p)).
 
-    Learned: σ⊥ (1), s_t (1), s_n (1), ThinningHead 16→12→1 (217).
-    Fixed: collinear kernels (precomputed, not learned).
-    Total: 220 learned parameters.
+    No Gaussian scatter-add splat.  Cell-grid fields are bilinearly
+    interpolated to pixel coordinates via F.grid_sample.  The edge
+    map is the pixel-native h2m, gated by a per-pixel MLP.
+
+    Learned: s_t (1), s_n (1), ThinningHead 17→16→1 (305).
+    Fixed: collinear kernels.
+    Total: 307 learned scalars.
     """
 
     def __init__(
@@ -567,24 +354,19 @@ class ModulationRenderer(nn.Module):
     ):
         super().__init__()
         _ = (hidden, kwargs)
-        self._sigma_perp_raw = nn.Parameter(
-            torch.tensor(_inv_softplus(_SIGMA_PERP_INIT), dtype=torch.float32)
-        )
         self.s_t = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
         self.s_n = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
-        self.thinning = ThinningHead(in_dim=16, hidden=12)
+        self.thinning = ThinningHead(in_dim=17, hidden=16)
 
-        # Collinear coherence config (kernels built on first use)
         self.col_radius = col_radius
         self.col_k_bins = col_k_bins
         self.col_sigma_d = col_sigma_d
         self.col_sigma_t = col_sigma_t
 
+    # Legacy compat — code that reads sigma_perp for diagnostics
     @property
     def sigma_perp(self) -> torch.Tensor:
-        return F.softplus(self._sigma_perp_raw)
-
-    # Legacy compat
+        return torch.tensor(1.0, dtype=torch.float32)
     @property
     def sigma_par(self) -> torch.Tensor:
         return torch.zeros((), dtype=torch.float32)
@@ -599,8 +381,6 @@ class ModulationRenderer(nn.Module):
         return torch.zeros((), dtype=torch.float32)
     def pixel_map(self, profile: torch.Tensor) -> torch.Tensor:
         return torch.ones(profile.shape[0], device=profile.device, dtype=profile.dtype)
-
-    # Legacy compat for code that checks these
     @property
     def n_refine(self) -> int:
         return 0
@@ -613,18 +393,18 @@ class ModulationRenderer(nn.Module):
 
 
 def upgrade_renderer_state_dict(state_dict: dict, prefix: str = "") -> dict:
-    """Upgrade old 12→8→1 state dicts to new 16→12→1."""
+    """Best-effort upgrade from old splat-based state dicts."""
     remove = {
         f"{prefix}_sigma_par_raw",
         f"{prefix}_sigma_pre_raw",
         f"{prefix}_eta_h_raw",
         f"{prefix}_smooth_sigma_raw",
+        f"{prefix}_sigma_perp_raw",
         f"{prefix}perp_conv.conv.weight",
         f"{prefix}perp_conv.conv.bias",
         f"{prefix}perp_conv.fc.weight",
         f"{prefix}perp_conv.fc.bias",
     }
-    # Also strip old refine head keys if present
     remove_prefixes = (
         f"{prefix}refine_head.",
         f"{prefix}_alpha_refine_raw",
@@ -635,26 +415,26 @@ def upgrade_renderer_state_dict(state_dict: dict, prefix: str = "") -> dict:
             continue
         if any(k.startswith(rp) or k == rp for rp in remove_prefixes):
             continue
-        # Handle old thinning head dimensions (12→8→1 → 16→12→1)
-        if k == f"{prefix}thinning.fc1.weight" and v.shape == (8, 12):
-            new_w = torch.zeros(12, 16, dtype=v.dtype)
-            # old: [0=ρ̄, 1=coh, 2-6=tang5, 7-11=norm5]
-            # new: [0=ρ̄, 1=s_photo, 2=h2m_lum, 3=h2m_chr, 4=κ_col, 5=coh, 6-10=tang5, 11-15=norm5]
-            old_to_new = {0: 0, 1: 5, 2: 6, 3: 7, 4: 8, 5: 9, 6: 10, 7: 11, 8: 12, 9: 13, 10: 14, 11: 15}
-            for old_j, new_j in old_to_new.items():
-                new_w[:8, new_j] = v[:, old_j]
-            out[k] = new_w
-        elif k == f"{prefix}thinning.fc1.bias" and v.shape == (8,):
-            new_b = torch.zeros(12, dtype=v.dtype)
-            new_b[:8] = v
-            out[k] = new_b
-        elif k == f"{prefix}thinning.fc2.weight" and v.shape == (1, 8):
-            new_w = torch.zeros(1, 12, dtype=v.dtype)
-            new_w[0, :8] = v[0]
-            out[k] = new_w
-        else:
-            out[k] = v
+        # Old thinning dimensions don't map cleanly to the new layout;
+        # drop them and let the new priors take over.
+        if "thinning." in k and v.shape != _expected_shape(k):
+            continue
+        out[k] = v
     return out
+
+
+def _expected_shape(key: str):
+    """Expected shapes for the new 17→16→1 thinning head."""
+    shapes = {
+        "thinning.fc1.weight": (16, 17),
+        "thinning.fc1.bias": (16,),
+        "thinning.fc2.weight": (1, 16),
+        "thinning.fc2.bias": (1,),
+    }
+    for k, s in shapes.items():
+        if key.endswith(k):
+            return s
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -686,7 +466,6 @@ def _theta_on_branch(theta, branch_pick, n_cells, device):
 
 
 def _s_photo_on_branch(s_photo, branch_pick, n_cells, device):
-    """Select s_photo for chosen branch."""
     if branch_pick is not None:
         b = branch_pick.to(device=device, dtype=torch.long).view(-1)
         idx_n = torch.arange(n_cells, device=device, dtype=torch.long)
@@ -695,7 +474,7 @@ def _s_photo_on_branch(s_photo, branch_pick, n_cells, device):
 
 
 # ═══════════════════════════════════════════════════════════════
-# render_boundary_map_torch
+# render_boundary_map_torch — harmonic-native
 # ═══════════════════════════════════════════════════════════════
 
 def render_boundary_map_torch(
@@ -713,34 +492,26 @@ def render_boundary_map_torch(
     return_dominant_theta: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
 
-    _ = (training, )
+    _ = training
     H, W = proj_dev["H"], proj_dev["W"]
     device, dtype = rho_cell.device, rho_cell.dtype
-
-    if "cx_z2" not in cells_flat or "cy_z2" not in cells_flat:
-        raise ValueError("cells_flat must include cx_z2 and cy_z2")
 
     nH, nW = int(cells_flat["nH"]), int(cells_flat["nW"])
     n_cells = int(proj_dev["n_cells"])
     theta_all = cells_flat["theta"].to(device=device, dtype=dtype)
     theta_c = _theta_on_branch(theta_all, branch_pick, n_cells, device)
     S = int(cells_flat.get("S", max(1, W // max(nW, 1))))
+    P = int(cells_flat.get("P", S + (S - 1)))  # reconstruct P from context
 
-    # ── Step 1: Cell-grid operations ─────────────────────────
+    # ── Step 1: Cell-grid θ combing ──────────────────────────
     rho_grid = rho_cell.reshape(nH, nW).to(dtype=dtype)
     ib_grid = cells_flat["is_border"].to(device=device).reshape(nH, nW).bool()
-    theta_c = _smooth_theta_rho_double_angle(
+    theta_combed = _smooth_theta_rho_double_angle(
         theta_c.reshape(nH, nW), rho_grid, ib_grid, eps=eps,
-    ).reshape(-1)
-
-    cx = cells_flat["cx_z2"].to(device=device, dtype=dtype)
-    cy = cells_flat["cy_z2"].to(device=device, dtype=dtype)
-    rho_flat = rho_cell.reshape(-1).to(dtype=dtype)
-    is_border = cells_flat["is_border"].to(device=device).reshape(-1).bool()
-
-    _cx, _cy = _smooth_anchors_rho_gated(
-        cx, cy, theta_c, rho_flat, is_border, nH, nW, eps=eps,
     )
+
+    is_border = cells_flat["is_border"].to(device=device).reshape(-1).bool()
+    rho_flat = rho_cell.reshape(-1).to(dtype=dtype)
 
     active = (rho_flat > 0) & (~is_border)
     if not active.any().item():
@@ -750,11 +521,9 @@ def render_boundary_map_torch(
             return out, torch.zeros_like(out)
         return out
 
-    # ── Step 2: Collinear coherence on cell grid (NEW) ───────
-    #   Fixed geometric computation — detach to avoid gradient
-    #   flow through the conv kernels back into seed params.
+    # ── Step 2: Collinear coherence on cell grid ─────────────
     kappa_col_grid = compute_collinear_coherence(
-        theta_c.reshape(nH, nW).detach(),
+        theta_combed.detach(),
         rho_grid.detach(),
         ib_grid,
         R=renderer.col_radius,
@@ -763,83 +532,92 @@ def render_boundary_map_torch(
         sigma_t=renderer.col_sigma_t,
         eps=eps,
     )
-    kappa_col_flat = kappa_col_grid.reshape(-1)
 
-    cx_det, cy_det = _cx.detach(), _cy.detach()
-    theta_det = theta_c.detach()
-    rho_splat = torch.where(is_border, torch.zeros_like(rho_flat), rho_flat)
+    # ── Step 3: Interpolate cell-grid fields to pixel res ────
+    # Zero out border cells before interpolation
+    rho_grid_m = torch.where(ib_grid, torch.zeros_like(rho_grid), rho_grid)
+    theta_cos2 = torch.where(ib_grid, torch.zeros_like(theta_combed),
+                              rho_grid_m * torch.cos(2.0 * theta_combed))
+    theta_sin2 = torch.where(ib_grid, torch.zeros_like(theta_combed),
+                              rho_grid_m * torch.sin(2.0 * theta_combed))
 
-    # ── Step 3: Gaussian-line splat → ρ̄(p), θ★(p) ───────────
-    rho_bar, theta_star = _gaussian_line_splat(
-        rho_splat, cx_det, cy_det, theta_det, is_border,
-        sigma_perp=renderer.sigma_perp,
-        H=H, W=W, S=S, eps=eps,
-    )
-
-    # ── Step 4: Splat photometric + collinear fields to pixels ─
+    # s_photo on chosen branch
     has_s_photo = "s_photo" in cells_flat
     if has_s_photo:
         s_photo_all = cells_flat["s_photo"].to(device=device, dtype=dtype)
         s_photo_c = _s_photo_on_branch(s_photo_all, branch_pick, n_cells, device)
-        s_photo_splat = torch.where(is_border, torch.zeros_like(s_photo_c), s_photo_c)
-        s_photo_pix = _splat_cell_scalar(
-            s_photo_splat, cx_det, cy_det, theta_det, is_border,
-            sigma_perp=renderer.sigma_perp,
-            H=H, W=W, S=S, eps=eps,
+        s_photo_grid = torch.where(
+            ib_grid, torch.zeros(nH, nW, device=device, dtype=dtype),
+            s_photo_c.reshape(nH, nW),
         )
     else:
-        s_photo_pix = torch.zeros(H, W, device=device, dtype=dtype)
+        s_photo_grid = torch.zeros(nH, nW, device=device, dtype=dtype)
 
-    # Splat κ_col to pixel resolution
-    kappa_col_splat = torch.where(is_border, torch.zeros_like(kappa_col_flat), kappa_col_flat)
-    kappa_col_pix = _splat_cell_scalar(
-        kappa_col_splat, cx_det, cy_det, theta_det, is_border,
-        sigma_perp=renderer.sigma_perp,
-        H=H, W=W, S=S, eps=eps,
-    )
+    # Stack fields for a single grid_sample call: (nH, nW, C)
+    # channels: [ρ, cos2θ·ρ, sin2θ·ρ, κ_col, s_photo]
+    cell_stack = torch.stack([
+        rho_grid_m,
+        theta_cos2,
+        theta_sin2,
+        kappa_col_grid,
+        s_photo_grid,
+    ], dim=-1)  # (nH, nW, 5)
 
-    # Pixel-level h2m from L0 (already at pixel resolution)
+    pix_stack = _interp_cell_to_pixel(cell_stack, nH, nW, H, W, S, P)
+    # (H, W, 5)
+
+    rho_pix = pix_stack[..., 0]
+    # Recover θ from interpolated double-angle (handles π-wraparound)
+    cos2_pix = pix_stack[..., 1]
+    sin2_pix = pix_stack[..., 2]
+    # Normalise by interpolated ρ to get unit double-angle
+    rho_pix_safe = rho_pix.clamp_min(eps)
+    cos2_norm = cos2_pix / rho_pix_safe
+    sin2_norm = sin2_pix / rho_pix_safe
+    theta_pix = 0.5 * torch.atan2(sin2_norm, cos2_norm)
+
+    kappa_col_pix = pix_stack[..., 3]
+    s_photo_pix = pix_stack[..., 4]
+
+    # ── Step 4: Pixel-native h2m fields ──────────────────────
     if l0_pix is not None and "h2m_lum" in l0_pix:
-        h2m_lum_pix = l0_pix["h2m_lum"].to(device=device, dtype=dtype)
-        if h2m_lum_pix.shape != (H, W):
-            h2m_lum_pix = h2m_lum_pix[:H, :W]
+        h2m_lum = l0_pix["h2m_lum"].to(device=device, dtype=dtype)
+        if h2m_lum.shape != (H, W):
+            h2m_lum = h2m_lum[:H, :W]
     else:
-        h2m_lum_pix = torch.zeros(H, W, device=device, dtype=dtype)
+        h2m_lum = torch.zeros(H, W, device=device, dtype=dtype)
 
     if l0_pix is not None and "h2m_chr" in l0_pix:
-        h2m_chr_pix = l0_pix["h2m_chr"].to(device=device, dtype=dtype)
-        if h2m_chr_pix.shape != (H, W):
-            h2m_chr_pix = h2m_chr_pix[:H, :W]
+        h2m_chr = l0_pix["h2m_chr"].to(device=device, dtype=dtype)
+        if h2m_chr.shape != (H, W):
+            h2m_chr = h2m_chr[:H, :W]
     else:
-        h2m_chr_pix = torch.zeros(H, W, device=device, dtype=dtype)
+        h2m_chr = torch.zeros(H, W, device=device, dtype=dtype)
 
-    # ── Step 5: Coherence ────────────────────────────────────
-    coh = _compute_coherence(
-        rho_bar, theta_star,
-        rho_splat, cx_det, cy_det, theta_det, is_border,
-        renderer.sigma_perp, H, W, S, eps=eps,
-    )
+    # Combined h2m as the base edge signal (pixel-native, smooth)
+    h2m_combined = h2m_lum + h2m_chr
 
-    # ── Step 6: Feature vector F_p ∈ R¹⁶ ────────────────────
-    tang5 = _sample_stencil_5(rho_bar, theta_star, renderer.s_t, "tangent", eps)
-    norm5 = _sample_stencil_5(rho_bar, theta_star, renderer.s_n, "normal", eps)
+    # ── Step 5: Stencils on h2m (pixel-native, no staircase) ─
+    tang5 = _sample_stencil_5(h2m_combined, theta_pix, renderer.s_t, "tangent", eps)
+    norm5 = _sample_stencil_5(h2m_combined, theta_pix, renderer.s_n, "normal", eps)
 
-    # F_p = [ρ̄, s̄_photo, h2m_lum, h2m_chr, κ̄_col, coh, tang5(5), norm5(5)] ∈ R¹⁶
+    # ── Step 6: Feature vector F_p ∈ R¹⁷ ────────────────────
     features = torch.cat([
-        rho_bar.unsqueeze(-1),          # 0
-        s_photo_pix.unsqueeze(-1),      # 1
-        h2m_lum_pix.unsqueeze(-1),      # 2
-        h2m_chr_pix.unsqueeze(-1),      # 3
-        kappa_col_pix.unsqueeze(-1),    # 4  collinear coherence
-        coh.unsqueeze(-1),              # 5
-        tang5,                          # 6-10
-        norm5,                          # 11-15
-    ], dim=-1)  # (H, W, 16)
+        h2m_lum.unsqueeze(-1),          # 0
+        h2m_chr.unsqueeze(-1),          # 1
+        rho_pix.unsqueeze(-1),          # 2  (interpolated)
+        cos2_norm.unsqueeze(-1),        # 3  (interpolated double-angle)
+        sin2_norm.unsqueeze(-1),        # 4
+        kappa_col_pix.unsqueeze(-1),    # 5  (interpolated)
+        s_photo_pix.unsqueeze(-1),      # 6  (interpolated)
+        tang5,                          # 7-11
+        norm5,                          # 12-16
+    ], dim=-1)  # (H, W, 17)
 
-    # ── Step 7: Thinning head → B̂(p) = ρ̄(p) · gate(p) ──────
-    feat_flat = features.reshape(H * W, 16)
+    # ── Step 7: Thinning head → B̂(p) = h2m(p) · gate(p) ────
+    feat_flat = features.reshape(H * W, 17)
     gate = renderer.thinning(feat_flat).reshape(H, W)
-    bmap = rho_bar * gate
+    bmap = h2m_combined * gate
 
     # ── Crop ─────────────────────────────────────────────────
     ch = Hp if content_h is None else content_h
@@ -850,11 +628,11 @@ def render_boundary_map_torch(
         if ch < H: crop[ch:, :] = 0.0
         if cw < W: crop[:, cw:] = 0.0
         bmap = bmap * crop
-        theta_star = theta_star * crop
+        theta_pix = theta_pix * crop
 
     out = bmap[:Hp, :Wp]
     if return_dominant_theta:
-        return out, theta_star[:Hp, :Wp]
+        return out, theta_pix[:Hp, :Wp]
     return out
 
 
