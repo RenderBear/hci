@@ -39,7 +39,7 @@ SEED = SimpleNamespace(
     ETA_RHO_INIT=0.1,
 )
 
-# ── Render: Gaussian-line splat + MLP thinning (see hbd/renderer.py) ────────
+# ── Render: Gaussian-line splat + MLP thinning (see hce/renderer.py) ────────
 RENDER = SimpleNamespace(
     CELL_HIDDEN=16,
     PIXEL_HIDDEN=6,

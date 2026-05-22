@@ -657,11 +657,12 @@ def format_seed_param_lines(seed: RhoSeedModule, *, indent: str = "  ") -> list[
 
 def format_renderer_param_lines(r: ModulationRenderer, *, indent: str = "  ") -> list[str]:
     n_th = sum(p.numel() for p in r.thinning.parameters())
-    return [
+    lines = [
         f"{indent}splat:  σ⊥={r.sigma_perp.item():.3f}  (softplus, px)",
         f"{indent}stencil spacings:  s_t={r.s_t.item():.3f}  s_n={r.s_n.item():.3f}",
-        f"{indent}thinning head:  12→8→1 MLP  ({n_th} params)",
+        f"{indent}thinning head:  16→12→1 MLP  ({n_th} params)  [+s_photo, h2m_lum, h2m_chr]",
     ]
+    return lines
 
 
 def _format_seed_block(model: HarmonicContourE2E) -> str:
@@ -684,7 +685,7 @@ def format_model_param_counts(model: HarmonicContourE2E):
 def _format_render_params(model: HarmonicContourE2E):
     r = model.renderer
     n_r = sum(p.numel() for p in r.parameters())
-    return f"renderer={n_r} params  (σ⊥, s_t, s_n, thinning 12→8→1)"
+    return f"renderer={n_r} params  (σ⊥, s_t, s_n, thinning 16→12→1)"
 
 
 def save_checkpoint(model, path):
@@ -772,8 +773,8 @@ def main():
         f"ρ = NR_pool(λ₁/(z₀+η_z)) × tile_interior  (learned η_z, η_ρ; no dynamics)"
     )
     print(
-        f"Render: Gaussian-line splat + MLP thinning gate (paper §2.5; "
-        f"see hbd/renderer.py)"
+        "Render: Gaussian-line splat + photometric thinning 16→12→1  "
+        "(see hce/renderer.py)"
     )
     print(
         f"Loss: λ_dice·soft-Dice + λ_bce·BCE (η± edge band)  "

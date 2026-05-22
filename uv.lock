@@ -238,31 +238,6 @@ wheels = [
 ]
 
 [[package]]
-name = "dhed"
-version = "0.1.0"
-source = { virtual = "." }
-dependencies = [
-    { name = "kagglehub" },
-    { name = "matplotlib" },
-    { name = "numpy" },
-    { name = "pillow" },
-    { name = "pyyaml" },
-    { name = "scipy" },
-    { name = "torch" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "kagglehub", specifier = "==1.0.0" },
-    { name = "matplotlib", specifier = ">=3.10.8" },
-    { name = "numpy", specifier = ">=2.0.0" },
-    { name = "pillow", specifier = ">=12.1.0" },
-    { name = "pyyaml", specifier = ">=6.0.0" },
-    { name = "scipy", specifier = ">=1.17.1" },
-    { name = "torch", specifier = ">=2.11.0" },
-]
-
-[[package]]
 name = "filelock"
 version = "3.25.2"
 source = { registry = "https://pypi.org/simple" }
@@ -319,6 +294,31 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/e1/cf/b50ddf667c15276a9ab15a70ef5f257564de271957933ffea49d2cdbcdfb/fsspec-2026.3.0.tar.gz", hash = "sha256:1ee6a0e28677557f8c2f994e3eea77db6392b4de9cd1f5d7a9e87a0ae9d01b41", size = 313547, upload-time = "2026-03-27T19:11:14.892Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d5/1f/5f4a3cd9e4440e9d9bc78ad0a91a1c8d46b4d429d5239ebe6793c9fe5c41/fsspec-2026.3.0-py3-none-any.whl", hash = "sha256:d2ceafaad1b3457968ed14efa28798162f1638dbb5d2a6868a2db002a5ee39a4", size = 202595, upload-time = "2026-03-27T19:11:13.595Z" },
+]
+
+[[package]]
+name = "hce"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "kagglehub" },
+    { name = "matplotlib" },
+    { name = "numpy" },
+    { name = "pillow" },
+    { name = "pyyaml" },
+    { name = "scipy" },
+    { name = "torch" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "kagglehub", specifier = "==1.0.0" },
+    { name = "matplotlib", specifier = ">=3.10.8" },
+    { name = "numpy", specifier = ">=2.0.0" },
+    { name = "pillow", specifier = ">=12.1.0" },
+    { name = "pyyaml", specifier = ">=6.0.0" },
+    { name = "scipy", specifier = ">=1.17.1" },
+    { name = "torch", specifier = ">=2.11.0" },
 ]
 
 [[package]]
