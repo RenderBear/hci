@@ -1,4 +1,4 @@
-# HCE renderer — equations
+# HCI renderer — equations
 
 ## Overview
 
@@ -82,7 +82,7 @@ $$
 
 ## Seed — cell strength from $\lambda_1$ (learned $\eta_z$; optional NR pool)
 
-**Implemented in** `hce/seed.py` (`RhoSeedModule`).
+**Implemented in** `hci/seed.py` (`RhoSeedModule`).
 
 Raw ratio (per cell, border cells forced to $0$):
 

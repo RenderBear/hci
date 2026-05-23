@@ -1,5 +1,5 @@
 [project]
-name = "hce"
+name = "hci"
 version = "0.1.0"
 description = "Harmonic Contour Extraction"
 readme = "README.md"
