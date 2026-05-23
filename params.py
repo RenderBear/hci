@@ -56,8 +56,8 @@ TRAIN = SimpleNamespace(
     BATCH_SIZE=8,
     GRAD_CLIP=1.0,
     NUM_WORKERS=2,
-    LAM_DICE=1.0,
-    LAM_BCE=0.0,
+    LAM_DICE=0.0,
+    LAM_BCE=1.0,
     CACHE_VERSION=9,
 )
 
