@@ -167,22 +167,29 @@ def compute_collinear_coherence(
     sigma_d: float | None = _COL_SIGMA_D,
     sigma_t: float = _COL_SIGMA_T,
     n_passes: int = _COL_PASSES,
+    nr_pool_radius: int | None = None,  # unused, kept for API compat
     eps: float = 1e-6,
     rho_snapshots_t_after: set[int] | frozenset[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict[int, torch.Tensor]]:
-    """Recurrent V1-style collinear facilitation + cross-orientation suppression.
+    """Recurrent V1-style collinear facilitation with GABA-budget normalization.
 
     Each pass:
-      1. Convolve ρ·cos2θ, ρ·sin2θ, ρ with K tangent-selective kernels.
-      2. Each cell reads its own θ-bin (collinear) and the orthogonal bin
-         (cross-oriented).
-      3. κ_col = collinear_energy / (collinear + cross + ε)    (Naka–Rushton)
-      4. ρ ← ρ · κ_col                                         (modulate)
-      5. Feed updated ρ into next pass.
+      1. Convolve ρ·cos2θ, ρ·sin2θ with K tangent-selective kernels.
+      2. Each cell reads its own θ-bin (collinear energy E_col).
+      3. Compute total oriented energy across ALL K bins (E_total).
+      4. κ = E_col / (E_total + ε)          (GABA budget)
+      5. ρ ← ρ · κ                           (modulate)
+      6. Feed updated ρ into next pass.
 
-    After n_passes, collinear facilitation has propagated along contours
-    (effective range ≈ n_passes × R) and cross-oriented cells have been
-    suppressed at each step.
+    The GABA budget replaces both the old col-vs-cross gating and the
+    separate NR pool in a single normalization.  The denominator is the
+    total oriented energy summed over all K angle bins — untuned
+    inhibition, matching V1 GABAergic interneuron pooling.
+
+    A cell on a clean edge has most energy in its own bin → κ ≈ 1.
+    A cell in texture has energy spread across many bins → κ ≈ 1/K.
+    No separate NR pool needed — the energy budget is self-stabilizing
+    across iterations because the denominator scales with ρ.
 
     Args:
         theta_grid: (nH, nW) combed orientations
@@ -206,10 +213,6 @@ def compute_collinear_coherence(
     # Bin assignments (fixed across passes — θ doesn't change)
     bin_idx = ((theta_grid % math.pi) * (K / math.pi)).long().clamp(0, K - 1)
     bin_idx_4d = bin_idx.unsqueeze(0).unsqueeze(0)  # (1, 1, nH, nW)
-
-    # Orthogonal bin: offset by K/2 (90°)
-    bin_idx_cross = (bin_idx + K // 2) % K
-    bin_idx_cross_4d = bin_idx_cross.unsqueeze(0).unsqueeze(0)
 
     rho_m = torch.where(is_border_grid, torch.zeros_like(rho_grid), rho_grid)
     kappa_col = torch.zeros_like(rho_m)
@@ -236,43 +239,41 @@ def compute_collinear_coherence(
 
         u_4d = u.unsqueeze(0).unsqueeze(0)
         v_4d = v.unsqueeze(0).unsqueeze(0)
-        rho_4d = rho_m.unsqueeze(0).unsqueeze(0)
 
-        # Convolve with all K kernels
-        conv_u = F.conv2d(u_4d, kernels, padding=R)    # (1, K, nH, nW)
-        conv_v = F.conv2d(v_4d, kernels, padding=R)    # (1, K, nH, nW)
-        conv_rho = F.conv2d(rho_4d, kernels, padding=R) # (1, K, nH, nW)
+        # Convolve with all K kernels: (1, K, nH, nW)
+        conv_u = F.conv2d(u_4d, kernels, padding=R)
+        conv_v = F.conv2d(v_4d, kernels, padding=R)
 
-        # Collinear: gather from own θ-bin
+        # Collinear energy: gather from own θ-bin, project onto cell's orientation
         su_col = torch.gather(conv_u, 1, bin_idx_4d).squeeze(0).squeeze(0)
         sv_col = torch.gather(conv_v, 1, bin_idx_4d).squeeze(0).squeeze(0)
-        sr_col = torch.gather(conv_rho, 1, bin_idx_4d).squeeze(0).squeeze(0)
-
-        # Cross-oriented: gather from orthogonal bin
-        su_cross = torch.gather(conv_u, 1, bin_idx_cross_4d).squeeze(0).squeeze(0)
-        sv_cross = torch.gather(conv_v, 1, bin_idx_cross_4d).squeeze(0).squeeze(0)
-        sr_cross = torch.gather(conv_rho, 1, bin_idx_cross_4d).squeeze(0).squeeze(0)
-
-        # Project neighbor energy onto cell's own orientation:
-        #   col_energy = (Σ_col w·ρ·cos2θ') · cos2θ_c + (Σ_col w·ρ·sin2θ') · sin2θ_c
-        #              = Σ_col w·ρ·cos(2(θ' - θ_c))
-        # This is positive when neighbors agree, near-zero when they disagree.
-        # Clamp to ≥ 0 since negative means anti-aligned (which is same edge, π away).
         col_proj = (su_col * c2 + sv_col * s2).clamp_min(0.0)
 
-        # Cross energy: project onto orthogonal direction
-        #   cross_proj = -su_cross·sin2θ_c + sv_cross·cos2θ_c
-        #              = Σ_cross w·ρ·sin(2(θ' - θ_c))
-        # Take abs since cross-orientation can be ±90°
-        cross_proj = (sv_cross * c2 - su_cross * s2).abs()
+        # GABA budget: total ρ pooled across all K bins (untuned inhibition).
+        rho_4d = rho_m.unsqueeze(0).unsqueeze(0)
+        conv_rho = F.conv2d(rho_4d, kernels, padding=R)  # (1, K, nH, nW)
 
-        # Divisive normalization (Naka–Rushton):
-        #   κ = col / (col + cross + ε)
-        kappa_col = col_proj / (col_proj + cross_proj + eps)
+        # Per-bin ρ from the cell's own bin (collinear share of the budget)
+        sr_col = torch.gather(conv_rho, 1, bin_idx_4d).squeeze(0).squeeze(0)
+
+        # Total ρ across all bins
+        sr_total = conv_rho.sum(dim=1).squeeze(0)  # (nH, nW)
+
+        # Fair-share normalization:
+        #   κ = (E_col / sr_col) × (sr_col / sr_total) × K
+        #     = E_col × K / sr_total
+        # But E_col ≤ sr_col (projection ≤ magnitude), so we normalize
+        # the collinear projection against the per-bin average:
+        #   κ = E_col / (sr_total / K + ε)
+        # When E_col equals the average per-bin energy, κ = 1.
+        # When E_col dominates (clean edge), κ > 1 → clamped to 1.
+        # When E_col is small (texture), κ < 1 → suppressed.
+        per_bin_avg = sr_total / K
+        kappa_col = col_proj / (per_bin_avg + eps)
         kappa_col = kappa_col.clamp(0.0, 1.0)
         kappa_col = torch.where(is_border_grid, torch.zeros_like(kappa_col), kappa_col)
 
-        # Modulate ρ for next pass (recurrence)
+        # Modulate ρ
         rho_m = rho_m * kappa_col
         rho_m = torch.where(is_border_grid, torch.zeros_like(rho_m), rho_m)
 
@@ -470,6 +471,7 @@ class ModulationRenderer(nn.Module):
         col_sigma_d: float | None = _COL_SIGMA_D,
         col_sigma_t: float = _COL_SIGMA_T,
         col_passes: int = _COL_PASSES,
+        col_nr_pool_radius: int | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -483,6 +485,7 @@ class ModulationRenderer(nn.Module):
         self.col_sigma_d = col_sigma_d
         self.col_sigma_t = col_sigma_t
         self.col_passes = col_passes
+        self.col_nr_pool_radius = col_nr_pool_radius  # default: same as col_radius
 
     # Legacy compat — code that reads sigma_perp for diagnostics
     @property
@@ -669,6 +672,7 @@ def render_boundary_map_torch(
             sigma_d=renderer.col_sigma_d,
             sigma_t=renderer.col_sigma_t,
             n_passes=renderer.col_passes,
+            nr_pool_radius=renderer.col_nr_pool_radius,
             eps=eps,
             rho_snapshots_t_after=frozenset(sched),
         )
@@ -682,6 +686,7 @@ def render_boundary_map_torch(
             sigma_d=renderer.col_sigma_d,
             sigma_t=renderer.col_sigma_t,
             n_passes=renderer.col_passes,
+            nr_pool_radius=renderer.col_nr_pool_radius,
             eps=eps,
         )
 
@@ -709,11 +714,14 @@ def render_boundary_map_torch(
 
     # ── Step 3: Interpolate cell-grid fields to pixel res ────
     # Use modulated ρ (after collinear facilitation + cross suppression)
+    # theta_combed is detached — orientation is a geometric feature, not
+    # a learned signal.  Gradient flows through ρ̄ and the thinning MLP.
+    theta_combed_det = theta_combed.detach()
     rho_grid_m = torch.where(ib_grid, torch.zeros_like(rho_mod_grid), rho_mod_grid)
-    theta_cos2 = torch.where(ib_grid, torch.zeros_like(theta_combed),
-                              rho_grid_m * torch.cos(2.0 * theta_combed))
-    theta_sin2 = torch.where(ib_grid, torch.zeros_like(theta_combed),
-                              rho_grid_m * torch.sin(2.0 * theta_combed))
+    theta_cos2 = torch.where(ib_grid, torch.zeros_like(theta_combed_det),
+                              rho_grid_m * torch.cos(2.0 * theta_combed_det))
+    theta_sin2 = torch.where(ib_grid, torch.zeros_like(theta_combed_det),
+                              rho_grid_m * torch.sin(2.0 * theta_combed_det))
 
     # Stack fields for a single grid_sample call: (nH, nW, C)
     # channels: [ρ, cos2θ·ρ, sin2θ·ρ, κ_col]
@@ -736,6 +744,7 @@ def render_boundary_map_torch(
     cos2_norm = cos2_pix / rho_pix_safe
     sin2_norm = sin2_pix / rho_pix_safe
     theta_pix = 0.5 * torch.atan2(sin2_norm, cos2_norm)
+    theta_pix = theta_pix.detach()  # geometric feature; grad flows through s_t, s_n, h2m
 
     kappa_col_pix = pix_stack[..., 3]
 
