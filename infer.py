@@ -1,9 +1,7 @@
 r"""infer.py — harmonic-contour-integration single-image inference.
 
-Pipeline: L0 → L1 (eigendecomposition on patches) → ``ρ_seed`` (NR pool on
-``λ₁/(z₀+η_z)``, tile-interior mask) → renderer splat to pixels, optional ridge
-NMS along θ, then thresholded edge PNG (default: Otsu on the soft map; use ``-t``
-for a fixed threshold in ``[0, 1]``).
+Pipeline: L0 → L1 hypercolumns (GABA + dominant θ/ρ) → seed passthrough → renderer
+(interp + thinning), optional ridge NMS, then thresholded edge PNG.
 """
 
 from __future__ import annotations
@@ -19,24 +17,25 @@ from PIL import Image
 
 from params import L0, L1, RENDER, INFER, SEED
 from hci.L0 import compute_l0_rgb, compute_interior, _compute_d_lum_chroma
-from hci.L1 import z_from_l0_harmonics, pad_for_patch_grid, run_l1
+from hci.L1 import (
+    HypercolumnSeed,
+    pad_for_patch_grid,
+    run_l1_hypercolumn,
+    z_from_l0_harmonics,
+)
 from hci.renderer import (
     compute_render_features,
     render_boundary_map_torch,
     proj_to_device,
     ridge_nms,
     upgrade_renderer_state_dict,
-    compute_collinear_coherence,
-    _smooth_theta_rho_double_angle,
 )
 from hci.diagnostics_viz import (
     viz_infer_l0_pinwheel,
     viz_infer_l1_lambdas,
-    viz_infer_l1_photometry,
     viz_infer_rho_map_hist_cdf,
     viz_infer_rho_seed_final_dual_maps,
     viz_infer_rho_seed_final_hist_cdf,
-    viz_infer_rho_iters_snapshot,
     save_rho_png,
     viz_infer_shape_readout,
     viz_infer_base_edges_overlay,
@@ -101,7 +100,7 @@ def _sync(device):
         torch.cuda.synchronize()
 
 
-def run_l0_l1(img_path, device):
+def run_l0_l1(img_path, device, hc_seed: HypercolumnSeed | None = None):
 
     timings = {}
 
@@ -129,6 +128,8 @@ def run_l0_l1(img_path, device):
 
     bm_t = ~compute_interior(ir_p.shape[0], ir_p.shape[1], device)
     z1, z2 = z_from_l0_harmonics(s, bm_t)
+    theta_h = (0.5 * torch.atan2(s[..., 3], s[..., 2])).to(torch.float32)
+    theta_h = torch.where(bm_t, torch.zeros_like(theta_h), theta_h)
 
     s_np = s.cpu().numpy()
     bm_np = bm_t.cpu().numpy()
@@ -137,25 +138,25 @@ def run_l0_l1(img_path, device):
     l0_pix = build_l0_pix(
         s_np, h1m, h2m, bm_np, h2m_lum=h2m_lum, h2m_chr=h2m_chr,
     )
-    del h, vld, s, h1m, h2m, h2m_lum, h2m_chr
+    del h, vld, s, h1m, h2m_lum, h2m_chr
     gc.collect()
     _sync(device)
     timings["l0"] = time.perf_counter() - t0
 
     t1 = time.perf_counter()
-    cells = run_l1(
-        z1,
-        z2,
-        L1.PATCH_SIZE,
-        border_mask=bm_t,
+    seed_l1 = hc_seed if hc_seed is not None else HypercolumnSeed().to(device)
+    cells = run_l1_hypercolumn(
+        h2m,
+        theta_h,
+        bm_t,
+        seed_l1,
+        P=L1.PATCH_SIZE,
         patch_overlap=L1.PATCH_OVERLAP,
         border_patch_max_frac=L1.BORDER_PATCH_MAX_FRAC,
-        eps=L1.EPS,
-        img=ir_t,
-        device=device,
         verbose=False,
+        eps=float(L1.EPS),
     )
-    del z1, z2, ir_t
+    del z1, z2, h2m, theta_h, ir_t
     border_mask_saved = bm_t.cpu()
     del bm_t
     gc.collect()
@@ -216,7 +217,6 @@ def _infer_seed_and_render(
     apply_ridge_nms: bool = True,
     timings: dict[str, float] | None = None,
     return_rho_cell_grids: bool = False,
-    return_rho_collinear_iter_pix: bool = False,
     verbose: bool = False,
 ) -> tuple[
     np.ndarray,
@@ -228,7 +228,6 @@ def _infer_seed_and_render(
     np.ndarray,
     np.ndarray | None,
     np.ndarray | None,
-    list[tuple[int, np.ndarray]] | None,
 ]:
     H0, W0 = prep["H0"], prep["W0"]
     Hp, Wp = prep["Hp"], prep["Wp"]
@@ -254,7 +253,7 @@ def _infer_seed_and_render(
         timings["seed"] = time.perf_counter() - t0
         t1 = time.perf_counter()
     with torch.no_grad():
-        want_cell_grids = bool(return_rho_cell_grids or return_rho_collinear_iter_pix)
+        want_cell_grids = bool(return_rho_cell_grids)
 
         # Determine which l0_pix to use (pass 1 or pass 2 with η modulation)
         l0_for_render = l0_dev
@@ -267,28 +266,14 @@ def _infer_seed_and_render(
             S = int(cf_dev.get("S", max(1, W // max(nW, 1))))
             P = int(cf_dev.get("P", S + (S - 1)))
 
-            theta_all = cf_dev["theta"].to(device=device, dtype=dtype)
-            bp = branch.reshape(-1).long()
-            idx_n = torch.arange(nH * nW, device=device)
-            theta_c = theta_all[idx_n, bp]
-            rho_grid = rho_out.reshape(nH, nW).detach()
             ib_grid = cf_dev["is_border"].to(device=device).reshape(nH, nW).bool()
 
-            theta_combed = _smooth_theta_rho_double_angle(
-                theta_c.reshape(nH, nW), rho_grid, ib_grid,
-            )
-
-            kappa_col, _, e_col = compute_collinear_coherence(
-                theta_combed.detach(),
-                rho_grid,
-                ib_grid,
-                R=model.renderer.col_radius,
-                K=model.renderer.col_k_bins,
-                sigma_d=model.renderer.col_sigma_d,
-                sigma_t=model.renderer.col_sigma_t,
-                n_passes=model.renderer.col_passes,
-                eps=model.render_eps,
-            )
+            kappa_col = cf_dev["kappa_col_cell"].to(
+                device=device, dtype=dtype,
+            ).reshape(nH, nW)
+            e_col = cf_dev["e_col_cell"].to(
+                device=device, dtype=dtype,
+            ).reshape(nH, nW)
 
             eta_lum_map, eta_chr_map = compute_eta_modulation(
                 kappa_col, e_col, ib_grid,
@@ -341,25 +326,14 @@ def _infer_seed_and_render(
             content_w=W0,
             return_dominant_theta=True,
             return_rho_cell_grids=want_cell_grids,
-            return_rho_collinear_iter_pix=return_rho_collinear_iter_pix,
         )
-        if return_rho_collinear_iter_pix:
-            bmap_t, theta_t, rho_seed_cell_t, rho_final_cell_t, rho_iter_list_t = render_out
-            rho_seed_cell_np = rho_seed_cell_t.detach().cpu().numpy()
-            rho_final_cell_np = rho_final_cell_t.detach().cpu().numpy()
-            rho_iter_snapshots_np = [
-                (int(ta), pix.detach().cpu().numpy()[:H0, :W0].astype(np.float32))
-                for ta, pix in rho_iter_list_t
-            ]
-        elif return_rho_cell_grids:
+        if return_rho_cell_grids:
             bmap_t, theta_t, rho_seed_cell_t, rho_final_cell_t = render_out
             rho_seed_cell_np = rho_seed_cell_t.detach().cpu().numpy()
             rho_final_cell_np = rho_final_cell_t.detach().cpu().numpy()
-            rho_iter_snapshots_np = None
         else:
             bmap_t, theta_t = render_out
             rho_seed_cell_np, rho_final_cell_np = None, None
-            rho_iter_snapshots_np = None
     if timings is not None:
         _sync(device)
         timings["render"] = time.perf_counter() - t1
@@ -381,7 +355,6 @@ def _infer_seed_and_render(
         supp_nb_np,
         rho_seed_cell_np,
         rho_final_cell_np,
-        rho_iter_snapshots_np,
     )
 
 
@@ -393,7 +366,6 @@ def forward_with_diagnostics(
     collect_diags,
     apply_ridge_nms=True,
     return_rho_cell_grids: bool = False,
-    return_rho_collinear_iter_pix: bool = False,
     verbose: bool = False,
 ):
 
@@ -408,7 +380,6 @@ def forward_with_diagnostics(
         supp_nb_np,
         rho_seed_cell_np,
         rho_final_cell_np,
-        rho_iter_snapshots_np,
     ) = _infer_seed_and_render(
         model,
         prep,
@@ -417,7 +388,6 @@ def forward_with_diagnostics(
         apply_ridge_nms=apply_ridge_nms,
         timings=timings,
         return_rho_cell_grids=return_rho_cell_grids,
-        return_rho_collinear_iter_pix=return_rho_collinear_iter_pix,
         verbose=verbose,
     )
 
@@ -432,7 +402,6 @@ def forward_with_diagnostics(
         timings,
         rho_seed_cell_np,
         rho_final_cell_np,
-        rho_iter_snapshots_np,
     )
 
 
@@ -488,9 +457,8 @@ def main():
         "-d",
         "--diagnostics",
         action="store_true",
-        help="Save additional diagnostics: base, l0_pinwheel, l1_lambdas, l1_photometry, "
-        "rho (map+histogram+CDF), rho_seed vs rho_after_collinear (dual map + hist/CDF), "
-        "iters_snapshot.png (pixel ρ via renderer bilinear at up to 5 collinear milestones), "
+        help="Save additional diagnostics: base, l0_pinwheel, l1_lambdas, "
+        "rho (map+histogram+CDF), rho_seed vs rho_final cell grids (dual map + hist/CDF), "
         "render_softmap, render_theta_bins, overlay (base RGB with thresholded edges).",
     )
     ap.add_argument("--device", default=None)
@@ -515,7 +483,7 @@ def main():
         print()
 
     img_path = os.path.join(args.input_dir, args.image)
-    prep, prep_t = run_l0_l1(img_path, device)
+    prep, prep_t = run_l0_l1(img_path, device, hc_seed=model.seed.hc_seed)
 
     collect_diags = args.verbose or args.diagnostics
     (
@@ -529,7 +497,6 @@ def main():
         fwd_t,
         rho_seed_cell,
         rho_final_cell,
-        rho_iter_snapshots,
     ) = forward_with_diagnostics(
         model,
         prep,
@@ -537,7 +504,6 @@ def main():
         collect_diags=collect_diags,
         apply_ridge_nms=args.ridge_nms,
         return_rho_cell_grids=args.diagnostics,
-        return_rho_collinear_iter_pix=args.diagnostics,
         verbose=args.verbose,
     )
 
@@ -557,7 +523,7 @@ def main():
             if "mid_band_frac" in st0:
                 print(f"  midband={st0['mid_band_frac']:.6f}")
 
-    n_collinear_passes = int(model.renderer.col_passes)
+    n_gaba_passes = int(L1.COL_PASSES)
     del model, ckpt
     gc.collect()
 
@@ -575,18 +541,14 @@ def main():
         saved_files.append(p_pin)
 
         p_lam = os.path.join(od, f"{stem}_l1_lambdas.png")
-        viz_infer_l1_lambdas(prep["lam_grid"], prep["lam3_grid"], is_border, p_lam)
-        saved_files.append(p_lam)
-
-        p_l1_ph = os.path.join(od, f"{stem}_l1_photometry.png")
-        viz_infer_l1_photometry(
-            prep["cells_flat"],
-            prep["nH"],
-            prep["nW"],
+        viz_infer_l1_lambdas(
+            prep["lam_grid"],
+            prep["lam3_grid"],
             is_border,
-            p_l1_ph,
+            p_lam,
+            z0_grid=prep["z0_grid"],
         )
-        saved_files.append(p_l1_ph)
+        saved_files.append(p_lam)
 
         p_rho = os.path.join(od, f"{stem}_rho.png")
         viz_infer_rho_map_hist_cdf(rho_post, is_border, p_rho, eta_z=eta_z)
@@ -598,7 +560,7 @@ def main():
             rho_final_cell,
             is_border,
             p_rho_sf,
-            n_collinear_passes=n_collinear_passes,
+            n_collinear_passes=n_gaba_passes,
         )
         saved_files.append(p_rho_sf)
         p_rho_stats = os.path.join(od, f"{stem}_rho_hist_cdf.png")
@@ -607,14 +569,6 @@ def main():
         )
         saved_files.append(p_rho_stats)
 
-        if rho_iter_snapshots:
-            p_it = os.path.join(od, f"{stem}_iters_snapshot.png")
-            viz_infer_rho_iters_snapshot(
-                rho_iter_snapshots,
-                p_it,
-                n_collinear_passes=n_collinear_passes,
-            )
-            saved_files.append(p_it)
     bmap_np = np.asarray(bmap, dtype=np.float64)
     if args.threshold is not None:
         threshold = float(args.threshold)

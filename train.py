@@ -1,13 +1,10 @@
-r"""train.py — harmonic-contour-integration: L1 seed + splat render.
+r"""train.py — harmonic-contour-integration: L1 hypercolumns + render.
 
-Pipeline per image: L0 contrast/harmonics → L1 eigendecomposition on the cell grid
-→ ``ρ_seed = (λ₁/(z₀+η_z)) × tile_interior`` (learned ``η_z`` only) with the same
-tile-interior mask as STRIATE's seed-only path → **renderer** splat to pixels.
+Pipeline per image: L0 → L1 (K-bin hypercolumns, learned ``η_z``, GABA recurrence,
+dominant θ/ρ/κ for the cell grid) → cache → **renderer** (interp + thinning MLP).
+The seed module only forwards cached ``lam`` as scalar ρ for the renderer.
 
 Loss combines soft-Dice and per-pixel BCE on the η± valid band.
-
-Trains on the full train split (no held-out val). Saves `intermediate.pt`
-each epoch and `final.pt` when training completes.
 """
 
 from __future__ import annotations
@@ -33,7 +30,12 @@ from hci.L0 import (
     compute_harmonics,
     compute_seed,
 )
-from hci.L1 import z_from_l0_harmonics, pad_for_patch_grid, run_l1
+from hci.L1 import (
+    HypercolumnSeed,
+    pad_for_patch_grid,
+    run_l1_hypercolumn,
+    z_from_l0_harmonics,
+)
 from hci.seed import RhoSeedModule
 from hci.renderer import (
     ModulationRenderer,
@@ -120,19 +122,6 @@ def fast_l0_pass2(
 
 
 def build_cells_flat(cells: dict) -> dict:
-    for key in (
-        "L_plus",
-        "L_minus",
-        "C_plus",
-        "C_minus",
-        "s_lum",
-        "s_chr",
-    ):
-        if key not in cells:
-            raise KeyError(
-                f"cells missing {key}; pass img= to run_l1 so partition "
-                "photometry is computed."
-            )
     nH, nW = cells["nH"], cells["nW"]
     N = nH * nW
     result = {
@@ -142,14 +131,6 @@ def build_cells_flat(cells: dict) -> dict:
         "q": torch.from_numpy(cells["q"].reshape(N, 2).astype(np.float32)),
         "kappa": torch.from_numpy(cells["kappa"].reshape(N, 2).astype(np.float32)),
         "z1_abs_sum": torch.from_numpy(cells["z1_abs_sum"].reshape(N).astype(np.float32)),
-        "L_plus": torch.from_numpy(cells["L_plus"].reshape(N, 2).astype(np.float32)),
-        "L_minus": torch.from_numpy(cells["L_minus"].reshape(N, 2).astype(np.float32)),
-        "C_plus": torch.from_numpy(cells["C_plus"].reshape(N, 2, 3).astype(np.float32)),
-        "C_minus": torch.from_numpy(
-            cells["C_minus"].reshape(N, 2, 3).astype(np.float32)
-        ),
-        "s_lum": torch.from_numpy(cells["s_lum"].reshape(N, 2).astype(np.float32)),
-        "s_chr": torch.from_numpy(cells["s_chr"].reshape(N, 2).astype(np.float32)),
         "lam": torch.from_numpy(cells["lam"].reshape(N, 2).astype(np.float32)),
         "lam3": torch.from_numpy(cells["lam3"].reshape(N).astype(np.float32)),
         "z0": torch.from_numpy(cells["z0"].reshape(N).astype(np.float32)),
@@ -157,6 +138,12 @@ def build_cells_flat(cells: dict) -> dict:
         "cy_z2": torch.from_numpy(cells["cy_z2"].reshape(N).astype(np.float32)),
         "is_border": torch.from_numpy(cells["is_border"].reshape(N).astype(np.bool_)),
     }
+    result["kappa_col_cell"] = torch.from_numpy(
+        np.asarray(cells["kappa_col_cell"], dtype=np.float32)
+    )
+    result["e_col_cell"] = torch.from_numpy(
+        np.asarray(cells["e_col_cell"], dtype=np.float32)
+    )
     return result
 
 
@@ -223,40 +210,20 @@ class HarmonicContourE2E(nn.Module):
                 and "border_mask" in m
             )
             if has_pass2_data:
-                # Extract κ_col and E_col from the renderer's collinear pass
-                # (they were computed during render; re-run collinear on cell grid
-                # to get them — cheap, already detached)
-                from hci.renderer import compute_collinear_coherence
                 nH = int(cf_flat["nH"])
                 nW = int(cf_flat["nW"])
                 S = int(cf_flat.get("S", max(1, m["proj_dev"]["W"] // max(nW, 1))))
                 P = int(cf_flat.get("P", S + (S - 1)))
                 device = rho_out.device
                 dtype = rho_out.dtype
-
-                theta_all = cf_flat["theta"].to(device=device, dtype=dtype)
-                bp = branch.reshape(-1).long()
-                idx_n = torch.arange(nH * nW, device=device)
-                theta_c = theta_all[idx_n, bp]
-                rho_grid = rho_out.reshape(nH, nW).detach()
                 ib_grid = cf_flat["is_border"].to(device=device).reshape(nH, nW).bool()
 
-                from hci.renderer import _smooth_theta_rho_double_angle
-                theta_combed = _smooth_theta_rho_double_angle(
-                    theta_c.reshape(nH, nW), rho_grid, ib_grid,
-                )
-
-                kappa_col, _, e_col = compute_collinear_coherence(
-                    theta_combed.detach(),
-                    rho_grid,
-                    ib_grid,
-                    R=self.renderer.col_radius,
-                    K=self.renderer.col_k_bins,
-                    sigma_d=self.renderer.col_sigma_d,
-                    sigma_t=self.renderer.col_sigma_t,
-                    n_passes=self.renderer.col_passes,
-                    eps=self.render_eps,
-                )
+                kappa_col = cf_flat["kappa_col_cell"].to(
+                    device=device, dtype=dtype,
+                ).reshape(nH, nW)
+                e_col = cf_flat["e_col_cell"].to(
+                    device=device, dtype=dtype,
+                ).reshape(nH, nW)
 
                 # Compute per-pixel η maps
                 H, W = m["proj_dev"]["H"], m["proj_dev"]["W"]
@@ -334,7 +301,7 @@ def prepare_batch(items, device):
             "l0_pix": l0_dev,
             "img": img,
         }
-        # Pass-2 η modulation data (may be None for old caches)
+        # Pass-2 η modulation data (may be None when absent)
         if d_lum is not None:
             m["d_lum"] = d_lum.to(device)
         if d_chr is not None:
@@ -389,6 +356,8 @@ def precompute_image(img_path, gt_path, gt_format):
     border_mask_t = ~compute_interior(ir_p.shape[0], ir_p.shape[1], ir_t.device)
 
     z1, z2 = z_from_l0_harmonics(s, border_mask_t)
+    theta_h = (0.5 * torch.atan2(s[..., 3], s[..., 2])).to(torch.float32)
+    theta_h = torch.where(border_mask_t, torch.zeros_like(theta_h), theta_h)
 
     s_np = s.cpu().numpy()
     border_mask_np = border_mask_t.cpu().numpy()
@@ -398,21 +367,28 @@ def precompute_image(img_path, gt_path, gt_format):
     l0_pix = build_l0_pix(
         s_np, h1m, h2m, border_mask_np, h2m_lum=h2m_lum, h2m_chr=h2m_chr,
     )
-    del h, vld, s, h1m, h2m, h2m_lum, h2m_chr
+    del h, vld, s, h1m, h2m_lum, h2m_chr
     gc.collect()
 
-    cells = run_l1(
-        z1,
-        z2,
-        L1.PATCH_SIZE,
-        border_mask=border_mask_t,
+    # Standalone η_z (same init as SEED); cache is geometry-only vs trained ckpt.
+    hc_seed = HypercolumnSeed(
+        r_pool=SEED.R_POOL,
+        stride=SEED.STRIDE,
+        eps=SEED.EPS,
+        eta_z_init=SEED.ETA_Z_INIT,
+    )
+    cells = run_l1_hypercolumn(
+        h2m,
+        theta_h,
+        border_mask_t,
+        hc_seed,
+        P=L1.PATCH_SIZE,
         patch_overlap=L1.PATCH_OVERLAP,
         border_patch_max_frac=L1.BORDER_PATCH_MAX_FRAC,
-        eps=L1.EPS,
-        img=ir_t,
         verbose=False,
+        eps=float(L1.EPS),
     )
-    del z1, z2, ir_t
+    del z1, z2, h2m, theta_h, ir_t
     gc.collect()
 
     P = cells["P"]
@@ -493,9 +469,8 @@ def _cache_entry_valid(data: dict) -> bool:
         "z0",
         "q",
         "kappa",
-        "s_lum",
-        "s_chr",
-        "L_plus",
+        "kappa_col_cell",
+        "e_col_cell",
     ):
         if key not in cf:
             return False
@@ -679,11 +654,14 @@ def bce_loss_with_ignore(
 
 
 def remap_checkpoint_state_dict(sd: dict) -> dict:
-    """Load STRIATE ``dynamics._eta_z`` into ``seed``; drop other dynamics keys.
+    """Load STRIATE ``dynamics._eta_z`` into ``seed.hc_seed``; drop other dynamics keys.
 
     ``seed._eta_rho_raw`` / ``dynamics._eta_rho_raw`` are omitted — NR pool on
     the seed was removed; those tensors are not loaded.  ``eta_mod_d`` is
     dropped if present (removed from the model).
+
+    Learned η_z lives on ``HypercolumnSeed`` inside ``RhoSeedModule``; legacy
+    checkpoints may use ``dynamics._eta_z_raw`` or flat ``seed._eta_z_raw``.
     """
     skip = frozenset({"seed._eta_rho_raw", "dynamics._eta_rho_raw"})
     out: dict = {}
@@ -693,7 +671,9 @@ def remap_checkpoint_state_dict(sd: dict) -> dict:
         if k == "eta_mod_d":
             continue
         if k == "dynamics._eta_z_raw":
-            out["seed._eta_z_raw"] = v
+            out["seed.hc_seed._eta_z_raw"] = v
+        elif k == "seed._eta_z_raw":
+            out["seed.hc_seed._eta_z_raw"] = v
         elif k.startswith("dynamics."):
             continue
         else:
@@ -828,13 +808,11 @@ def format_seed_param_lines(seed: RhoSeedModule, *, indent: str = "  ") -> list[
 
 def format_renderer_param_lines(r: ModulationRenderer, *, indent: str = "  ") -> list[str]:
     n_th = sum(p.numel() for p in r.thinning.parameters())
-    sig_d = r.col_sigma_d if r.col_sigma_d is not None else r.col_radius / 2.0
     return [
         f"{indent}harmonic-native:  h2m · gate(MLP)  (no Gaussian splat)",
         f"{indent}stencil spacings:  s_t={r.s_t.item():.3f}  s_n={r.s_n.item():.3f}",
         f"{indent}thinning head:  18→16→1 MLP  ({n_th} params)",
-        f"{indent}collinear:  R={r.col_radius}  K={r.col_k_bins}  "
-        f"σ_d={sig_d:.1f}  σ_t={r.col_sigma_t:.1f}",
+        f"{indent}κ_col / E_col:  supplied from L1 hypercolumn (cached in cells_flat)",
     ]
 
 
@@ -864,7 +842,7 @@ def _format_render_params(model: HarmonicContourE2E):
                    f"b={model.eta_mod_b.item():.1f},"
                    f"c={model.eta_mod_c.item():.1f})")
     return (f"renderer={n_r} params  (harmonic-native, s_t, s_n, "
-            f"thinning 18→16→1, collinear R={r.col_radius}{eta_str})")
+            f"thinning 18→16→1{eta_str})")
 
 
 def save_checkpoint(model, path):
@@ -964,8 +942,8 @@ def main():
         f"ρ = (λ₁/(z₀+η_z)) × tile_interior  (learned η_z; no NR pool on seed; no dynamics)"
     )
     print(
-        f"Render: harmonic-native h2m·gate + collinear coherence "
-        f"(R={RENDER.COL_RADIUS}, K={RENDER.COL_K_BINS})"
+        f"Render: harmonic-native h2m·gate  "
+        f"(L1 collinear GABA: R={L1.COL_RADIUS}, K={L1.COL_K_BINS}, passes={L1.COL_PASSES})"
     )
     print(
         f"Loss: λ_dice·soft-Dice + λ_bce·BCE (η± edge band)  "

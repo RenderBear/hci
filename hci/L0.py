@@ -12,7 +12,7 @@ Per-pixel minimum across directions, then independent Naka–Rushton per channel
 
   h_k = h_k^lum + h_k^chr,   z_n = Σ_k h_k e^{inφ_k}  (n ∈ {1,2} via ``compute_harmonics``).
 
-Second-harmonic magnitudes from split fields (renderer + L1 photometry):
+Second-harmonic magnitudes from split fields (renderer):
   h_{2m}^lum = |Σ_k h_k^lum e^{2iφ_k}|,   h_{2m}^chr = |Σ_k h_k^chr e^{2iφ_k}|.
 
 η_lum and η_chr are read from ``params.L0`` at precompute time only; they are not model

@@ -1,35 +1,8 @@
-r"""Renderer — harmonic-native gating + recurrent collinear facilitation.
+r"""Renderer — harmonic-native gating (interp → features → MLP).
 
-Pipeline:
-  1. Cell grid: ρ-weighted θ combing (unchanged).
-  2. Recurrent V1-style collinear facilitation + cross-orientation
-     suppression on cell grid (n_passes iterations, binned-θ conv).
-     Each pass: κ = col/(col+cross+ε), ρ ← ρ·κ.
-     Effective range ≈ n_passes × R.
-  3. Bilinear interpolation of modulated cell-grid fields (ρ_mod, θ,
-     κ_col) to pixel coordinates — no scatter-add splat.
-  4. Per-pixel feature vector F_p ∈ R¹⁸:
-       [h2m_lum, h2m_chr, ρ̄^(T), θ̄_cos2, θ̄_sin2, κ̄_col,
-        ρ̄^(T)/(ρ̄^(0)+ε), tang5(5), norm5(5), η_lum_map]
-     where ρ̄^(0) is pre–collinear-recurrence ρ (same bilinear interp as ρ̄^(T)),
-     tang5/norm5 are sampled from h2m (pixel-native), and η_lum_map is the
-     pass-2 luminance η field (optional key ``eta_mod_map`` in ``l0_pix``;
-     zeros if absent).
-  5. Thinning head: B̂(p) = h2m(p) · σ(W₂ ReLU(W₁ F_p + b₁) + b₂).
-     18→16→1 MLP.
-
-Collinear coherence (Step 2):
-  Recurrent divisive normalization on the cell grid.  Each cell's θ-bin
-  selects the collinear kernel; the orthogonal bin (θ + 90°) selects
-  the cross-oriented kernel.  κ = col_energy / (col + cross + ε) is
-  Naka–Rushton: co-aligned neighbors facilitate, cross-oriented suppress.
-  ρ is modulated by κ at each pass, so facilitation propagates along
-  contours and cross-orientation suppression cascades — gap bridging
-  and junction resolution emerge from the recurrence.
-
-Learned: s_t (1), s_n (1), ThinningHead 18→16→1 (321 params).
-Fixed: collinear kernels (precomputed), recurrent dynamics (0 params).
-Total: 323 learned scalars.
+θ-combing on the cell grid, bilinear interpolation of cached cell fields (ρ, θ,
+κ_col from L1), stencil sampling on ``h2m``, and the thinning MLP.  GABA
+collinear recurrence lives only in ``hci.L1``; this module does not re-run it.
 """
 
 from __future__ import annotations
@@ -43,23 +16,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from params import RENDER
-
-
-# ═══════════════════════════════════════════════════════════════
-# Defaults
-# ═══════════════════════════════════════════════════════════════
-
-_SIGMA_PERP_INIT = getattr(RENDER, "SIGMA_PERP_INIT", 1.5)
-_SIGMA_PERP_MAX = getattr(RENDER, "SIGMA_PERP_MAX", 8.0)
-_SPLAT_RADIUS_SIGMAS = getattr(RENDER, "SPLAT_RADIUS_SIGMAS", 3.0)
-_SPLAT_HALF_W_PERP = getattr(RENDER, "SPLAT_HALF_W_PERP", 3)
-
-# Collinear coherence defaults
-_COL_RADIUS = getattr(RENDER, "COL_RADIUS", 5)
-_COL_K_BINS = getattr(RENDER, "COL_K_BINS", 24)
-_COL_SIGMA_D = getattr(RENDER, "COL_SIGMA_D", None)
-_COL_SIGMA_T = getattr(RENDER, "COL_SIGMA_T", 1.0)
-_COL_PASSES = getattr(RENDER, "COL_PASSES", 3)
 
 
 def _inv_softplus(x: float) -> float:
@@ -98,194 +54,6 @@ def _smooth_theta_rho_double_angle(
         use = (~ib) & (sw > eps)
         th = torch.where(use, th_new, th)
     return th
-
-
-# ═══════════════════════════════════════════════════════════════
-# Collinear coherence (binned-θ convolution on cell grid)
-# ═══════════════════════════════════════════════════════════════
-
-def _build_collinear_kernels(
-    R: int, K: int, sigma_d: float | None, sigma_t: float,
-    device: torch.device, dtype: torch.dtype = torch.float32,
-) -> torch.Tensor:
-    """Precompute K kernels of shape (2R+1, 2R+1).
-    Returns: (K, 1, 2R+1, 2R+1) ready for F.conv2d.
-    """
-    if sigma_d is None:
-        sigma_d = max(R / 2.0, 0.5)
-    offsets = torch.arange(-R, R + 1, device=device, dtype=dtype)
-    di, dj = torch.meshgrid(offsets, offsets, indexing="ij")
-    dist_sq = di * di + dj * dj
-    w_d = torch.exp(-dist_sq / (2.0 * sigma_d * sigma_d))
-    w_d[R, R] = 0.0
-    w_d[dist_sq > R * R] = 0.0
-
-    kernels = torch.zeros(K, 2 * R + 1, 2 * R + 1, device=device, dtype=dtype)
-    for k in range(K):
-        theta_k = k * math.pi / K
-        d_perp = dj * math.cos(theta_k) - di * math.sin(theta_k)
-        w_t = torch.exp(-d_perp * d_perp / (2.0 * sigma_t * sigma_t))
-        kernels[k] = w_d * w_t
-    return kernels.unsqueeze(1)
-
-
-def collinear_rho_snapshot_schedule(
-    n_passes: int, *, max_timestamps: int = 5,
-) -> list[int]:
-    """Pick ``t_after`` indices in ``[0, n_passes]`` for ρ collinear trajectory.
-
-    ``t_after`` counts completed collinear passes (``0`` = before the first pass).
-    At most ``max_timestamps`` values, spanning the full recurrence when
-    ``n_passes + 1`` exceeds the cap.
-    """
-    if n_passes < 0:
-        raise ValueError("n_passes must be non-negative")
-    if max_timestamps < 1:
-        raise ValueError("max_timestamps must be >= 1")
-    n_states = n_passes + 1
-    if n_states <= max_timestamps:
-        return list(range(n_states))
-    if max_timestamps == 1:
-        return [n_passes]
-    times: list[int] = []
-    denom = max_timestamps - 1
-    for k in range(max_timestamps):
-        x = (k * n_passes) / denom
-        times.append(int(round(x)))
-    times = [max(0, min(n_passes, t)) for t in times]
-    out: list[int] = []
-    for t in times:
-        if not out or out[-1] != t:
-            out.append(t)
-    return out
-
-
-def compute_collinear_coherence(
-    theta_grid: torch.Tensor,
-    rho_grid: torch.Tensor,
-    is_border_grid: torch.Tensor,
-    R: int = _COL_RADIUS,
-    K: int = _COL_K_BINS,
-    sigma_d: float | None = _COL_SIGMA_D,
-    sigma_t: float = _COL_SIGMA_T,
-    n_passes: int = _COL_PASSES,
-    nr_pool_radius: int | None = None,  # unused, kept for API compat
-    eps: float = 1e-6,
-    rho_snapshots_t_after: set[int] | frozenset[int] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict[int, torch.Tensor]]:
-    """Recurrent V1-style collinear facilitation with GABA-budget normalization.
-
-    Each pass:
-      1. Convolve ρ·cos2θ, ρ·sin2θ with K tangent-selective kernels.
-      2. Each cell reads its own θ-bin (collinear energy E_col).
-      3. Compute total oriented energy across ALL K bins (E_total).
-      4. κ = E_col / (E_total + ε)          (GABA budget)
-      5. ρ ← ρ · κ                           (modulate)
-      6. Feed updated ρ into next pass.
-
-    The GABA budget replaces both the old col-vs-cross gating and the
-    separate NR pool in a single normalization.  The denominator is the
-    total oriented energy summed over all K angle bins — untuned
-    inhibition, matching V1 GABAergic interneuron pooling.
-
-    A cell on a clean edge has most energy in its own bin → κ ≈ 1.
-    A cell in texture has energy spread across many bins → κ ≈ 1/K.
-    No separate NR pool needed — the energy budget is self-stabilizing
-    across iterations because the denominator scales with ρ.
-
-    Args:
-        theta_grid: (nH, nW) combed orientations
-        rho_grid:   (nH, nW) cell strengths
-        is_border_grid: (nH, nW) bool
-        R, K, sigma_d, sigma_t: kernel parameters
-        n_passes: number of recurrent iterations (default 3)
-
-    Returns:
-        kappa_col: (nH, nW) final collinear coherence in [0, 1]
-        rho_mod:   (nH, nW) modulated ρ after all passes
-
-        If ``rho_snapshots_t_after`` is not ``None``, also returns a dict mapping
-        ``t_after`` → detached cell-grid ``ρ`` snapshot (same shape as ``rho_mod``).
-    """
-    device, dtype = theta_grid.device, theta_grid.dtype
-    nH, nW = theta_grid.shape
-
-    kernels = _build_collinear_kernels(R, K, sigma_d, sigma_t, device, dtype)
-
-    # Bin assignments (fixed across passes — θ doesn't change)
-    bin_idx = ((theta_grid % math.pi) * (K / math.pi)).long().clamp(0, K - 1)
-    bin_idx_4d = bin_idx.unsqueeze(0).unsqueeze(0)  # (1, 1, nH, nW)
-
-    rho_m = torch.where(is_border_grid, torch.zeros_like(rho_grid), rho_grid)
-    kappa_col = torch.zeros_like(rho_m)
-
-    # Cell's own double-angle unit vector (fixed across passes)
-    c2 = torch.cos(2.0 * theta_grid)  # cos(2θ_c)
-    s2 = torch.sin(2.0 * theta_grid)  # sin(2θ_c)
-
-    want_snaps = rho_snapshots_t_after is not None
-    snaps: dict[int, torch.Tensor] = {}
-    snap_want: frozenset[int] = frozenset()
-    if want_snaps:
-        snap_want = frozenset(
-            int(x) for x in (rho_snapshots_t_after or ())
-            if 0 <= int(x) <= n_passes
-        )
-        if 0 in snap_want:
-            snaps[0] = rho_m.detach().clone()
-
-    for t in range(n_passes):
-        # Double-angle fields with current ρ
-        u = rho_m * torch.cos(2.0 * theta_grid)
-        v = rho_m * torch.sin(2.0 * theta_grid)
-
-        u_4d = u.unsqueeze(0).unsqueeze(0)
-        v_4d = v.unsqueeze(0).unsqueeze(0)
-
-        # Convolve with all K kernels: (1, K, nH, nW)
-        conv_u = F.conv2d(u_4d, kernels, padding=R)
-        conv_v = F.conv2d(v_4d, kernels, padding=R)
-
-        # Collinear energy: gather from own θ-bin, project onto cell's orientation
-        su_col = torch.gather(conv_u, 1, bin_idx_4d).squeeze(0).squeeze(0)
-        sv_col = torch.gather(conv_v, 1, bin_idx_4d).squeeze(0).squeeze(0)
-        col_proj = (su_col * c2 + sv_col * s2).clamp_min(0.0)
-
-        # GABA budget: total ρ pooled across all K bins (untuned inhibition).
-        rho_4d = rho_m.unsqueeze(0).unsqueeze(0)
-        conv_rho = F.conv2d(rho_4d, kernels, padding=R)  # (1, K, nH, nW)
-
-        # Per-bin ρ from the cell's own bin (collinear share of the budget)
-        sr_col = torch.gather(conv_rho, 1, bin_idx_4d).squeeze(0).squeeze(0)
-
-        # Total ρ across all bins
-        sr_total = conv_rho.sum(dim=1).squeeze(0)  # (nH, nW)
-
-        # Fair-share normalization:
-        #   κ = (E_col / sr_col) × (sr_col / sr_total) × K
-        #     = E_col × K / sr_total
-        # But E_col ≤ sr_col (projection ≤ magnitude), so we normalize
-        # the collinear projection against the per-bin average:
-        #   κ = E_col / (sr_total / K + ε)
-        # When E_col equals the average per-bin energy, κ = 1.
-        # When E_col dominates (clean edge), κ > 1 → clamped to 1.
-        # When E_col is small (texture), κ < 1 → suppressed.
-        per_bin_avg = sr_total / K
-        kappa_col = col_proj / (per_bin_avg + eps)
-        kappa_col = kappa_col.clamp(0.0, 1.0)
-        kappa_col = torch.where(is_border_grid, torch.zeros_like(kappa_col), kappa_col)
-
-        # Modulate ρ
-        rho_m = rho_m * kappa_col
-        rho_m = torch.where(is_border_grid, torch.zeros_like(rho_m), rho_m)
-
-        if want_snaps and (t + 1) in snap_want:
-            snaps[t + 1] = rho_m.detach().clone()
-
-    # Return final-pass raw collinear energy alongside κ and ρ_mod
-    if want_snaps:
-        return kappa_col, rho_m, col_proj, snaps
-    return kappa_col, rho_m, col_proj
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -463,38 +231,16 @@ class ThinningHead(nn.Module):
 class ModulationRenderer(nn.Module):
     """Harmonic-native renderer: h2m · gate(MLP(F_p)).
 
-    No Gaussian scatter-add splat.  Cell-grid fields are bilinearly
-    interpolated to pixel coordinates via F.grid_sample.  The edge
-    map is the pixel-native h2m, gated by a per-pixel MLP.
-
-    Learned: s_t (1), s_n (1), ThinningHead 18→16→1 (321).
-    Fixed: collinear kernels.
-    Total: 323 learned scalars.
+    Learned: ``s_t``, ``s_n``, ThinningHead 18→16→1.  Cell-grid κ_col and E_col
+    come from L1 (``cells_flat``), not from this module.
     """
 
-    def __init__(
-        self,
-        hidden: int | None = None,
-        col_radius: int = _COL_RADIUS,
-        col_k_bins: int = _COL_K_BINS,
-        col_sigma_d: float | None = _COL_SIGMA_D,
-        col_sigma_t: float = _COL_SIGMA_T,
-        col_passes: int = _COL_PASSES,
-        col_nr_pool_radius: int | None = None,
-        **kwargs,
-    ):
+    def __init__(self, hidden: int | None = None, **kwargs):
         super().__init__()
         _ = (hidden, kwargs)
         self.s_t = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
         self.s_n = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
         self.thinning = ThinningHead(in_dim=18, hidden=16)
-
-        self.col_radius = col_radius
-        self.col_k_bins = col_k_bins
-        self.col_sigma_d = col_sigma_d
-        self.col_sigma_t = col_sigma_t
-        self.col_passes = col_passes
-        self.col_nr_pool_radius = col_nr_pool_radius  # default: same as col_radius
 
     # Legacy compat — code that reads sigma_perp for diagnostics
     @property
@@ -632,18 +378,15 @@ def render_boundary_map_torch(
     content_w: int | None = None,
     return_dominant_theta: bool = False,
     return_rho_cell_grids: bool = False,
-    return_rho_collinear_iter_pix: bool = False,
-    rho_collinear_iter_max_snapshots: int = 5,
 ) -> (
     torch.Tensor
     | tuple[torch.Tensor, torch.Tensor]
     | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
     | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-    | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[tuple[int, torch.Tensor]]]
 ):
 
     _ = training
-    want_cell_grids = bool(return_rho_cell_grids or return_rho_collinear_iter_pix)
+    want_cell_grids = bool(return_rho_cell_grids)
     H, W = proj_dev["H"], proj_dev["W"]
     device, dtype = rho_cell.device, rho_cell.dtype
 
@@ -670,10 +413,7 @@ def render_boundary_map_torch(
         out = z.expand(H, W)[:Hp, :Wp]
         th_z = torch.zeros_like(out)
         zs_grid = torch.zeros(nH, nW, device=device, dtype=dtype)
-        rho_iter_pix_list: list[tuple[int, torch.Tensor]] = []
         if return_dominant_theta and want_cell_grids:
-            if return_rho_collinear_iter_pix:
-                return out, th_z, zs_grid, zs_grid, rho_iter_pix_list
             return out, th_z, zs_grid, zs_grid
         if return_dominant_theta:
             return out, th_z
@@ -681,64 +421,15 @@ def render_boundary_map_torch(
             return out, zs_grid, zs_grid
         return out
 
-    # ── Step 2: Recurrent collinear facilitation + cross suppression ─
-    rho_cell_snaps: dict[int, torch.Tensor] | None = None
-    if return_rho_collinear_iter_pix:
-        sched = collinear_rho_snapshot_schedule(
-            int(renderer.col_passes),
-            max_timestamps=int(rho_collinear_iter_max_snapshots),
-        )
-        kappa_col_grid, rho_mod_grid, e_col_grid, rho_cell_snaps = compute_collinear_coherence(
-            theta_combed.detach(),
-            rho_grid.detach(),
-            ib_grid,
-            R=renderer.col_radius,
-            K=renderer.col_k_bins,
-            sigma_d=renderer.col_sigma_d,
-            sigma_t=renderer.col_sigma_t,
-            n_passes=renderer.col_passes,
-            nr_pool_radius=renderer.col_nr_pool_radius,
-            eps=eps,
-            rho_snapshots_t_after=frozenset(sched),
-        )
-    else:
-        kappa_col_grid, rho_mod_grid, e_col_grid = compute_collinear_coherence(
-            theta_combed.detach(),
-            rho_grid.detach(),
-            ib_grid,
-            R=renderer.col_radius,
-            K=renderer.col_k_bins,
-            sigma_d=renderer.col_sigma_d,
-            sigma_t=renderer.col_sigma_t,
-            n_passes=renderer.col_passes,
-            nr_pool_radius=renderer.col_nr_pool_radius,
-            eps=eps,
-        )
+    # ── Step 2: L1-supplied κ_col (cell grid); ρ unchanged here ──
+    kappa_col_grid = cells_flat["kappa_col_cell"].to(
+        device=device, dtype=dtype,
+    ).reshape(nH, nW)
+    rho_mod_grid = rho_grid.detach()
 
-    # Cell grids for diagnostics: ρ before vs after recurrent collinear passes
     rho_seed_cell = torch.where(ib_grid, torch.zeros_like(rho_grid), rho_grid)
 
-    ch_pre = Hp if content_h is None else content_h
-    cw_pre = Wp if content_w is None else content_w
-    ch_pre, cw_pre = min(ch_pre, H), min(cw_pre, W)
-
-    rho_iter_pix_list: list[tuple[int, torch.Tensor]] = []
-    if rho_cell_snaps is not None:
-        for t_after in sorted(rho_cell_snaps.keys()):
-            rho_snap = rho_cell_snaps[t_after]
-            rho_grid_m_snap = torch.where(ib_grid, torch.zeros_like(rho_snap), rho_snap)
-            rho_pix_s = _interp_cell_to_pixel(rho_grid_m_snap, nH, nW, H, W, S, P)
-            if content_h is not None and content_w is not None:
-                crop_s = torch.ones_like(rho_pix_s)
-                if ch_pre < H:
-                    crop_s[ch_pre:, :] = 0.0
-                if cw_pre < W:
-                    crop_s[:, cw_pre:] = 0.0
-                rho_pix_s = rho_pix_s * crop_s
-            rho_iter_pix_list.append((t_after, rho_pix_s[:Hp, :Wp].contiguous()))
-
     # ── Step 3: Interpolate cell-grid fields to pixel res ────
-    # Use modulated ρ (after collinear facilitation + cross suppression)
     # theta_combed is detached — orientation is a geometric feature, not
     # a learned signal.  Gradient flows through ρ̄ and the thinning MLP.
     theta_combed_det = theta_combed.detach()
@@ -773,8 +464,8 @@ def render_boundary_map_torch(
 
     kappa_col_pix = pix_stack[..., 3]
 
-    # Pre–collinear-recurrence ρ at pixels (same geometry as ρ̄^(T)); ratio
-    # encodes how much collinear recurrence preserved each site (texture → low).
+    # ρ̄^(0) vs ρ̄ used in thinning feature 6 (seed ρ vs rendered ρ; identical when
+    # L1 does not modulate ρ on the cell grid for the renderer path).
     rho0_pix = _interp_cell_to_pixel(rho_seed_cell, nH, nW, H, W, S, P)
     rho_pres_ratio = rho_pix / (rho0_pix + eps)
     rho_pres_ratio = rho_pres_ratio.clamp(max=10.0)
@@ -846,14 +537,10 @@ def render_boundary_map_torch(
     out = bmap[:Hp, :Wp]
     th_out = theta_pix[:Hp, :Wp]
     if return_dominant_theta and want_cell_grids:
-        if return_rho_collinear_iter_pix:
-            return out, th_out, rho_seed_cell, rho_grid_m, rho_iter_pix_list
         return out, th_out, rho_seed_cell, rho_grid_m
     if return_dominant_theta:
         return out, th_out
     if want_cell_grids:
-        if return_rho_collinear_iter_pix:
-            return out, rho_seed_cell, rho_grid_m, rho_iter_pix_list
         return out, rho_seed_cell, rho_grid_m
     return out
 

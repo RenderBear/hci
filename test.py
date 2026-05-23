@@ -28,15 +28,18 @@ from scipy.ndimage import binary_dilation
 
 from params import L0, L1, RENDER, SEED, TEST
 from hci.L0 import compute_l0_rgb, compute_interior, _compute_d_lum_chroma
-from hci.L1 import z_from_l0_harmonics, pad_for_patch_grid, run_l1
+from hci.L1 import (
+    HypercolumnSeed,
+    pad_for_patch_grid,
+    run_l1_hypercolumn,
+    z_from_l0_harmonics,
+)
 from hci.renderer import (
     compute_render_features,
     render_boundary_map_torch,
     proj_to_device,
     ridge_nms,
     upgrade_renderer_state_dict,
-    compute_collinear_coherence,
-    _smooth_theta_rho_double_angle,
 )
 from train import (
     HarmonicContourE2E,
@@ -161,6 +164,8 @@ def run_image_inference(model, img_path, device, *, verbose: bool = False):
     )
     bm_t = ~compute_interior(ir_p.shape[0], ir_p.shape[1], device)
     z1, z2 = z_from_l0_harmonics(s, bm_t)
+    theta_h = (0.5 * torch.atan2(s[..., 3], s[..., 2])).to(torch.float32)
+    theta_h = torch.where(bm_t, torch.zeros_like(theta_h), theta_h)
 
     s_np = s.cpu().numpy()
     bm_np = bm_t.cpu().numpy()
@@ -169,22 +174,21 @@ def run_image_inference(model, img_path, device, *, verbose: bool = False):
     l0_pix = build_l0_pix(
         s_np, h1m, h2m, bm_np, h2m_lum=h2m_lum, h2m_chr=h2m_chr,
     )
-    del h, vld, s, h1m, h2m, h2m_lum, h2m_chr
+    del h, vld, s, h1m, h2m_lum, h2m_chr
     gc.collect()
 
-    cells = run_l1(
-        z1,
-        z2,
-        L1.PATCH_SIZE,
-        border_mask=bm_t,
+    cells = run_l1_hypercolumn(
+        h2m,
+        theta_h,
+        bm_t,
+        model.seed.hc_seed,
+        P=L1.PATCH_SIZE,
         patch_overlap=L1.PATCH_OVERLAP,
         border_patch_max_frac=L1.BORDER_PATCH_MAX_FRAC,
-        eps=L1.EPS,
-        img=ir_t,
-        device=device,
         verbose=False,
+        eps=float(L1.EPS),
     )
-    del z1, z2, bm_t, ir_t
+    del z1, z2, h2m, theta_h, bm_t, ir_t
     gc.collect()
     cells["is_border"] |= (cells["cy"] + cells["P"] / 2 > H0) | (
         cells["cx"] + cells["P"] / 2 > W0
@@ -236,28 +240,14 @@ def run_image_inference(model, img_path, device, *, verbose: bool = False):
             H, W = proj_dev["H"], proj_dev["W"]
             dtype = rho_out.dtype
 
-            theta_all = cf_dev["theta"].to(device=device, dtype=dtype)
-            bp = branch.reshape(-1).long()
-            idx_n = torch.arange(nH * nW, device=device)
-            theta_c = theta_all[idx_n, bp]
-            rho_grid = rho_out.reshape(nH, nW).detach()
             ib_grid = cf_dev["is_border"].to(device=device).reshape(nH, nW).bool()
 
-            theta_combed = _smooth_theta_rho_double_angle(
-                theta_c.reshape(nH, nW), rho_grid, ib_grid,
-            )
-
-            kappa_col, _, e_col = compute_collinear_coherence(
-                theta_combed.detach(),
-                rho_grid,
-                ib_grid,
-                R=model.renderer.col_radius,
-                K=model.renderer.col_k_bins,
-                sigma_d=model.renderer.col_sigma_d,
-                sigma_t=model.renderer.col_sigma_t,
-                n_passes=model.renderer.col_passes,
-                eps=model.render_eps,
-            )
+            kappa_col = cf_dev["kappa_col_cell"].to(
+                device=device, dtype=dtype,
+            ).reshape(nH, nW)
+            e_col = cf_dev["e_col_cell"].to(
+                device=device, dtype=dtype,
+            ).reshape(nH, nW)
 
             eta_lum_map, eta_chr_map = compute_eta_modulation(
                 kappa_col, e_col, ib_grid,

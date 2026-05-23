@@ -1,7 +1,7 @@
 r"""Shared pipeline hyperparameters, module inits, and script defaults.
 
-L1 eigendecomposition → ``ρ_seed`` (NR pool on ``λ₁/(z₀+η_z)``) → renderer splat.
-No L2 tile dynamics.
+L1 builds K-bin hypercolumns + GABA collinear recurrence; the renderer only
+interpolates cell fields, builds pixel features, and runs the thinning MLP.
 """
 
 from __future__ import annotations
@@ -21,16 +21,20 @@ L0 = SimpleNamespace(
     GAMMA=1.0,
 )
 
-# ── L1: per-patch eigendecomposition → cell grid ────────────────────────────
+# ── L1: hypercolumn cell grid + collinear recurrence (depthwise GABA) ───────
 L1 = SimpleNamespace(
     PATCH_SIZE=5,
     PATCH_OVERLAP=3,
     BORDER_PATCH_MAX_FRAC=0.2,
     EPS=1e-15,
-    N_BRANCHES=2,
+    COL_RADIUS=5,
+    COL_K_BINS=24,
+    COL_SIGMA_D=None,       # default: R/2 inside L1
+    COL_SIGMA_T=1.0,
+    COL_PASSES=5,
 )
 
-# ── SEED: NR-normalized ρ from L1 (tile coverage mask; no dynamics) ─────────
+# ── SEED: tile geometry + learned η_z (HypercolumnSeed); no separate dynamics ─
 SEED = SimpleNamespace(
     R_POOL=10,
     STRIDE=7,
@@ -38,46 +42,27 @@ SEED = SimpleNamespace(
     ETA_Z_INIT=5.0,
 )
 
-# ── Render: Gaussian-line splat + collinear coherence + thinning ─────────────
+# ── Render: θ combing + bilinear interp + thinning MLP (κ_col, E_col from L1) ─
 RENDER = SimpleNamespace(
     CELL_HIDDEN=16,
     PIXEL_HIDDEN=6,
-    SIGMA_PAR_INIT=8.0,
-    SIGMA_PERP_INIT=1.0,
-    SIGMA_PAR_MAX=32.0,
-    SIGMA_PERP_MAX=8.0,
-    GATE_RADIUS_SIGMAS=3.0,
-    GATE_ALPHA_INIT=1.0,
-    GATE_TAU_INIT=0.0,
-    SPLAT_RADIUS_SIGMAS=3.0,
     THETA_SMOOTH_PASSES=4,
-    SIGMA_PRE_INIT=1.5,
-    SIGMA_PRE_MAX=12.0,
-    SMOOTH_SIGMA_INIT=2.0,
-    SMOOTH_RADIUS=3,
-    PRE_SMOOTH_RADIUS=3,
-    COL_RADIUS=5,
-    COL_K_BINS=24,
-    COL_SIGMA_D=None,       # default: R/2
-    COL_SIGMA_T=1.0,
-    COL_PASSES=5,
 )
 
 # ── Training ─────────────────────────────────────────────────────────────────
 TRAIN = SimpleNamespace(
     LR=5e-2,
     EPOCHS=15,
-    BATCH_SIZE=4,
+    BATCH_SIZE=8,
     GRAD_CLIP=1.0,
     NUM_WORKERS=2,
     LAM_DICE=1.0,
     LAM_BCE=0.0,
-    CACHE_VERSION=3,
+    CACHE_VERSION=6,
 )
 
 # ── Inference ────────────────────────────────────────────────────────────────
 INFER = SimpleNamespace(
-    # infer.py: default edge τ is Otsu on the soft map; pass -t to use a fixed value.
     DEFAULT_THRESHOLD=0.5,
     SHAPE_THETA_BINS=12,
 )

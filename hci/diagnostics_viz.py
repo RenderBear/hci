@@ -90,6 +90,8 @@ def viz_l1_lambdas_three(
     is_border: np.ndarray,
     out_path: str,
     suptitle: str,
+    *,
+    panel_titles: tuple[str, str, str] | None = None,
 ) -> None:
 
     cmap = "coolwarm"
@@ -98,10 +100,15 @@ def viz_l1_lambdas_three(
     a3 = apply_border_zero(lam3, is_border)
     interior = ~np.asarray(is_border, dtype=bool)
 
+    t1, t2, t3 = panel_titles or (
+        r"$\lambda_1$ (branch 0)",
+        r"$\lambda_2$ (branch 1)",
+        r"$\lambda_3$ (smallest eigenvalue)",
+    )
     panels = [
-        (a1, r"$\lambda_1$ (branch 0)"),
-        (a2, r"$\lambda_2$ (branch 1)"),
-        (a3, r"$\lambda_3$ (smallest eigenvalue)"),
+        (a1, t1),
+        (a2, t2),
+        (a3, t3),
     ]
 
     fig, axes = plt.subplots(3, 1, figsize=(5.5, 5.2 * 3), facecolor=VIZ.BG)
@@ -704,53 +711,6 @@ def save_rho_png(pix_proj: np.ndarray, out_path):
     Image.fromarray((rgba[..., :3] * 255).astype(np.uint8), "RGB").save(out_path)
 
 
-def viz_infer_rho_iters_snapshot(
-    panels: list[tuple[int, np.ndarray]],
-    out_path: str,
-    *,
-    n_collinear_passes: int,
-) -> None:
-    """Montage of pixel $\\rho$ from the renderer's cell→pixel bilinear path at
-    up to five milestones along the recurrent collinear recurrence.
-    """
-    if not panels:
-        return
-    panels = sorted(panels, key=lambda x: x[0])
-    vmax = max(float(np.max(p[1])) for p in panels)
-    vmax = max(vmax, VIZ.EPS)
-    cmap = rho_heatmap_cmap()
-    n = len(panels)
-    fig_w = max(12.0, 3.2 * n)
-    fig, axes = plt.subplots(1, n, figsize=(fig_w, 3.8), facecolor=VIZ.BG)
-    if n == 1:
-        axes = np.asarray([axes])
-    fig.suptitle(
-        (
-            rf"$\rho$ pixel projection (renderer bilinear) vs collinear passes "
-            rf"($N={int(n_collinear_passes)}$ total passes; "
-            rf"up to 5 timeline samples)"
-        ),
-        fontsize=10,
-        color=VIZ.FG,
-        fontfamily="monospace",
-    )
-    for ax, (t_after, pix) in zip(axes.ravel(), panels):
-        ax.set_facecolor(VIZ.PANEL_BG)
-        ax.axis("off")
-        rgba = cmap(
-            np.clip(np.asarray(pix, dtype=np.float64) / vmax, 0.0, 1.0)
-        )
-        ax.imshow(rgba[..., :3])
-        if int(t_after) == 0:
-            title = r"$\rho_{\mathrm{pix}}$ (pre-collinear)"
-        else:
-            title = rf"$\rho_{{\mathrm{{pix}}}}$ after pass {int(t_after)}"
-        ax.set_title(title, fontsize=8, color=VIZ.FG, fontfamily="monospace")
-    fig.tight_layout(rect=[0, 0, 1, 0.90])
-    fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
-    plt.close(fig)
-
-
 def viz_infer_l0_pinwheel(
     h_np: np.ndarray, img_pinwheel: np.ndarray, out_path: str
 ) -> None:
@@ -758,164 +718,79 @@ def viz_infer_l0_pinwheel(
     viz_l0_pinwheel(h_np, img_pinwheel, out_path)
 
 
-def cell_photo_diff_grids(
-    cells_flat: dict,
-    nH: int,
-    nW: int,
-    *,
-    branch: int = 0,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Signed luminance and chrominance differences across the cut (branch 0 for L2)."""
-    b = int(branch)
-    Lp = cells_flat["L_plus"].detach().cpu().numpy().reshape(nH, nW, 2)[:, :, b]
-    Lm = cells_flat["L_minus"].detach().cpu().numpy().reshape(nH, nW, 2)[:, :, b]
-    Cp = cells_flat["C_plus"].detach().cpu().numpy().reshape(nH, nW, 2, 3)[:, :, b, :]
-    Cm = cells_flat["C_minus"].detach().cpu().numpy().reshape(nH, nW, 2, 3)[:, :, b, :]
-    dL = Lp.astype(np.float64) - Lm.astype(np.float64)
-    dC_norm = np.linalg.norm(
-        Cp.astype(np.float64) - Cm.astype(np.float64),
-        axis=-1,
-    )
-    return dL, dC_norm
-
-
-def _cell_signal_grid(
-    cells_flat: dict,
-    key: str,
-    nH: int,
-    nW: int,
-    *,
-    branch: int = 0,
-) -> np.ndarray:
-    """Extract a per-cell scalar signal from cells_flat by key."""
-    b = int(branch)
-    if key in cells_flat:
-        s = cells_flat[key]
-        if isinstance(s, torch.Tensor):
-            s = s.detach().cpu().numpy()
-        s = np.asarray(s, dtype=np.float64)
-        if s.ndim == 3:
-            # (nH, nW, K) — already spatial
-            return s[:, :, b]
-        if s.ndim == 2:
-            N = nH * nW
-            if s.shape[0] == N and s.shape[1] > 1:
-                # (N, K) — flat with branch dim
-                return s[:, b].reshape(nH, nW)
-            return s.reshape(nH, nW)
-        return s.reshape(nH, nW)
-    return np.zeros((nH, nW), dtype=np.float64)
-
-
-def cell_s_lum_grid(cells_flat, nH, nW, *, branch=0):
-    """L1 luminance separability s_lum per cell."""
-    return _cell_signal_grid(cells_flat, "s_lum", nH, nW, branch=branch)
-
-
-def cell_s_chr_grid(cells_flat, nH, nW, *, branch=0):
-    """L1 chrominance separability s_chr per cell."""
-    return _cell_signal_grid(cells_flat, "s_chr", nH, nW, branch=branch)
-
-
-def viz_infer_l1_photometry(
-    cells_flat: dict,
-    nH: int,
-    nW: int,
-    is_border: np.ndarray,
-    out_path: str,
-    *,
-    branch: int = 0,
-) -> None:
-    """ΔL, ‖ΔC‖, s_lum, s_chr per cell (branch 0)."""
-    dL, dC_norm = cell_photo_diff_grids(cells_flat, nH, nW, branch=branch)
-    s_lum = cell_s_lum_grid(cells_flat, nH, nW, branch=branch)
-    s_chr = cell_s_chr_grid(cells_flat, nH, nW, branch=branch)
-    interior = ~np.asarray(is_border, dtype=bool)
-    panels = [
-        (apply_border_zero(dL, is_border), r"$\Delta L = L^+ - L^-$", "coolwarm", None),
-        (
-            apply_border_zero(dC_norm, is_border),
-            r"$\|\Delta C\| = \|C^+ - C^-\|$",
-            "magma",
-            None,
-        ),
-        (
-            apply_border_zero(s_lum, is_border),
-            r"$s_{\mathrm{lum}}$ ($\Delta L^2/(\eta_{\mathrm{lum}}^2+\Delta L^2)$, same $\eta$ as L0)",
-            "viridis",
-            (0.0, 1.0),
-        ),
-        (
-            apply_border_zero(s_chr, is_border),
-            r"$s_{\mathrm{chr}}$ ($\|\Delta C\|^2/(\eta_{\mathrm{chr}}^2+\|\Delta C\|^2)$, same $\eta$ as L0)",
-            "viridis",
-            (0.0, 1.0),
-        ),
-    ]
-
-    fig, axes = plt.subplots(4, 1, figsize=(5.5, 5.2 * 4), facecolor=VIZ.BG)
-    axes_flat = np.atleast_1d(axes).ravel()
-    for ax, (arr, title_base, cmap, vlim) in zip(axes_flat, panels):
-        ax.set_facecolor(VIZ.PANEL_BG)
-        ax.axis("off")
-        if vlim is not None:
-            vmin, vmax = vlim
-        elif cmap == "coolwarm":
-            if interior.any():
-                v = np.abs(arr[interior])
-                vmax = float(np.max(v)) if v.size else 1.0
-            else:
-                vmax = 1.0
-            vmax = max(vmax, 1e-12)
-            vmin = -vmax
-        else:
-            vmin, vmax = _interior_vmin_vmax(arr, interior)
-        im = ax.imshow(
-            arr,
-            cmap=cmap,
-            vmin=vmin,
-            vmax=vmax,
-            interpolation="nearest",
-        )
-        ax.set_title(
-            f"{title_base}  (branch {branch})\n"
-            f"interior min={vmin:.4g}  max={vmax:.4g}",
-            fontsize=9,
-            color=VIZ.FG,
-            fontfamily="monospace",
-        )
-        cbar = fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02, shrink=0.82)
-        cbar.outline.set_edgecolor(VIZ.ACCENT)
-        cbar.ax.tick_params(colors=VIZ.FG, labelsize=7)
-
-    fig.suptitle(
-        rf"L1 photometry — $\Delta L$, $\|\Delta C\|$, $s_{{\mathrm{{lum}}}}$, "
-        rf"$s_{{\mathrm{{chr}}}}$ "
-        rf"(z₂-centroid partition, branch {branch})",
-        fontsize=10,
-        color=VIZ.FG,
-        fontfamily="monospace",
-        y=0.995,
-    )
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
-    fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
-    plt.close(fig)
-
-
 def viz_infer_l1_lambdas(
     lam: np.ndarray,
     lam3: np.ndarray,
     is_border: np.ndarray,
     out_path: str,
+    *,
+    z0_grid: np.ndarray | None = None,
 ) -> None:
+    r"""L1 cell-grid diagnostics.
+
+    Supports legacy ``lam`` shape ``(nH, nW, 2)`` (eigenvalues) and hypercolumn
+    flat layout ``(nH*nW, 2)`` (duplicate dominant ρ per renderer branch).
+    Third row: ``lam3`` (legacy λ₃), or ``z0`` patch total energy when
+    ``z0_grid`` is provided (same length as flattened cell grid).
+    """
+    lam = np.asarray(lam, dtype=np.float64)
+    lam3 = np.asarray(lam3, dtype=np.float64)
+    is_b = np.asarray(is_border, dtype=bool)
+
+    nH, nW = lam3.shape[:2]
+
+    if lam.ndim == 2 and lam.shape[0] == nH * nW and lam.shape[1] >= 2:
+        lam = lam.reshape(nH, nW, lam.shape[1])
+    elif lam.ndim != 3:
+        raise ValueError(
+            f"lam must be (nH, nW, C) or (nH*nW, C); got {lam.shape} with lam3 {lam3.shape}"
+        )
+
+    if is_b.ndim == 1 and is_b.size == nH * nW:
+        is_b = is_b.reshape(nH, nW)
+
+    lam1 = lam[..., 0]
+    lam2 = lam[..., min(1, lam.shape[-1] - 1)]
+
+    if z0_grid is not None:
+        z0 = np.asarray(z0_grid, dtype=np.float64).ravel()
+        lam3_plot = z0.reshape(nH, nW) if z0.size == nH * nW else lam3
+        z0_ok = z0.size == nH * nW
+    else:
+        lam3_plot = lam3
+        z0_ok = False
+
+    hyper = lam.shape[-1] >= 2 and np.allclose(lam[..., 0], lam[..., 1], equal_nan=True)
+    if hyper:
+        third_title = (
+            r"$z_0$ (patch total oriented energy, pre-$\eta_z$)"
+            if z0_ok
+            else r"$\lambda_3$ / placeholder (no $z_0$ for this grid)"
+        )
+        panel_titles = (
+            r"$\rho_{\mathrm{dom}}$ (branch 0, scalar readout)",
+            r"$\rho_{\mathrm{dom}}$ (branch 1, duplicate)",
+            third_title,
+        )
+        suptitle = (
+            r"L1 hypercolumn — dominant $\rho$ on cell grid "
+            r"(renderer API uses two identical branches)"
+        )
+    else:
+        panel_titles = None
+        suptitle = (
+            r"L1 $\lambda$ (not the L2 seed; seed is "
+            r"$\lambda_k/(\lambda_1+\lambda_2+\eta_z)$)"
+        )
 
     viz_l1_lambdas_three(
-        lam[:, :, 0],
-        lam[:, :, 1],
-        lam3,
-        is_border,
+        lam1,
+        lam2,
+        lam3_plot,
+        is_b,
         out_path,
-        suptitle=r"L1 $\lambda$ (not the L2 seed; seed is $\lambda_k/(\lambda_1+\lambda_2+\eta_z)$)",
+        suptitle,
+        panel_titles=panel_titles,
     )
 
 

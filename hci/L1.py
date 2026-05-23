@@ -1,9 +1,21 @@
-r"""L1 — per-patch eigendecomposition → cell grid (GPU-native).
+r"""L1 — hypercolumn oriented-energy construction + GABA-budget recurrence.
 
-Photometry (when ``img`` is passed): partition-side **means** of L and C use the
-same luminance/chrominance split as L0 (L=(R+G+B)/3, C=I−L·1). Separability scores
-reuse **the same** ``L0.ETA_LUM`` and ``L0.ETA_CHR`` in the Naka–Rushton map applied
-to |L⁺−L⁻| and ‖C⁺−C⁻‖₂ — no separate L1 η and no h₂m-based partition pooling.
+Replaces per-patch eigendecomposition with direct K-bin oriented energy
+projection at each cell position.  Each cell becomes a hypercolumn:
+K orientation-tuned units pooling over the same receptive field (patch).
+
+Pipeline:
+  1. Extract patches from pixel-level h2m and θ_h fields (from L0).
+  2. Project each patch's oriented energy onto K bins via cos² tuning.
+  3. Normalize per-bin energy by total energy + η_z (learned).
+  4. Run recurrent GABA-budget collinear facilitation (T passes).
+  5. Extract dominant orientation, ρ, κ per cell for the renderer.
+
+The collinear recurrence uses depthwise conv2d — each bin convolved with
+its own tangent-selective kernel.  Junctions with 3+ arms are naturally
+represented as 3+ active bins.
+
+Learned parameters: η_z (1 scalar).  Everything else is fixed geometry.
 """
 
 from __future__ import annotations
@@ -12,9 +24,15 @@ import math
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-from params import L0, L1
+from params import L1, SEED
 
+
+# ═══════════════════════════════════════════════════════════════
+# Patch utilities (reused from old L1)
+# ═══════════════════════════════════════════════════════════════
 
 def stride_from_patch_overlap(P: int, patch_overlap: int) -> int:
     o = int(patch_overlap)
@@ -41,9 +59,28 @@ def pad_for_patch_grid(
     Hp, Wp = pd(H0), pd(W0)
     if Hp == H0 and Wp == W0:
         return img, H0, W0
-    out = np.pad(img, ((0, Hp - H0), (0, Wp - W0), (0, 0)), mode="reflect")
+    ndim = img.ndim
+    if ndim == 3:
+        out = np.pad(img, ((0, Hp - H0), (0, Wp - W0), (0, 0)), mode="reflect")
+    else:
+        out = np.pad(img, ((0, Hp - H0), (0, Wp - W0)), mode="reflect")
     return out, H0, W0
 
+
+def _extract_patches_2d(
+    field: torch.Tensor,
+    nH: int, nW: int,
+    P: int, S: int,
+) -> torch.Tensor:
+    """Extract (nH*nW, P*P) patches from a (H, W) field."""
+    # Use unfold for efficient patch extraction
+    patches = field.unfold(0, P, S).unfold(1, P, S)  # (nH, nW, P, P)
+    return patches.contiguous().reshape(nH * nW, P * P)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Legacy compatibility: z_from_l0_harmonics
+# ═══════════════════════════════════════════════════════════════
 
 def z_from_l0_harmonics(
     s: torch.Tensor,
@@ -56,368 +93,497 @@ def z_from_l0_harmonics(
     return z1, z2
 
 
-def _extract_patches_torch(
-    t: torch.Tensor,
-    nH: int,
-    nW: int,
-    P: int,
-    S: int,
-) -> torch.Tensor:
-    patches = t.unfold(0, P, S).unfold(1, P, S)
-    return patches.contiguous().reshape(nH * nW, P * P)
+# ═══════════════════════════════════════════════════════════════
+# Collinear kernels (same as renderer, factored out)
+# ═══════════════════════════════════════════════════════════════
 
-
-def _rgb_split_l0(img: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Same L / C as L0: L = (R+G+B)/3, C = I − L·1  (per-pixel 3-vector)."""
-    if img.ndim != 3 or img.shape[-1] != 3:
-        raise ValueError(f"expected (H, W, 3) image, got {tuple(img.shape)}")
-    img_f = img.to(torch.float32)
-    R, G, B = img_f[..., 0], img_f[..., 1], img_f[..., 2]
-    L = (R + G + B) * (1.0 / 3.0)
-    C = torch.stack([R - L, G - L, B - L], dim=-1)
-    return L, C
-
-
-def _extract_patches_channels(
-    t: torch.Tensor,
-    nH: int,
-    nW: int,
-    P: int,
-    S: int,
-) -> torch.Tensor:
-
-    if t.ndim == 2:
-        patches = t.unfold(0, P, S).unfold(1, P, S)
-        return patches.contiguous().reshape(nH * nW, P * P).unsqueeze(-1)
-    patches = t.unfold(0, P, S).unfold(1, P, S)
-    return (
-        patches.contiguous().permute(0, 1, 3, 4, 2).reshape(nH * nW, P * P, t.shape[-1])
-    )
-
-
-def _partition_side_masks(
-    n: int,
-    P: int,
-    theta: torch.Tensor,
-    q: torch.Tensor,
+def _build_collinear_kernels(
+    R: int, K: int,
+    sigma_d: float | None,
+    sigma_t: float,
     device: torch.device,
-    dcx: torch.Tensor | None = None,
-    dcy: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """plus_mask / minus_mask: (n, K, PP) float in {0,1}."""
-    K = theta.shape[-1]
-    half = (P - 1) / 2.0
-    ys = torch.arange(P, device=device, dtype=torch.float64) - half
-    xs = torch.arange(P, device=device, dtype=torch.float64) - half
-    dy, dx = torch.meshgrid(ys, xs, indexing="ij")
-    dx_flat = dx.reshape(-1)
-    dy_flat = dy.reshape(-1)
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Precompute K depthwise kernels of shape (K, 1, 2R+1, 2R+1)."""
+    if sigma_d is None:
+        sigma_d = max(R / 2.0, 0.5)
+    offsets = torch.arange(-R, R + 1, device=device, dtype=dtype)
+    di, dj = torch.meshgrid(offsets, offsets, indexing="ij")
+    dist_sq = di * di + dj * dj
+    w_d = torch.exp(-dist_sq / (2.0 * sigma_d * sigma_d))
+    w_d[R, R] = 0.0
+    w_d[dist_sq > R * R] = 0.0
 
-    if dcx is not None and dcy is not None:
-        dx_shifted = dx_flat.unsqueeze(0) - dcx.unsqueeze(-1)
-        dy_shifted = dy_flat.unsqueeze(0) - dcy.unsqueeze(-1)
-    else:
-        dx_shifted = dx_flat.unsqueeze(0).expand(n, -1)
-        dy_shifted = dy_flat.unsqueeze(0).expand(n, -1)
-
-    sgn_q = torch.sign(q)
-    sgn_q = torch.where(sgn_q == 0, torch.ones_like(sgn_q), sgn_q)
-    nx = sgn_q * torch.cos(theta)
-    ny = -sgn_q * torch.sin(theta)
-
-    proj = nx.unsqueeze(-1) * dx_shifted.unsqueeze(1) + ny.unsqueeze(-1) * dy_shifted.unsqueeze(1)
-    plus_mask = (proj > 0).to(torch.float32)
-    minus_mask = (proj < 0).to(torch.float32)
-    return plus_mask, minus_mask
+    kernels = torch.zeros(K, 2 * R + 1, 2 * R + 1, device=device, dtype=dtype)
+    for k in range(K):
+        theta_k = k * math.pi / K
+        d_perp = dj * math.cos(theta_k) - di * math.sin(theta_k)
+        w_t = torch.exp(-d_perp * d_perp / (2.0 * sigma_t * sigma_t))
+        kernels[k] = w_d * w_t
+    # Depthwise: (K, 1, 2R+1, 2R+1) — each channel gets its own kernel
+    return kernels.unsqueeze(1)
 
 
-def _pool_partition_sides(
-    lum_patches: torch.Tensor,
-    chr_patches: torch.Tensor,
-    theta: torch.Tensor,
-    q: torch.Tensor,
-    P: int,
-    eps: float,
-    dcx: torch.Tensor | None = None,
-    dcy: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Partition each cell into + and − sides and compute per-side means.
-
-    The partition line passes through (dcx, dcy) — the z₂-weighted centroid
-    offset from the patch geometric centre.  When dcx/dcy are None, the
-    geometric centre is used (legacy behaviour).
-    """
-    device = lum_patches.device
-    n, PP = lum_patches.shape
-    K = theta.shape[-1]
-
-    plus_mask, minus_mask = _partition_side_masks(
-        n, P, theta, q, device, dcx=dcx, dcy=dcy,
-    )
-
-    lum = lum_patches.unsqueeze(1)
-    chr_ = chr_patches.unsqueeze(1)
-
-    L_whole = lum.mean(dim=-1).expand(-1, K)
-    C_whole = chr_.mean(dim=-2).expand(-1, K, -1)
-
-    def _mean_scalar(vals, mask, fallback):
-        s = (vals * mask).sum(dim=-1)
-        cnt = mask.sum(dim=-1).clamp_min(eps)
-        mean = s / cnt
-        empty = mask.sum(dim=-1) < 0.5
-        return torch.where(empty, fallback, mean)
-
-    def _mean_vec(vals, mask, fallback):
-        m = mask.unsqueeze(-1)
-        s = (vals * m).sum(dim=2)
-        cnt = m.sum(dim=2).clamp_min(eps)
-        mean = s / cnt
-        empty = mask.sum(dim=-1, keepdim=True) < 0.5
-        return torch.where(empty, fallback, mean)
-
-    lum_exp = lum.expand(-1, K, -1)
-    chr_exp = chr_.expand(-1, K, -1, -1)
-
-    L_plus = _mean_scalar(lum_exp, plus_mask, L_whole)
-    L_minus = _mean_scalar(lum_exp, minus_mask, L_whole)
-    C_plus = _mean_vec(chr_exp, plus_mask, C_whole)
-    C_minus = _mean_vec(chr_exp, minus_mask, C_whole)
-
-    return (
-        L_plus.to(torch.float32),
-        L_minus.to(torch.float32),
-        C_plus.to(torch.float32),
-        C_minus.to(torch.float32),
-    )
+def _build_tile_grid(nH, nW, R, stride, dev):
+    ti = torch.arange(R, nH - R, stride, device=dev)
+    tj = torch.arange(R, nW - R, stride, device=dev)
+    if ti.numel() == 0:
+        ti = torch.tensor([min(R, nH - 1)], device=dev)
+    if tj.numel() == 0:
+        tj = torch.tensor([min(R, nW - 1)], device=dev)
+    ti_g, tj_g = torch.meshgrid(ti, tj, indexing="ij")
+    return ti_g.reshape(-1), tj_g.reshape(-1)
 
 
-def _patch_orientation_kappa(
-    z1_patches: torch.Tensor,
-    theta: torch.Tensor,
-    q: torch.Tensor,
-    P: int,
+def _build_tile_membership(ti, tj, nW, R, dev):
+    offsets = torch.arange(-R, R + 1, device=dev)
+    di, dj = torch.meshgrid(offsets, offsets, indexing="ij")
+    mi = ti.unsqueeze(1) + di.reshape(-1).unsqueeze(0)
+    mj = tj.unsqueeze(1) + dj.reshape(-1).unsqueeze(0)
+    return (mi * nW + mj).to(torch.int64)
+
+
+def tile_interior_flat(
+    nH: int,
+    nW: int,
+    is_border: torch.Tensor,
+    r_pool: int,
+    stride: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Per-cell 0/1 mask (tile coverage ∧ ¬border), shape (N,) flat."""
+    N = nH * nW
+    ib = is_border.reshape(-1).bool()
+    ti, tj = _build_tile_grid(nH, nW, int(r_pool), int(stride), device)
+    mi = _build_tile_membership(ti, tj, nW, int(r_pool), device)
+    tile_cov = torch.zeros(N, dtype=torch.bool, device=device)
+    tile_cov[mi.reshape(-1)] = True
+    return (~ib & tile_cov).to(torch.float32)
+
+
+def _e_col_dominant_bin(
+    rho_k: torch.Tensor,
+    dominant_bin: torch.Tensor,
+    nH: int,
+    nW: int,
+    K: int,
+    R: int,
+    sigma_d: float | None,
+    sigma_t: float,
     eps: float,
 ) -> torch.Tensor:
-    """Per-cell per-branch orientation confidence κ ∈ [0, 1].
+    """One depthwise conv on final ρ; return S at dominant bin per cell (N,)."""
+    device, dtype = rho_k.device, rho_k.dtype
+    kernels = _build_collinear_kernels(R, K, sigma_d, sigma_t, device, dtype)
+    x = rho_k.reshape(nH, nW, K).permute(2, 0, 1).unsqueeze(0)
+    s_k = F.conv2d(x, kernels, padding=R, groups=K)
+    s_nk = s_k.squeeze(0).permute(1, 2, 0).reshape(-1, K)
+    return s_nk.gather(1, dominant_bin.unsqueeze(-1)).squeeze(-1).clamp_min(eps)
 
-    κ = |mean(z₁ projections onto edge normal)| / mean(|projections|).
-    High when patch z₁ agrees on bright/dark side relative to q; low at ridges/texture.
+
+# ═══════════════════════════════════════════════════════════════
+# Hypercolumn construction
+# ═══════════════════════════════════════════════════════════════
+
+def build_hypercolumns(
+    h2m: torch.Tensor,
+    theta_h: torch.Tensor,
+    border_mask: torch.Tensor,
+    P: int,
+    patch_overlap: int,
+    border_patch_max_frac: float,
+    K: int,
+    eps: float = 1e-15,
+) -> dict:
+    """Build K-bin oriented energy hypercolumns from pixel-level L0 output.
+
+    Args:
+        h2m: (H, W) second-harmonic magnitude from L0
+        theta_h: (H, W) pixel-level orientation = 0.5 * atan2(z2_im, z2_re)
+        border_mask: (H, W) bool
+        P: patch size
+        patch_overlap: patch overlap
+        border_patch_max_frac: fraction of border pixels to mark cell as border
+        K: number of orientation bins
+
+    Returns:
+        dict with:
+            nH, nW: cell grid dimensions
+            P, S: patch size and stride
+            rho_k: (nH*nW, K) per-bin oriented energy (unnormalized)
+            z0: (nH*nW,) total energy per cell
+            is_border: (nH*nW,) bool
+            cx, cy: (nH*nW,) cell centre pixel coords
+            bin_centers: (K,) angle of each bin centre
     """
-    n, _ = z1_patches.shape
-    device = z1_patches.device
-    half = (P - 1) / 2.0
-    ys = torch.arange(P, device=device, dtype=torch.float64) - half
-    xs = torch.arange(P, device=device, dtype=torch.float64) - half
-    dy, dx = torch.meshgrid(ys, xs, indexing="ij")
-    di_f, dj_f = dy.reshape(-1), dx.reshape(-1)
-    rd = (di_f.pow(2) + dj_f.pow(2)).sqrt().clamp_min(eps)
-    oi, oj = di_f / rd, dj_f / rd
+    H, W = h2m.shape
+    device = h2m.device
+    dtype = h2m.dtype
+    S = stride_from_patch_overlap(P, patch_overlap)
+    nH = (H - P) // S + 1 if H >= P else 0
+    nW = (W - P) // S + 1 if W >= P else 0
+    N = nH * nW
 
-    z1_c = z1_patches.to(torch.complex128)
-    zr = z1_c.real
-    zi = z1_c.imag
+    # Extract patches
+    h2m_patches = _extract_patches_2d(h2m, nH, nW, P, S)            # (N, P²)
+    theta_patches = _extract_patches_2d(theta_h, nH, nW, P, S)      # (N, P²)
+    bm_patches = _extract_patches_2d(border_mask.float(), nH, nW, P, S)
+    is_border = bm_patches.mean(dim=-1) > border_patch_max_frac      # (N,)
 
-    sgn_q = torch.sign(q)
-    sgn_q = torch.where(sgn_q == 0, torch.ones_like(sgn_q), sgn_q)
-    nx = sgn_q * torch.cos(theta)
-    ny = -sgn_q * torch.sin(theta)
+    # Bin centres
+    bin_centers = torch.arange(K, device=device, dtype=dtype) * (math.pi / K)
 
-    proj = nx.unsqueeze(-1) * zr.unsqueeze(1) + ny.unsqueeze(-1) * zi.unsqueeze(1)
-    signed_mean = proj.mean(dim=-1)
-    abs_mean = proj.abs().mean(dim=-1).clamp_min(eps)
-    return (signed_mean.abs() / abs_mean).clamp(0.0, 1.0).to(torch.float32)
+    # Project onto K bins: cos²(θ_pixel - θ_bin) weighting
+    # theta_patches: (N, P²), bin_centers: (K,)
+    # diff: (N, P², K)
+    diff = theta_patches.unsqueeze(-1) - bin_centers.unsqueeze(0).unsqueeze(0)
+    cos2_weight = torch.cos(diff).pow(2)  # (N, P², K)
+
+    # Weighted sum: (N, K)
+    rho_k = (h2m_patches.unsqueeze(-1) * cos2_weight).sum(dim=1)
+
+    # Zero border cells
+    rho_k[is_border] = 0.0
+
+    # Total energy per cell
+    z0 = rho_k.sum(dim=-1)  # (N,)
+
+    # Cell centre pixel coordinates
+    ci = torch.arange(nH, device=device, dtype=dtype) * S + P / 2.0
+    cj = torch.arange(nW, device=device, dtype=dtype) * S + P / 2.0
+    cy = ci.unsqueeze(1).expand(nH, nW).reshape(-1)
+    cx = cj.unsqueeze(0).expand(nH, nW).reshape(-1)
+
+    return {
+        "nH": nH,
+        "nW": nW,
+        "N": N,
+        "P": P,
+        "S": S,
+        "rho_k": rho_k,
+        "z0": z0,
+        "is_border": is_border,
+        "cx": cx,
+        "cy": cy,
+        "bin_centers": bin_centers,
+        "K": K,
+    }
 
 
-def _build_moment_matrices(Z0, Z2, Z4):
-    N = Z0.shape[0]
-    device = Z0.device
-    M = torch.zeros((N, 3, 3), dtype=torch.complex128, device=device)
+# ═══════════════════════════════════════════════════════════════
+# GABA-budget recurrence on K-channel representation
+# ═══════════════════════════════════════════════════════════════
 
-    Z0_c = Z0.to(torch.complex128)
-    Z2_conj = Z2.conj()
-    Z4_conj = Z4.conj()
+def gaba_recurrence(
+    rho_k: torch.Tensor,
+    nH: int, nW: int,
+    is_border: torch.Tensor,
+    K: int,
+    R: int,
+    sigma_d: float | None,
+    sigma_t: float,
+    n_passes: int,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Recurrent GABA-budget collinear facilitation on K-channel cell grid.
 
-    M[:, 0, 0] = Z0_c
-    M[:, 0, 1] = Z2_conj
-    M[:, 0, 2] = Z4_conj
-    M[:, 1, 0] = Z2
-    M[:, 1, 1] = Z0_c
-    M[:, 1, 2] = Z2_conj
-    M[:, 2, 0] = Z4
-    M[:, 2, 1] = Z2
-    M[:, 2, 2] = Z0_c
+    Args:
+        rho_k: (N, K) per-bin cell energies
+        nH, nW: cell grid dimensions
+        is_border: (N,) bool
+        K: number of orientation bins
+        R, sigma_d, sigma_t: collinear kernel parameters
+        n_passes: number of recurrence iterations
 
-    return M
+    Returns:
+        rho_k_out: (N, K) modulated per-bin energies after all passes
+        kappa_k: (N, K) final-pass per-bin collinear coherence
+    """
+    device = rho_k.device
+    dtype = rho_k.dtype
+
+    # Build depthwise kernels: (K, 1, 2R+1, 2R+1)
+    kernels = _build_collinear_kernels(R, K, sigma_d, sigma_t, device, dtype)
+
+    # Reshape to (1, K, nH, nW) for depthwise conv
+    ib_grid = is_border.reshape(nH, nW)
+    rho_grid = rho_k.reshape(nH, nW, K).permute(2, 0, 1).unsqueeze(0)  # (1, K, nH, nW)
+
+    # Zero border cells
+    border_mask_4d = ib_grid.unsqueeze(0).unsqueeze(0).expand_as(rho_grid)
+    rho_grid = torch.where(border_mask_4d, torch.zeros_like(rho_grid), rho_grid)
+
+    kappa_grid = torch.zeros_like(rho_grid)
+
+    for t in range(n_passes):
+        # Depthwise conv: each bin k convolved with its own kernel W_k
+        # groups=K means each channel is convolved independently
+        s_k = F.conv2d(rho_grid, kernels, padding=R, groups=K)  # (1, K, nH, nW)
+
+        # Total energy across all bins at each cell
+        e_total = s_k.sum(dim=1, keepdim=True)  # (1, 1, nH, nW)
+
+        # Per-bin fair-share: κ_k = S_k / (E_total / K + ε)
+        per_bin_avg = e_total / K
+        kappa_grid = s_k / (per_bin_avg + eps)
+        kappa_grid = kappa_grid.clamp(0.0, 1.0)
+
+        # Zero borders
+        kappa_grid = torch.where(border_mask_4d, torch.zeros_like(kappa_grid), kappa_grid)
+
+        # Modulate
+        rho_grid = rho_grid * kappa_grid
+        rho_grid = torch.where(border_mask_4d, torch.zeros_like(rho_grid), rho_grid)
+
+    # Reshape back to (N, K)
+    rho_k_out = rho_grid.squeeze(0).permute(1, 2, 0).reshape(-1, K)
+    kappa_k_out = kappa_grid.squeeze(0).permute(1, 2, 0).reshape(-1, K)
+
+    return rho_k_out, kappa_k_out
 
 
-def _eigh_3x3_hermitian(M: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    eps_local = 1e-30
-    dtype_c = M.dtype
-    dtype_r = torch.float64 if dtype_c == torch.complex128 else torch.float32
-    dev = M.device
+# ═══════════════════════════════════════════════════════════════
+# Extract dominant orientation + scalar ρ for renderer interface
+# ═══════════════════════════════════════════════════════════════
 
-    a00 = M[..., 0, 0].real.to(dtype_r)
-    a11 = M[..., 1, 1].real.to(dtype_r)
-    a22 = M[..., 2, 2].real.to(dtype_r)
-    m01 = M[..., 0, 1]
-    m02 = M[..., 0, 2]
-    m12 = M[..., 1, 2]
-    s01 = (m01.real * m01.real + m01.imag * m01.imag).to(dtype_r)
-    s02 = (m02.real * m02.real + m02.imag * m02.imag).to(dtype_r)
-    s12 = (m12.real * m12.real + m12.imag * m12.imag).to(dtype_r)
+def extract_dominant(
+    rho_k: torch.Tensor,
+    kappa_k: torch.Tensor,
+    rho_k_initial: torch.Tensor,
+    bin_centers: torch.Tensor,
+    is_border: torch.Tensor,
+    K: int,
+    nH: int,
+    nW: int,
+    R: int,
+    sigma_d: float | None,
+    sigma_t: float,
+    eps: float = 1e-15,
+) -> dict:
+    """Extract per-cell scalar ρ, θ, κ from K-bin representation."""
+    N = rho_k.shape[0]
+    device = rho_k.device
+    dtype = rho_k.dtype
 
-    p1 = a00 + a11 + a22
-    p2 = (a00 * a11 - s01) + (a00 * a22 - s02) + (a11 * a22 - s12)
-    triple = m01 * m12 * m02.conj()
-    p3 = (
-        a00 * (a11 * a22 - s12)
-        - a22 * s01
-        - a11 * s02
-        + 2.0 * triple.real.to(dtype_r)
+    dominant_bin = rho_k.argmax(dim=-1)
+    idx = dominant_bin.unsqueeze(-1)
+    rho = rho_k.gather(1, idx).squeeze(-1)
+    kappa = kappa_k.gather(1, idx).squeeze(-1)
+    rho_init = rho_k_initial.gather(1, idx).squeeze(-1)
+
+    theta_dominant = bin_centers[dominant_bin]
+    theta = torch.stack([theta_dominant, theta_dominant], dim=-1)
+
+    e_col = _e_col_dominant_bin(
+        rho_k, dominant_bin, nH, nW, K, R, sigma_d, sigma_t, eps,
     )
 
-    p1_3 = p1 / 3.0
-    q = (p2 - p1 * p1 / 3.0) / 3.0
-    r = (p3 - p1 * p2 / 3.0 + 2.0 * p1 * p1 * p1 / 27.0) / 2.0
+    rho = torch.where(is_border, torch.zeros_like(rho), rho)
+    kappa = torch.where(is_border, torch.zeros_like(kappa), kappa)
+    e_col = torch.where(is_border, torch.zeros_like(e_col), e_col)
 
-    nq = (-q).clamp_min(0.0)
-    nq_sqrt = nq.sqrt()
-    nq_pow_3_2 = nq_sqrt * nq
+    rho_max = rho_k.max(dim=-1).values
+    rho_max = torch.where(is_border, torch.zeros_like(rho_max), rho_max)
 
-    deg_eps = 1e-24 if dtype_r == torch.float64 else 1e-10
-    matrix_scale_sq = (p1 * p1).clamp_min(deg_eps)
-    degenerate = nq < deg_eps * matrix_scale_sq
-    safe_denom = nq_pow_3_2.clamp_min(eps_local)
-    cos_phi = (r / safe_denom).clamp(-1.0, 1.0)
-    phi = torch.acos(cos_phi)
+    return {
+        "rho": rho,
+        "theta": theta,
+        "kappa_col": kappa,
+        "rho_max": rho_max,
+        "rho_initial": rho_init,
+        "e_col": e_col,
+        "dominant_bin": dominant_bin,
+    }
 
-    two_sqrt_nq = 2.0 * nq_sqrt
-    third = 1.0 / 3.0
-    mu_max = two_sqrt_nq * torch.cos(phi * third)
-    mu_mid = two_sqrt_nq * torch.cos((phi - 2.0 * math.pi) * third)
-    mu_min = two_sqrt_nq * torch.cos((phi - 4.0 * math.pi) * third)
 
-    lam_max = torch.where(degenerate, p1_3, p1_3 + mu_max)
-    lam_mid = torch.where(degenerate, p1_3, p1_3 + mu_mid)
-    lam_min = torch.where(degenerate, p1_3, p1_3 + mu_min)
+# ═══════════════════════════════════════════════════════════════
+# Seed module (simplified: just η_z on K-bin energies)
+# ═══════════════════════════════════════════════════════════════
 
-    w = torch.stack([lam_min, lam_mid, lam_max], dim=-1)
+def _inv_softplus(x: float) -> float:
+    return math.log(math.expm1(max(float(x), 1e-8)))
 
-    batch_shape = M.shape[:-2]
-    M_flat = M.reshape(-1, 3, 3)
-    w_flat = w.reshape(-1, 3)
-    N = M_flat.shape[0]
-    arange_N = torch.arange(N, device=dev)
-    I3 = torch.eye(3, dtype=dtype_c, device=dev).unsqueeze(0)
 
-    g_lo = w_flat[:, 1] - w_flat[:, 0]
-    g_hi = w_flat[:, 2] - w_flat[:, 1]
-    gaps = torch.stack([g_lo, torch.minimum(g_lo, g_hi), g_hi], dim=-1)
-    order = gaps.argsort(dim=-1, descending=True)
+class HypercolumnSeed(nn.Module):
+    """Learned η_z for hypercolumn K-bin normalization.
 
-    cp_eps = 1e-30 if dtype_r == torch.float64 else 1e-14
-    matrix_scale = p1.reshape(-1).abs().clamp_min(1.0)
-    cp_threshold = (
-        cp_eps * matrix_scale * matrix_scale * matrix_scale * matrix_scale
+    ρ_k = rho_k_raw / (z0 + η_z)
+
+    Single learned parameter.  The GABA recurrence handles all
+    competitive normalization; η_z just sets the gain floor.
+    """
+
+    def __init__(
+        self,
+        r_pool: int = SEED.R_POOL,
+        stride: int = SEED.STRIDE,
+        eps: float = SEED.EPS,
+        eta_z_init: float = SEED.ETA_Z_INIT,
+    ):
+        super().__init__()
+        self.R = int(r_pool)
+        self.stride = int(stride)
+        self.eps = float(eps)
+        self._eta_z_raw = nn.Parameter(
+            torch.tensor(_inv_softplus(max(eta_z_init, 1e-6)), dtype=torch.float32)
+        )
+
+    @property
+    def eta_z(self) -> torch.Tensor:
+        return F.softplus(self._eta_z_raw)
+
+    def normalize(self, rho_k_raw: torch.Tensor, z0: torch.Tensor) -> torch.Tensor:
+        """Normalize K-bin energies: ρ_k = rho_k_raw / (z0 + η_z).
+
+        Args:
+            rho_k_raw: (N, K) raw per-bin energies from hypercolumn construction
+            z0: (N,) total energy per cell
+
+        Returns:
+            rho_k: (N, K) normalized per-bin energies
+        """
+        denom = (z0 + self.eta_z).clamp_min(self.eps).unsqueeze(-1)  # (N, 1)
+        return rho_k_raw / denom
+
+
+# ═══════════════════════════════════════════════════════════════
+# Full L1 pipeline: hypercolumn + seed + recurrence
+# ═══════════════════════════════════════════════════════════════
+
+def run_l1_hypercolumn(
+    h2m: torch.Tensor,
+    theta_h: torch.Tensor,
+    border_mask: torch.Tensor,
+    seed: HypercolumnSeed,
+    P: int = L1.PATCH_SIZE,
+    patch_overlap: int = L1.PATCH_OVERLAP,
+    border_patch_max_frac: float = L1.BORDER_PATCH_MAX_FRAC,
+    K: int = L1.COL_K_BINS,
+    R: int = L1.COL_RADIUS,
+    sigma_d: float | None = L1.COL_SIGMA_D,
+    sigma_t: float = L1.COL_SIGMA_T,
+    n_passes: int = L1.COL_PASSES,
+    eps: float = 1e-6,
+    verbose: bool = True,
+) -> dict:
+    """Run the full hypercolumn L1 pipeline.
+
+    L0 output → K-bin hypercolumns → η_z normalization → GABA recurrence
+    → extract dominant orientation for renderer.
+
+    Args:
+        h2m: (H, W) from L0
+        theta_h: (H, W) from L0
+        border_mask: (H, W) bool
+        seed: HypercolumnSeed module (provides learned η_z)
+        P, patch_overlap, border_patch_max_frac: patch geometry
+        K, R, sigma_d, sigma_t, n_passes: recurrence params
+        verbose: print diagnostics
+
+    Returns:
+        cells dict compatible with the renderer interface
+    """
+    device = h2m.device
+
+    # Step 1: Build hypercolumns
+    hc = build_hypercolumns(
+        h2m, theta_h, border_mask,
+        P=P, patch_overlap=patch_overlap,
+        border_patch_max_frac=border_patch_max_frac,
+        K=K, eps=eps,
+    )
+    nH, nW, N = hc["nH"], hc["nW"], hc["N"]
+    S = hc["S"]
+
+    if verbose:
+        print(f"  hypercolumn grid {nH}×{nW} = {N} cells, K={K} bins")
+
+    # Step 2: Normalize with learned η_z
+    rho_k_raw = hc["rho_k"]  # (N, K)
+    z0 = hc["z0"]            # (N,)
+    rho_k_norm = seed.normalize(rho_k_raw, z0)
+
+    # Save initial (pre-recurrence) for preservation ratio
+    rho_k_initial = rho_k_norm.detach().clone()
+
+    if verbose:
+        interior = ~hc["is_border"]
+        rho_max_init = rho_k_norm[interior].max(dim=-1).values
+        print(f"  η_z={seed.eta_z.item():.3f}  "
+              f"ρ_k max (interior): mean={rho_max_init.mean():.4f} "
+              f"max={rho_max_init.max():.4f}")
+
+    # Step 3: GABA-budget recurrence
+    rho_k_out, kappa_k = gaba_recurrence(
+        rho_k_norm, nH, nW, hc["is_border"], K,
+        R=R, sigma_d=sigma_d, sigma_t=sigma_t,
+        n_passes=n_passes, eps=eps,
     )
 
-    lam_complex = w_flat.to(dtype_c)
-    V_unsorted = torch.empty_like(M_flat)
+    if verbose:
+        interior = ~hc["is_border"]
+        rho_max_out = rho_k_out[interior].max(dim=-1).values
+        print(f"  after {n_passes} GABA passes: "
+              f"ρ_max mean={rho_max_out.mean():.4f} "
+              f"max={rho_max_out.max():.4f}")
 
-    for j in range(3):
-        k = order[:, j]
-        lam_k = lam_complex.gather(-1, k.unsqueeze(-1)).squeeze(-1)
-        A = M_flat - lam_k.unsqueeze(-1).unsqueeze(-1) * I3
-        r0, r1, r2 = A[:, 0, :], A[:, 1, :], A[:, 2, :]
-
-        u01 = torch.stack([
-            r0[:, 1] * r1[:, 2] - r0[:, 2] * r1[:, 1],
-            r0[:, 2] * r1[:, 0] - r0[:, 0] * r1[:, 2],
-            r0[:, 0] * r1[:, 1] - r0[:, 1] * r1[:, 0],
-        ], dim=-1)
-        u02 = torch.stack([
-            r0[:, 1] * r2[:, 2] - r0[:, 2] * r2[:, 1],
-            r0[:, 2] * r2[:, 0] - r0[:, 0] * r2[:, 2],
-            r0[:, 0] * r2[:, 1] - r0[:, 1] * r2[:, 0],
-        ], dim=-1)
-        u12 = torch.stack([
-            r1[:, 1] * r2[:, 2] - r1[:, 2] * r2[:, 1],
-            r1[:, 2] * r2[:, 0] - r1[:, 0] * r2[:, 2],
-            r1[:, 0] * r2[:, 1] - r1[:, 1] * r2[:, 0],
-        ], dim=-1)
-
-        n01 = (u01.real * u01.real + u01.imag * u01.imag).sum(dim=-1)
-        n02 = (u02.real * u02.real + u02.imag * u02.imag).sum(dim=-1)
-        n12 = (u12.real * u12.real + u12.imag * u12.imag).sum(dim=-1)
-        norms = torch.stack([n01, n02, n12], dim=-1)
-        candidates = torch.stack([u01, u02, u12], dim=1)
-        best = norms.argmax(dim=-1)
-        v_cand = candidates[arange_N, best]
-        best_norm_sq = norms.gather(-1, best.unsqueeze(-1)).squeeze(-1)
-
-        for jj in range(j):
-            vj = V_unsorted[:, :, jj]
-            proj = (vj.conj() * v_cand).sum(dim=-1, keepdim=True)
-            v_cand = v_cand - proj * vj
-
-        v_norm_sq = (v_cand.real * v_cand.real + v_cand.imag * v_cand.imag).sum(dim=-1)
-        good = (best_norm_sq > cp_threshold) & (v_norm_sq > cp_threshold)
-        v_cand = v_cand / v_norm_sq.clamp_min(eps_local).sqrt().to(dtype_c).unsqueeze(-1)
-
-        if j == 0:
-            fb = torch.zeros_like(v_cand)
-            fb[:, 0] = 1.0
-        elif j == 1:
-            v0 = V_unsorted[:, :, 0]
-            min_idx = v0.abs().argmin(dim=-1)
-            fb = torch.zeros_like(v_cand)
-            fb[arange_N, min_idx] = 1.0
-            proj = (v0.conj() * fb).sum(dim=-1, keepdim=True)
-            fb = fb - proj * v0
-            fb_n = (fb.real * fb.real + fb.imag * fb.imag).sum(
-                dim=-1, keepdim=True
-            ).clamp_min(eps_local).sqrt().to(dtype_c)
-            fb = fb / fb_n
-        else:
-            v0, v1 = V_unsorted[:, :, 0], V_unsorted[:, :, 1]
-            fb = torch.stack([
-                v0[:, 1] * v1[:, 2] - v0[:, 2] * v1[:, 1],
-                v0[:, 2] * v1[:, 0] - v0[:, 0] * v1[:, 2],
-                v0[:, 0] * v1[:, 1] - v0[:, 1] * v1[:, 0],
-            ], dim=-1)
-            fb_n = (fb.real * fb.real + fb.imag * fb.imag).sum(
-                dim=-1, keepdim=True
-            ).clamp_min(eps_local).sqrt().to(dtype_c)
-            fb = fb / fb_n
-
-        V_unsorted[:, :, j] = torch.where(good.unsqueeze(-1), v_cand, fb)
-
-    inv_order = torch.argsort(order, dim=-1)
-    inv_idx = inv_order.unsqueeze(1).expand(-1, 3, -1)
-    V_flat = torch.gather(V_unsorted, -1, inv_idx)
-
-    V = V_flat.reshape(*batch_shape, 3, 3)
-    return w, V
-
-
-def _theta_from_eigenvector(v_col: torch.Tensor) -> torch.Tensor:
-
-    eps = 1e-15
-    v0 = v_col[:, 0]
-    v1 = v_col[:, 1]
-    v2 = v_col[:, 2]
-    use_first = v0.abs() >= eps
-    ratio = torch.where(
-        use_first,
-        v1 / torch.where(use_first, v0, torch.ones_like(v0)),
-        v2 / torch.where(~use_first & (v1.abs() >= eps), v1, torch.ones_like(v1)),
+    # Step 4: Extract dominant orientation for renderer interface
+    dom = extract_dominant(
+        rho_k_out, kappa_k, rho_k_initial,
+        hc["bin_centers"], hc["is_border"], K,
+        nH, nW, R, sigma_d, sigma_t, eps=eps,
     )
-    th = 0.5 * torch.angle(ratio)
-    th = th % math.pi
-    return th
+
+    interior_flat = tile_interior_flat(
+        nH, nW, hc["is_border"], seed.R, seed.stride, device,
+    )
+    dom["rho"] = dom["rho"] * interior_flat
+    dom["kappa_col"] = dom["kappa_col"] * interior_flat
+    dom["e_col"] = dom["e_col"] * interior_flat
+    dom["rho_max"] = dom["rho_max"] * interior_flat
+    rho_pair = torch.stack([dom["rho"], dom["rho"]], dim=-1)
+    kappa_pair = torch.stack([dom["kappa_col"], dom["kappa_col"]], dim=-1)
+
+    is_border_out = hc["is_border"].cpu().numpy()
+    kappa_cell = dom["kappa_col"].reshape(nH, nW).detach().cpu().numpy()
+    e_cell = dom["e_col"].reshape(nH, nW).detach().cpu().numpy()
+
+    lam3_hw = torch.zeros(nH, nW, device=device, dtype=h2m.dtype).cpu().numpy()
+
+    # Build renderer-compatible cells dict
+    cells = {
+        "nH": nH,
+        "nW": nW,
+        "P": P,
+        "S": S,
+        "theta": dom["theta"].cpu().numpy(),
+        "lam": rho_pair.detach().cpu().numpy(),
+        "lam3": lam3_hw,
+        "z0": z0.detach().cpu().numpy(),
+        "cx": hc["cx"].cpu().numpy(),
+        "cy": hc["cy"].cpu().numpy(),
+        "cx_z2": hc["cx"].cpu().numpy(),
+        "cy_z2": hc["cy"].cpu().numpy(),
+        "is_border": is_border_out,
+        "kappa": kappa_pair.detach().cpu().numpy(),
+        "q": torch.zeros(N, 2, device=device).cpu().numpy(),
+        "z1_abs_sum": torch.zeros(N, device=device).cpu().numpy(),
+        "rho_k": rho_k_out.detach().cpu().numpy(),
+        "kappa_k": kappa_k.detach().cpu().numpy(),
+        "rho_k_initial": rho_k_initial.cpu().numpy(),
+        "dominant_bin": dom["dominant_bin"].cpu().numpy(),
+        "K": K,
+        "kappa_col_cell": kappa_cell,
+        "e_col_cell": e_cell,
+    }
+    return cells
 
 
+# ═══════════════════════════════════════════════════════════════
+# Legacy compatibility aliases
+# ═══════════════════════════════════════════════════════════════
+
+# Old code imports run_l1 from L1 — provide a wrapper
 def run_l1(
     z1: torch.Tensor,
     z2: torch.Tensor,
@@ -429,294 +595,41 @@ def run_l1(
     img: torch.Tensor | None = None,
     device: torch.device | str | None = None,
     verbose: bool = True,
+    # New: pass seed module and L0 fields for hypercolumn construction
+    seed: HypercolumnSeed | None = None,
+    h2m: torch.Tensor | None = None,
+    theta_h: torch.Tensor | None = None,
 ) -> dict:
+    """Legacy-compatible wrapper.
 
-    dev = torch.device(device) if device is not None else z1.device
-    z1 = z1.to(dev)
-    z2 = z2.to(dev)
+    If seed, h2m, theta_h are provided: runs the new hypercolumn pipeline.
+    Otherwise: falls back to computing h2m/theta_h from z2 and running
+    the hypercolumn pipeline with a default seed (η_z=5.0).
+
+    ``img`` is accepted for API compatibility and ignored (RGB partition
+    photometry was removed).
+    """
+    _ = img
+    dev = torch.device(device) if device is not None else z2.device
+
+    if h2m is None:
+        # Reconstruct from z2
+        h2m = z2.abs().float().to(dev)
+    if theta_h is None:
+        theta_h = (0.5 * torch.angle(z2)).float().to(dev)
+
+    if seed is None:
+        seed = HypercolumnSeed().to(dev)
+
     border_mask = border_mask.to(dev)
 
-    H, W = z1.shape
-    S = stride_from_patch_overlap(P, patch_overlap)
-    nH = (H - P) // S + 1 if H >= P else 0
-    nW = (W - P) // S + 1 if W >= P else 0
-    n = nH * nW
-
-    if verbose:
-        print(f"  grid {nH}x{nW} = {n} cells, {L1.N_BRANCHES} branches/cell (λ₁, λ₂)")
-
-    z2_patches = _extract_patches_torch(z2, nH, nW, P, S)
-    z1_patches = _extract_patches_torch(z1, nH, nW, P, S)
-
-    bm_float = border_mask.float()
-    bm_patches = _extract_patches_torch(bm_float, nH, nW, P, S)
-    is_border_flat = bm_patches.mean(dim=-1) > border_patch_max_frac
-
-    z2_abs = z2_patches.abs().to(torch.float64)
-    local_y_64 = (
-        torch.arange(P, device=dev, dtype=torch.float64)
-        .unsqueeze(1)
-        .expand(P, P)
-        .reshape(-1)
-    )
-    local_x_64 = (
-        torch.arange(P, device=dev, dtype=torch.float64)
-        .unsqueeze(0)
-        .expand(P, P)
-        .reshape(-1)
+    cells = run_l1_hypercolumn(
+        h2m.to(dev), theta_h.to(dev), border_mask,
+        seed=seed,
+        P=P, patch_overlap=patch_overlap,
+        border_patch_max_frac=border_patch_max_frac,
+        verbose=verbose,
+        eps=eps,
     )
 
-    z2_patches_c128 = z2_patches.to(torch.complex128)
-    Z0 = z2_abs.sum(dim=-1)
-    Z2 = z2_patches_c128.sum(dim=-1)
-    Z4 = (z2_patches_c128 * z2_patches_c128).sum(dim=-1)
-
-    z1_patches_c128 = z1_patches.to(torch.complex128)
-    Z1_sum = z1_patches_c128.sum(dim=-1)
-    z1_abs_sum = z1_patches.abs().sum(dim=-1).to(torch.float64)
-
-    n_pix_patch_f = float(P * P)
-    z1_bar = Z1_sum / n_pix_patch_f
-    z2_bar = Z2 / n_pix_patch_f
-    z1_bar_abs_flat = z1_bar.abs().to(torch.float32)
-    z2_bar_abs_flat = z2_bar.abs().to(torch.float32)
-    phi_z1_flat = torch.angle(z1_bar).to(torch.float32)
-    z1_bar_abs_flat = torch.where(
-        is_border_flat, torch.zeros_like(z1_bar_abs_flat), z1_bar_abs_flat
-    )
-    z2_bar_abs_flat = torch.where(
-        is_border_flat, torch.zeros_like(z2_bar_abs_flat), z2_bar_abs_flat
-    )
-    phi_z1_flat = torch.where(is_border_flat, torch.zeros_like(phi_z1_flat), phi_z1_flat)
-
-    M = _build_moment_matrices(Z0, Z2, Z4)
-    del (
-        Z0,
-        Z2,
-        Z4,
-        z2_patches,
-        z2_patches_c128,
-        z1_patches_c128,
-        bm_float,
-        bm_patches,
-    )
-
-    w_all, v_all = _eigh_3x3_hermitian(M)
-    del M
-    if not torch.isfinite(w_all).all():
-        w_all = torch.where(torch.isfinite(w_all), w_all, torch.zeros_like(w_all))
-    if not torch.isfinite(v_all).all():
-        v_all = torch.where(
-            torch.isfinite(v_all.real).unsqueeze(-1).all(dim=-1, keepdim=True),
-            v_all,
-            torch.zeros_like(v_all),
-        )
-
-    lam3 = w_all[:, 0]
-    lam2 = w_all[:, 1]
-    lam1 = w_all[:, 2]
-
-    th_b0 = _theta_from_eigenvector(v_all[:, :, 2])
-    th_b1 = _theta_from_eigenvector(v_all[:, :, 1])
-
-    def _q_for_theta(theta: torch.Tensor) -> torch.Tensor:
-        exp_ith = torch.complex(torch.cos(theta), torch.sin(theta))
-        return (Z1_sum.conj() * exp_ith).real
-
-    q_b0 = _q_for_theta(th_b0)
-    q_b1 = _q_for_theta(th_b1)
-
-    delta_b0 = ((lam1 - lam3) / (lam1 + eps)).clamp(0.0, 1.0)
-    delta_b1 = ((lam2 - lam3) / (lam2 + eps)).clamp(0.0, 1.0)
-
-    theta_flat = torch.stack([th_b0, th_b1], dim=-1)
-    q_flat = torch.stack([q_b0, q_b1], dim=-1)
-    delta_flat = torch.stack([delta_b0, delta_b1], dim=-1)
-    lam_flat = torch.stack([lam1, lam2], dim=-1)
-
-    kappa_flat = _patch_orientation_kappa(
-        z1_patches, theta_flat, q_flat, P, eps,
-    )
-    del z1_patches
-
-    lam_pair_sum = lam1 + lam2
-    lam_sum = lam1 + lam2 + lam3
-    lam_bar = lam_sum / 3.0
-
-    theta_flat[is_border_flat] = 0.0
-    q_flat[is_border_flat] = 0.0
-    delta_flat[is_border_flat] = 0.0
-    lam_flat[is_border_flat] = 0.0
-    kappa_flat[is_border_flat] = 0.0
-
-    lam3_masked = lam3.clone()
-    lam3_masked[is_border_flat] = 0.0
-
-    pis = torch.arange(nH, device=dev).repeat_interleave(nW)
-    pjs = torch.arange(nW, device=dev).repeat(nH)
-    cx_flat = pjs.double() * S + P / 2.0
-    cy_flat = pis.double() * S + P / 2.0
-
-    sw = z2_abs.sum(dim=-1)
-    has_mass = sw > eps
-
-    # Local z₂ centroid offsets (within patch, relative to geometric centre)
-    # Used to shift the partition cut to where the contrast energy is.
-    local_cx_z2 = torch.where(
-        has_mass,
-        (z2_abs * local_x_64.unsqueeze(0)).sum(dim=-1) / sw.clamp_min(eps),
-        torch.full_like(sw, (P - 1) / 2.0),
-    )
-    local_cy_z2 = torch.where(
-        has_mass,
-        (z2_abs * local_y_64.unsqueeze(0)).sum(dim=-1) / sw.clamp_min(eps),
-        torch.full_like(sw, (P - 1) / 2.0),
-    )
-    # Offset from geometric centre: the partition line passes through this point
-    dcx_z2 = local_cx_z2 - (P - 1) / 2.0   # (n,) local x offset
-    dcy_z2 = local_cy_z2 - (P - 1) / 2.0   # (n,) local y offset
-
-    # Global z₂ centroid (for renderer anchoring)
-    glob_x_64 = (pjs.double() * S).unsqueeze(1) + local_x_64.unsqueeze(0)
-    glob_y_64 = (pis.double() * S).unsqueeze(1) + local_y_64.unsqueeze(0)
-    wx = (z2_abs * glob_x_64).sum(dim=-1)
-    wy = (z2_abs * glob_y_64).sum(dim=-1)
-    cx_z2_flat = torch.where(has_mass, wx / sw.clamp_min(eps), cx_flat)
-    cy_z2_flat = torch.where(has_mass, wy / sw.clamp_min(eps), cy_flat)
-    cx_z2_flat = torch.where(is_border_flat, cx_flat, cx_z2_flat)
-    cy_z2_flat = torch.where(is_border_flat, cy_flat, cy_z2_flat)
-    del z2_abs, glob_x_64, glob_y_64, local_x_64, local_y_64, sw, wx, wy
-
-    color_out = None
-    if img is not None:
-        img_dev = img.to(dev)
-        if img_dev.shape[:2] != z1.shape[:2]:
-            raise ValueError(
-                f"img shape {tuple(img_dev.shape[:2])} must match z1 "
-                f"spatial shape {tuple(z1.shape[:2])}"
-            )
-        lum_img, chr_img = _rgb_split_l0(img_dev)
-        lum_patches = (
-            _extract_patches_channels(lum_img, nH, nW, P, S)
-            .squeeze(-1)
-            .to(torch.float32)
-        )
-        chr_patches = _extract_patches_channels(chr_img, nH, nW, P, S).to(torch.float32)
-
-        L_plus, L_minus, C_plus, C_minus = _pool_partition_sides(
-            lum_patches,
-            chr_patches,
-            theta_flat,
-            q_flat,
-            P,
-            eps,
-            dcx=dcx_z2,
-            dcy=dcy_z2,
-        )
-
-        L_plus[is_border_flat] = 0.0
-        L_minus[is_border_flat] = 0.0
-        C_plus[is_border_flat] = 0.0
-        C_minus[is_border_flat] = 0.0
-
-        # Same η_lum, η_chr as L0: Naka–Rushton on partition mean differences
-        eta_l_sq = float(L0.ETA_LUM) ** 2
-        eta_c_sq = float(L0.ETA_CHR) ** 2
-        dL = (L_plus - L_minus).abs()
-        dC = (C_plus - C_minus).norm(dim=-1)
-        dL_sq = dL * dL
-        dC_sq = dC * dC
-        s_lum = (dL_sq / (dL_sq + eta_l_sq)).clamp(0.0, 1.0 - 1e-6)
-        s_chr = (dC_sq / (dC_sq + eta_c_sq)).clamp(0.0, 1.0 - 1e-6)
-        s_lum[is_border_flat] = 0.0
-        s_chr[is_border_flat] = 0.0
-
-        color_out = {
-            "L_plus": L_plus.reshape(nH, nW, L1.N_BRANCHES),
-            "L_minus": L_minus.reshape(nH, nW, L1.N_BRANCHES),
-            "C_plus": C_plus.reshape(nH, nW, L1.N_BRANCHES, 3),
-            "C_minus": C_minus.reshape(nH, nW, L1.N_BRANCHES, 3),
-            "s_lum": s_lum.to(torch.float32).reshape(nH, nW, L1.N_BRANCHES),
-            "s_chr": s_chr.to(torch.float32).reshape(nH, nW, L1.N_BRANCHES),
-        }
-
-    if verbose:
-        lam1_np = lam1.cpu().numpy()
-        lam2_np = lam2.cpu().numpy()
-        lam3_np = lam3.cpu().numpy()
-        n_border = int(is_border_flat.sum().item())
-        n_active = n - n_border
-        print(f"  active={n_active}  border={n_border}")
-        print(f"  λ₁: mean={lam1_np.mean():.2f} max={lam1_np.max():.2f}")
-        print(f"  λ₂: mean={lam2_np.mean():.2f} max={lam2_np.max():.2f}")
-        print(f"  λ₃: mean={lam3_np.mean():.4f}")
-        print(
-            f"  δ₀: mean={float(delta_b0.mean()):.3f}  "
-            f"δ₁: mean={float(delta_b1.mean()):.3f}"
-        )
-        print(
-            f"  |q|₀: mean={float(q_b0.abs().mean()):.3f}  "
-            f"|q|₁: mean={float(q_b1.abs().mean()):.3f}"
-        )
-        print(
-            f"  κ₀: mean={float(kappa_flat[:, 0].mean()):.3f}  "
-            f"κ₁: mean={float(kappa_flat[:, 1].mean()):.3f}"
-        )
-        if color_out is not None:
-            dL = (color_out["L_plus"] - color_out["L_minus"]).abs()
-            dC = (color_out["C_plus"] - color_out["C_minus"]).norm(dim=-1)
-            print(
-                f"  photometry: same η_lum={float(L0.ETA_LUM):.3f}, η_chr={float(L0.ETA_CHR):.3f} as L0 "
-                "(NR on partition mean Δ)"
-            )
-            print(
-                f"  |ΔL|₀: mean={float(dL[..., 0].mean()):.3f}  "
-                f"|ΔL|₁: mean={float(dL[..., 1].mean()):.3f}"
-            )
-            print(
-                f"  ‖ΔC‖₀: mean={float(dC[..., 0].mean()):.3f}  "
-                f"‖ΔC‖₁: mean={float(dC[..., 1].mean()):.3f}"
-            )
-            print(
-                f"  s_lum₀: mean={float(color_out['s_lum'][..., 0].mean()):.3f}  "
-                f"max={float(color_out['s_lum'][..., 0].max()):.3f}"
-            )
-            print(
-                f"  s_chr₀: mean={float(color_out['s_chr'][..., 0].mean()):.3f}  "
-                f"max={float(color_out['s_chr'][..., 0].max()):.3f}"
-            )
-
-    def _to_np(t):
-        return t.cpu().numpy()
-
-    out = {
-        "nH": nH,
-        "nW": nW,
-        "S": S,
-        "P": P,
-        "theta": _to_np(theta_flat.reshape(nH, nW, L1.N_BRANCHES)),
-        "q": _to_np(q_flat.reshape(nH, nW, L1.N_BRANCHES)),
-        "delta": _to_np(delta_flat.reshape(nH, nW, L1.N_BRANCHES)),
-        "kappa": _to_np(kappa_flat.reshape(nH, nW, L1.N_BRANCHES)),
-        "lam": _to_np(lam_flat.reshape(nH, nW, L1.N_BRANCHES)),
-        "lam3": _to_np(lam3_masked.reshape(nH, nW)),
-        "z0": _to_np(lam_pair_sum.reshape(nH, nW)),
-        "lam_bar": _to_np(lam_bar.reshape(nH, nW)),
-        "cx": _to_np(cx_flat.reshape(nH, nW)),
-        "cy": _to_np(cy_flat.reshape(nH, nW)),
-        "cx_z2": _to_np(cx_z2_flat.reshape(nH, nW)),
-        "cy_z2": _to_np(cy_z2_flat.reshape(nH, nW)),
-        "z1_bar_abs": _to_np(z1_bar_abs_flat.reshape(nH, nW)),
-        "z1_abs_sum": _to_np(z1_abs_sum.to(torch.float32).reshape(nH, nW)),
-        "z2_bar_abs": _to_np(z2_bar_abs_flat.reshape(nH, nW)),
-        "phi_z1": _to_np(phi_z1_flat.reshape(nH, nW)),
-        "is_border": _to_np(is_border_flat.reshape(nH, nW)),
-    }
-    if color_out is not None:
-        out["L_plus"] = _to_np(color_out["L_plus"])
-        out["L_minus"] = _to_np(color_out["L_minus"])
-        out["C_plus"] = _to_np(color_out["C_plus"])
-        out["C_minus"] = _to_np(color_out["C_minus"])
-        out["s_lum"] = _to_np(color_out["s_lum"])
-        out["s_chr"] = _to_np(color_out["s_chr"])
-    return out
+    return cells
