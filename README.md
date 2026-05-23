@@ -239,7 +239,7 @@ uv run test.py --model output/checkpoints/best.pt
 | `--device` | CUDA if available | `cpu`, `cuda`, or `mps` |
 | `--tol` | `0.0075` | Precision-match radius factor (`max_dist = tol * image_diagonal`) |
 
-Checkpoints produced **before** per-pixel η modulation was added do not contain `eta_mod_a`, `eta_mod_b`, or `eta_mod_c`. `infer.py` / `test.py` load with `strict=False`, so missing keys keep their **initial** values (a=2, b=0, c=0) until you **retrain** with the current `train.py`; a short **WARNING** is printed when any of those keys are absent from the file.
+Checkpoints produced **before** per-pixel η modulation was added do not contain `eta_mod_a`, `eta_mod_b`, `eta_mod_c`, or `eta_mod_d`. `infer.py` / `test.py` load with `strict=False`, so missing keys keep their **initial** values (a=2, b=0, c=0, d=0) until you **retrain** with the current `train.py`; a short **WARNING** is printed when any of those keys are absent from the file.
 
 ### Infer
 

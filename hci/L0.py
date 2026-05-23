@@ -448,6 +448,8 @@ def compute_eta_modulation(
     a: torch.Tensor | float,
     b: torch.Tensor | float,
     c: torch.Tensor | float,
+    d: torch.Tensor | float = 0.0,
+    pres_ratio_grid: torch.Tensor | None = None,
     eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""Compute spatially-varying η maps for L0 pass 2.
@@ -456,27 +458,29 @@ def compute_eta_modulation(
 
     .. math::
         \eta(p) = \eta_0 \cdot \sigma\!\bigl(a - b\cdot\bar\kappa(p)
-                  + c\cdot\bar E_{\text{col}}(p)\bigr)
+                  + c\cdot\bar E_{\text{col}}(p)
+                  + d\cdot\bar r_{\text{pres}}(p)\bigr)
 
-    Three learned scalars (a, b, c) control the modulation:
-      - a: bias (positive → η starts near η₀, keeps L0 sensitive by default)
-      - b: κ coefficient (positive → high collinear coherence reduces η,
-            boosting sensitivity where geometric structure exists)
-      - c: E_col coefficient (positive → high absolute energy increases η,
-            keeping sensitivity low where edges are already strong)
+    where :math:`\bar r_{\text{pres}}` is the collinear **preservation ratio**
+    on the cell grid (``ρ`` after recurrence divided by initial ``ρ + ε``),
+    max-normalized like :math:`E_{\text{col}}` for stable logits.  If
+    ``pres_ratio_grid`` is ``None``, the :math:`d\cdot\bar r_{\text{pres}}`
+    term is omitted (equivalent to zero ratio).
 
-    At initialization (a=2, b=0, c=0): σ(2) ≈ 0.88, so η ≈ 0.88·η₀
-    everywhere — near-identity, no modulation.
+    Scalars (a, b, c, d) control the modulation; at init (a=2, b=c=d=0),
+    :math:`\sigma(2)\approx 0.88` → near-identity.
 
     Args:
         kappa_col_grid: (nH, nW) normalized collinear coherence
         e_col_grid:     (nH, nW) raw (unnormalized) collinear energy
         is_border_grid: (nH, nW) bool
+        pres_ratio_grid: (nH, nW) optional; :math:`\rho^{(T)}/(\rho^{(0)}+\epsilon)`
+            on cells (e.g. clamped), borders masked like κ
         nH, nW: cell grid dimensions
         H, W: pixel dimensions
         S, P: cell grid stride and patch size
         eta0_lum, eta0_chr: base η values from pass 1
-        a, b, c: learned modulation parameters (scalars or 0-d tensors)
+        a, b, c, d: learned modulation parameters (scalars or 0-d tensors)
 
     Returns:
         eta_lum_map: (H, W) per-pixel η for luminance
@@ -493,16 +497,27 @@ def compute_eta_modulation(
     e_max = e_col.max().clamp_min(eps)
     e_col_norm = e_col / e_max
 
+    if pres_ratio_grid is not None:
+        pres = torch.where(
+            is_border_grid, torch.zeros_like(pres_ratio_grid), pres_ratio_grid,
+        )
+        pres_max = pres.max().clamp_min(eps)
+        pres_norm = pres / pres_max
+    else:
+        pres_norm = None
+
     # Resolve scalars to tensors on the right device
     def _t(x):
         if isinstance(x, torch.Tensor):
             return x.to(device=device, dtype=dtype)
         return torch.tensor(float(x), device=device, dtype=dtype)
 
-    a_t, b_t, c_t = _t(a), _t(b), _t(c)
+    a_t, b_t, c_t, d_t = _t(a), _t(b), _t(c), _t(d)
 
-    # σ(a - b·κ + c·E_col_norm) on cell grid
+    # σ(a - b·κ + c·E_col_norm + d·r_pres_norm) on cell grid
     logit = a_t - b_t * kappa + c_t * e_col_norm
+    if pres_norm is not None:
+        logit = logit + d_t * pres_norm
     mod_grid = torch.sigmoid(logit)
 
     # Interpolate to pixel resolution
@@ -528,11 +543,13 @@ def run_l0_two_pass(
     a: torch.Tensor | float = 2.0,
     b: torch.Tensor | float = 0.0,
     c: torch.Tensor | float = 0.0,
+    d: torch.Tensor | float = 0.0,
+    pres_ratio_grid: torch.Tensor | None = None,
     verbose: bool = True,
 ) -> dict:
     """Run L0 pass 2 with η modulated by collinear coherence from pass 1.
 
-    η(p) = η₀ · σ(a - b·κ̄(p) + c·Ē_col(p))
+    η(p) = η₀ · σ(a - b·κ̄(p) + c·Ē_col(p) + d·r̄_pres(p))
 
     Pass 1 is assumed to have already been run (producing the collinear
     signals).  This function computes the η modulation map and re-runs
@@ -547,7 +564,9 @@ def run_l0_two_pass(
         e_col_grid: (nH, nW) raw collinear energy from pass 1
         is_border_grid: (nH, nW) bool
         nH, nW, S, P: cell grid geometry
-        a, b, c: learned modulation params (scalar or 0-d tensor)
+        a, b, c, d: learned modulation params (scalar or 0-d tensor)
+        pres_ratio_grid: optional (nH, nW) cell-grid preservation ratio; if
+            ``None``, the :math:`d\cdot\bar r_{\text{pres}}` term is omitted
         verbose: print diagnostics
 
     Returns:
@@ -560,7 +579,8 @@ def run_l0_two_pass(
         kappa_col_grid, e_col_grid, is_border_grid,
         nH, nW, H, W, S, P,
         eta0_lum=eta_lum, eta0_chr=eta_chr,
-        a=a, b=b, c=c,
+        a=a, b=b, c=c, d=d,
+        pres_ratio_grid=pres_ratio_grid,
     )
 
     if verbose:
@@ -572,7 +592,8 @@ def run_l0_two_pass(
         a_v = a.item() if isinstance(a, torch.Tensor) else a
         b_v = b.item() if isinstance(b, torch.Tensor) else b
         c_v = c.item() if isinstance(c, torch.Tensor) else c
-        print(f"  σ params: a={a_v:.3f}  b={b_v:.3f}  c={c_v:.3f}")
+        d_v = d.item() if isinstance(d, torch.Tensor) else d
+        print(f"  σ params: a={a_v:.3f}  b={b_v:.3f}  c={c_v:.3f}  d={d_v:.3f}")
 
     # Re-run L0 with spatially-varying η
     result = run_l0(
