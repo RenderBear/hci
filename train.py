@@ -669,9 +669,9 @@ def format_renderer_param_lines(r: ModulationRenderer, *, indent: str = "  ") ->
 def _format_seed_block(model: HarmonicContourE2E) -> str:
     s = model.seed
     parts = [
-        "\n--- L1 seed (raw λ₁/(z₀+η_z), NR pool off) ---\n",
+        "\n--- L1 seed (NR) ---\n",
         *[ln + "\n" for ln in format_seed_param_lines(s, indent="")],
-        "\nρ = λ₁/(z₀+η_z) × tile_interior  (no Allen–Cahn refine)\n",
+        "\nρ = NR_pool(λ₁/(z₀+η_z)) × tile_interior  (no Allen–Cahn refine)\n",
     ]
     return "".join(parts)
 
@@ -772,7 +772,7 @@ def main():
     )
     print(
         f"Seed: R={SEED.R_POOL}  stride={SEED.STRIDE}  "
-        f"ρ = λ₁/(z₀+η_z) × tile_interior  (NR pool off; learned η_z)"
+        f"ρ = NR_pool(λ₁/(z₀+η_z)) × tile_interior  (learned η_z, η_ρ; no dynamics)"
     )
     print(
         f"Render: harmonic-native h2m·gate + collinear coherence "

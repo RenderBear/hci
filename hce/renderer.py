@@ -1,29 +1,31 @@
-r"""Renderer — harmonic-native gating + collinear coherence.
+r"""Renderer — harmonic-native gating + recurrent collinear facilitation.
 
 Pipeline:
   1. Cell grid: ρ-weighted θ combing (unchanged).
-  2. Collinear coherence κ_col on cell grid (binned-θ conv, radius R).
-  3. Bilinear interpolation of cell-grid fields (ρ, θ, κ_col, s_photo,
-     coh) to pixel coordinates — no scatter-add splat.
+  2. Recurrent V1-style collinear facilitation + cross-orientation
+     suppression on cell grid (n_passes iterations, binned-θ conv).
+     Each pass: κ = col/(col+cross+ε), ρ ← ρ·κ.
+     Effective range ≈ n_passes × R.
+  3. Bilinear interpolation of modulated cell-grid fields (ρ_mod, θ,
+     κ_col, s_photo) to pixel coordinates — no scatter-add splat.
   4. Per-pixel feature vector F_p ∈ R¹⁷:
-       [h2m_lum, h2m_chr, ρ̄, θ̄_cos2, θ̄_sin2, κ̄_col, s̄_photo, coh,
+       [h2m_lum, h2m_chr, ρ̄, θ̄_cos2, θ̄_sin2, κ̄_col, s̄_photo,
         tang5(5), norm5(5)]
-     where tang5/norm5 are sampled from h2m (pixel-native), not from a
-     splatted ρ̄ field.
+     where tang5/norm5 are sampled from h2m (pixel-native).
   5. Thinning head: B̂(p) = h2m(p) · σ(W₂ ReLU(W₁ F_p + b₁) + b₂).
      17→16→1 MLP.
 
-The edge map is the pixel-native second-harmonic magnitude h2m, gated
-by the thinning MLP.  Cell-grid features inform the gate via bilinear
-interpolation (F.grid_sample) instead of Gaussian scatter-add.  This
-eliminates the cell-grid staircase artifacts that plagued the splat
-renderer.
+Collinear coherence (Step 2):
+  Recurrent divisive normalization on the cell grid.  Each cell's θ-bin
+  selects the collinear kernel; the orthogonal bin (θ + 90°) selects
+  the cross-oriented kernel.  κ = col_energy / (col + cross + ε) is
+  Naka–Rushton: co-aligned neighbors facilitate, cross-oriented suppress.
+  ρ is modulated by κ at each pass, so facilitation propagates along
+  contours and cross-orientation suppression cascades — gap bridging
+  and junction resolution emerge from the recurrence.
 
-Collinear coherence is unchanged: binned-θ convolution on the cell
-grid with Gaussian distance × tangent-selectivity kernels.
-
-Learned: s_t (1), s_n (1), ThinningHead 17→16→1 (17·16+16 + 16·1+1 = 305).
-Fixed: collinear kernels.
+Learned: s_t (1), s_n (1), ThinningHead 17→16→1 (305 params).
+Fixed: collinear kernels (precomputed), recurrent dynamics (0 params).
 Total: 307 learned scalars.
 """
 
@@ -54,6 +56,7 @@ _COL_RADIUS = getattr(RENDER, "COL_RADIUS", 5)
 _COL_K_BINS = getattr(RENDER, "COL_K_BINS", 24)
 _COL_SIGMA_D = getattr(RENDER, "COL_SIGMA_D", None)
 _COL_SIGMA_T = getattr(RENDER, "COL_SIGMA_T", 1.0)
+_COL_PASSES = getattr(RENDER, "COL_PASSES", 3)
 
 
 def _inv_softplus(x: float) -> float:
@@ -131,37 +134,102 @@ def compute_collinear_coherence(
     K: int = _COL_K_BINS,
     sigma_d: float | None = _COL_SIGMA_D,
     sigma_t: float = _COL_SIGMA_T,
+    n_passes: int = _COL_PASSES,
     eps: float = 1e-6,
-) -> torch.Tensor:
-    """Per-cell collinear coherence κ_col ∈ [0, 1] on the cell grid."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Recurrent V1-style collinear facilitation + cross-orientation suppression.
+
+    Each pass:
+      1. Convolve ρ·cos2θ, ρ·sin2θ, ρ with K tangent-selective kernels.
+      2. Each cell reads its own θ-bin (collinear) and the orthogonal bin
+         (cross-oriented).
+      3. κ_col = collinear_energy / (collinear + cross + ε)    (Naka–Rushton)
+      4. ρ ← ρ · κ_col                                         (modulate)
+      5. Feed updated ρ into next pass.
+
+    After n_passes, collinear facilitation has propagated along contours
+    (effective range ≈ n_passes × R) and cross-oriented cells have been
+    suppressed at each step.
+
+    Args:
+        theta_grid: (nH, nW) combed orientations
+        rho_grid:   (nH, nW) cell strengths
+        is_border_grid: (nH, nW) bool
+        R, K, sigma_d, sigma_t: kernel parameters
+        n_passes: number of recurrent iterations (default 3)
+
+    Returns:
+        kappa_col: (nH, nW) final collinear coherence in [0, 1]
+        rho_mod:   (nH, nW) modulated ρ after all passes
+    """
     device, dtype = theta_grid.device, theta_grid.dtype
     nH, nW = theta_grid.shape
 
-    rho_m = torch.where(is_border_grid, torch.zeros_like(rho_grid), rho_grid)
-    u = rho_m * torch.cos(2.0 * theta_grid)
-    v = rho_m * torch.sin(2.0 * theta_grid)
-
     kernels = _build_collinear_kernels(R, K, sigma_d, sigma_t, device, dtype)
 
-    u_4d = u.unsqueeze(0).unsqueeze(0)
-    v_4d = v.unsqueeze(0).unsqueeze(0)
-    rho_4d = rho_m.unsqueeze(0).unsqueeze(0)
-
-    conv_u = F.conv2d(u_4d, kernels, padding=R)
-    conv_v = F.conv2d(v_4d, kernels, padding=R)
-    conv_rho = F.conv2d(rho_4d, kernels, padding=R)
-
+    # Bin assignments (fixed across passes — θ doesn't change)
     bin_idx = ((theta_grid % math.pi) * (K / math.pi)).long().clamp(0, K - 1)
-    bin_idx_4d = bin_idx.unsqueeze(0).unsqueeze(0)
-    sum_u = torch.gather(conv_u, 1, bin_idx_4d).squeeze(0).squeeze(0)
-    sum_v = torch.gather(conv_v, 1, bin_idx_4d).squeeze(0).squeeze(0)
-    sum_rho = torch.gather(conv_rho, 1, bin_idx_4d).squeeze(0).squeeze(0)
+    bin_idx_4d = bin_idx.unsqueeze(0).unsqueeze(0)  # (1, 1, nH, nW)
 
-    agreement_mag = (sum_u * sum_u + sum_v * sum_v).sqrt()
-    kappa_col = agreement_mag / sum_rho.clamp_min(eps)
-    kappa_col = kappa_col.clamp(0.0, 1.0)
-    kappa_col = torch.where(is_border_grid, torch.zeros_like(kappa_col), kappa_col)
-    return kappa_col
+    # Orthogonal bin: offset by K/2 (90°)
+    bin_idx_cross = (bin_idx + K // 2) % K
+    bin_idx_cross_4d = bin_idx_cross.unsqueeze(0).unsqueeze(0)
+
+    rho_m = torch.where(is_border_grid, torch.zeros_like(rho_grid), rho_grid)
+    kappa_col = torch.zeros_like(rho_m)
+
+    # Cell's own double-angle unit vector (fixed across passes)
+    c2 = torch.cos(2.0 * theta_grid)  # cos(2θ_c)
+    s2 = torch.sin(2.0 * theta_grid)  # sin(2θ_c)
+
+    for t in range(n_passes):
+        # Double-angle fields with current ρ
+        u = rho_m * torch.cos(2.0 * theta_grid)
+        v = rho_m * torch.sin(2.0 * theta_grid)
+
+        u_4d = u.unsqueeze(0).unsqueeze(0)
+        v_4d = v.unsqueeze(0).unsqueeze(0)
+        rho_4d = rho_m.unsqueeze(0).unsqueeze(0)
+
+        # Convolve with all K kernels
+        conv_u = F.conv2d(u_4d, kernels, padding=R)    # (1, K, nH, nW)
+        conv_v = F.conv2d(v_4d, kernels, padding=R)    # (1, K, nH, nW)
+        conv_rho = F.conv2d(rho_4d, kernels, padding=R) # (1, K, nH, nW)
+
+        # Collinear: gather from own θ-bin
+        su_col = torch.gather(conv_u, 1, bin_idx_4d).squeeze(0).squeeze(0)
+        sv_col = torch.gather(conv_v, 1, bin_idx_4d).squeeze(0).squeeze(0)
+        sr_col = torch.gather(conv_rho, 1, bin_idx_4d).squeeze(0).squeeze(0)
+
+        # Cross-oriented: gather from orthogonal bin
+        su_cross = torch.gather(conv_u, 1, bin_idx_cross_4d).squeeze(0).squeeze(0)
+        sv_cross = torch.gather(conv_v, 1, bin_idx_cross_4d).squeeze(0).squeeze(0)
+        sr_cross = torch.gather(conv_rho, 1, bin_idx_cross_4d).squeeze(0).squeeze(0)
+
+        # Project neighbor energy onto cell's own orientation:
+        #   col_energy = (Σ_col w·ρ·cos2θ') · cos2θ_c + (Σ_col w·ρ·sin2θ') · sin2θ_c
+        #              = Σ_col w·ρ·cos(2(θ' - θ_c))
+        # This is positive when neighbors agree, near-zero when they disagree.
+        # Clamp to ≥ 0 since negative means anti-aligned (which is same edge, π away).
+        col_proj = (su_col * c2 + sv_col * s2).clamp_min(0.0)
+
+        # Cross energy: project onto orthogonal direction
+        #   cross_proj = -su_cross·sin2θ_c + sv_cross·cos2θ_c
+        #              = Σ_cross w·ρ·sin(2(θ' - θ_c))
+        # Take abs since cross-orientation can be ±90°
+        cross_proj = (sv_cross * c2 - su_cross * s2).abs()
+
+        # Divisive normalization (Naka–Rushton):
+        #   κ = col / (col + cross + ε)
+        kappa_col = col_proj / (col_proj + cross_proj + eps)
+        kappa_col = kappa_col.clamp(0.0, 1.0)
+        kappa_col = torch.where(is_border_grid, torch.zeros_like(kappa_col), kappa_col)
+
+        # Modulate ρ for next pass (recurrence)
+        rho_m = rho_m * kappa_col
+        rho_m = torch.where(is_border_grid, torch.zeros_like(rho_m), rho_m)
+
+    return kappa_col, rho_m
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -350,6 +418,7 @@ class ModulationRenderer(nn.Module):
         col_k_bins: int = _COL_K_BINS,
         col_sigma_d: float | None = _COL_SIGMA_D,
         col_sigma_t: float = _COL_SIGMA_T,
+        col_passes: int = _COL_PASSES,
         **kwargs,
     ):
         super().__init__()
@@ -362,6 +431,7 @@ class ModulationRenderer(nn.Module):
         self.col_k_bins = col_k_bins
         self.col_sigma_d = col_sigma_d
         self.col_sigma_t = col_sigma_t
+        self.col_passes = col_passes
 
     # Legacy compat — code that reads sigma_perp for diagnostics
     @property
@@ -521,8 +591,8 @@ def render_boundary_map_torch(
             return out, torch.zeros_like(out)
         return out
 
-    # ── Step 2: Collinear coherence on cell grid ─────────────
-    kappa_col_grid = compute_collinear_coherence(
+    # ── Step 2: Recurrent collinear facilitation + cross suppression ─
+    kappa_col_grid, rho_mod_grid = compute_collinear_coherence(
         theta_combed.detach(),
         rho_grid.detach(),
         ib_grid,
@@ -530,12 +600,13 @@ def render_boundary_map_torch(
         K=renderer.col_k_bins,
         sigma_d=renderer.col_sigma_d,
         sigma_t=renderer.col_sigma_t,
+        n_passes=renderer.col_passes,
         eps=eps,
     )
 
     # ── Step 3: Interpolate cell-grid fields to pixel res ────
-    # Zero out border cells before interpolation
-    rho_grid_m = torch.where(ib_grid, torch.zeros_like(rho_grid), rho_grid)
+    # Use modulated ρ (after collinear facilitation + cross suppression)
+    rho_grid_m = torch.where(ib_grid, torch.zeros_like(rho_mod_grid), rho_mod_grid)
     theta_cos2 = torch.where(ib_grid, torch.zeros_like(theta_combed),
                               rho_grid_m * torch.cos(2.0 * theta_combed))
     theta_sin2 = torch.where(ib_grid, torch.zeros_like(theta_combed),
