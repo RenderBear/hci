@@ -7,11 +7,12 @@ Pipeline:
      Each pass: κ = col/(col+cross+ε), ρ ← ρ·κ.
      Effective range ≈ n_passes × R.
   3. Bilinear interpolation of modulated cell-grid fields (ρ_mod, θ,
-     κ_col, s_photo) to pixel coordinates — no scatter-add splat.
+     κ_col) to pixel coordinates — no scatter-add splat.
   4. Per-pixel feature vector F_p ∈ R¹⁷:
-       [h2m_lum, h2m_chr, ρ̄, θ̄_cos2, θ̄_sin2, κ̄_col, s̄_photo,
-        tang5(5), norm5(5)]
-     where tang5/norm5 are sampled from h2m (pixel-native).
+       [h2m_lum, h2m_chr, ρ̄^(T), θ̄_cos2, θ̄_sin2, κ̄_col,
+        ρ̄^(T)/(ρ̄^(0)+ε), tang5(5), norm5(5)]
+     where ρ̄^(0) is pre–collinear-recurrence ρ (same bilinear interp as ρ̄^(T)),
+     and tang5/norm5 are sampled from h2m (pixel-native).
   5. Thinning head: B̂(p) = h2m(p) · σ(W₂ ReLU(W₁ F_p + b₁) + b₂).
      17→16→1 MLP.
 
@@ -383,7 +384,7 @@ def _sample_stencil_5(
 class ThinningHead(nn.Module):
     """17→16→1 MLP: σ(W₂ ReLU(W₁ F + b₁) + b₂).
 
-    F = [h2m_lum, h2m_chr, ρ̄, θ̄_cos2, θ̄_sin2, κ̄_col, s̄_photo,
+    F = [h2m_lum, h2m_chr, ρ̄^(T), θ̄_cos2, θ̄_sin2, κ̄_col, ρ̄^(T)/(ρ̄^(0)+ε),
          tang5(5), norm5(5)] ∈ R¹⁷.
     """
 
@@ -404,11 +405,11 @@ class ThinningHead(nn.Module):
             # Feature layout (in_dim=17):
             #   0: h2m_lum
             #   1: h2m_chr
-            #   2: ρ̄  (interpolated from cell grid)
-            #   3: θ̄_cos2  (cos(2θ) interpolated)
-            #   4: θ̄_sin2  (sin(2θ) interpolated)
+            #   2: ρ̄^(T)  (after collinear recurrence, interpolated)
+            #   3: θ̄_cos2
+            #   4: θ̄_sin2
             #   5: κ̄_col
-            #   6: s̄_photo
+            #   6: ρ̄^(T) / (ρ̄^(0) + ε)  collinear preservation ratio
             #   7-11: tang5 (on h2m)
             #   12-16: norm5 (on h2m)
 
@@ -419,12 +420,11 @@ class ThinningHead(nn.Module):
             # Unit 0: flat smoothing on tang5 (channels 7–11)
             self.fc1.weight[0, 7:12] = 0.2
 
-            # Unit 1: ρ̄ — cell-grid edge strength
+            # Unit 1: ρ̄^(T) — cell-grid edge strength
             self.fc1.weight[1, 2] = 1.0
 
-            # Unit 2: s_photo × ρ̄ agreement
-            self.fc1.weight[2, 2] = 0.5
-            self.fc1.weight[2, 6] = 0.5
+            # Unit 2: collinear preservation ratio (texture crushed → low)
+            self.fc1.weight[2, 6] = 1.0
 
             # Unit 3: h2m evidence
             self.fc1.weight[3, 0] = 0.5
@@ -435,9 +435,9 @@ class ThinningHead(nn.Module):
 
             # b₂ = 2 → σ(2) ≈ 0.88 near-identity gate at init
             self.fc2.bias.fill_(2.0)
-            # Positive weights on ρ̄, photometry, collinear units
-            self.fc2.weight[0, 1] = 0.3  # ρ̄ unit
-            self.fc2.weight[0, 2] = 0.2  # s_photo unit
+            # Positive weights on ρ̄^(T), preservation ratio, collinear units
+            self.fc2.weight[0, 1] = 0.3  # ρ̄^(T) unit
+            self.fc2.weight[0, 2] = 0.2  # preservation-ratio unit
             self.fc2.weight[0, 4] = 0.3  # collinear unit
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
@@ -545,7 +545,7 @@ def upgrade_renderer_state_dict(state_dict: dict, prefix: str = "") -> dict:
 
 
 def _expected_shape(key: str):
-    """Expected shapes for the new 17→16→1 thinning head."""
+    """Expected shapes for the 17→16→1 thinning head."""
     shapes = {
         "thinning.fc1.weight": (16, 17),
         "thinning.fc1.bias": (16,),
@@ -584,14 +584,6 @@ def _theta_on_branch(theta, branch_pick, n_cells, device):
         idx_n = torch.arange(n_cells, device=device, dtype=torch.long)
         return theta[idx_n, b]
     return theta[:, 0]
-
-
-def _s_photo_on_branch(s_photo, branch_pick, n_cells, device):
-    if branch_pick is not None:
-        b = branch_pick.to(device=device, dtype=torch.long).view(-1)
-        idx_n = torch.arange(n_cells, device=device, dtype=torch.long)
-        return s_photo[idx_n, b]
-    return s_photo[:, 0]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -723,30 +715,17 @@ def render_boundary_map_torch(
     theta_sin2 = torch.where(ib_grid, torch.zeros_like(theta_combed),
                               rho_grid_m * torch.sin(2.0 * theta_combed))
 
-    # s_photo on chosen branch
-    has_s_photo = "s_photo" in cells_flat
-    if has_s_photo:
-        s_photo_all = cells_flat["s_photo"].to(device=device, dtype=dtype)
-        s_photo_c = _s_photo_on_branch(s_photo_all, branch_pick, n_cells, device)
-        s_photo_grid = torch.where(
-            ib_grid, torch.zeros(nH, nW, device=device, dtype=dtype),
-            s_photo_c.reshape(nH, nW),
-        )
-    else:
-        s_photo_grid = torch.zeros(nH, nW, device=device, dtype=dtype)
-
     # Stack fields for a single grid_sample call: (nH, nW, C)
-    # channels: [ρ, cos2θ·ρ, sin2θ·ρ, κ_col, s_photo]
+    # channels: [ρ, cos2θ·ρ, sin2θ·ρ, κ_col]
     cell_stack = torch.stack([
         rho_grid_m,
         theta_cos2,
         theta_sin2,
         kappa_col_grid,
-        s_photo_grid,
-    ], dim=-1)  # (nH, nW, 5)
+    ], dim=-1)  # (nH, nW, 4)
 
     pix_stack = _interp_cell_to_pixel(cell_stack, nH, nW, H, W, S, P)
-    # (H, W, 5)
+    # (H, W, 4)
 
     rho_pix = pix_stack[..., 0]
     # Recover θ from interpolated double-angle (handles π-wraparound)
@@ -759,7 +738,12 @@ def render_boundary_map_torch(
     theta_pix = 0.5 * torch.atan2(sin2_norm, cos2_norm)
 
     kappa_col_pix = pix_stack[..., 3]
-    s_photo_pix = pix_stack[..., 4]
+
+    # Pre–collinear-recurrence ρ at pixels (same geometry as ρ̄^(T)); ratio
+    # encodes how much collinear recurrence preserved each site (texture → low).
+    rho0_pix = _interp_cell_to_pixel(rho_seed_cell, nH, nW, H, W, S, P)
+    rho_pres_ratio = rho_pix / (rho0_pix + eps)
+    rho_pres_ratio = rho_pres_ratio.clamp(max=10.0)
 
     # ── Step 4: Pixel-native h2m fields ──────────────────────
     if l0_pix is not None and "h2m_lum" in l0_pix:
@@ -787,11 +771,11 @@ def render_boundary_map_torch(
     features = torch.cat([
         h2m_lum.unsqueeze(-1),          # 0
         h2m_chr.unsqueeze(-1),          # 1
-        rho_pix.unsqueeze(-1),          # 2  (interpolated)
+        rho_pix.unsqueeze(-1),          # 2  ρ̄^(T) interpolated
         cos2_norm.unsqueeze(-1),        # 3  (interpolated double-angle)
         sin2_norm.unsqueeze(-1),        # 4
         kappa_col_pix.unsqueeze(-1),    # 5  (interpolated)
-        s_photo_pix.unsqueeze(-1),      # 6  (interpolated)
+        rho_pres_ratio.unsqueeze(-1),   # 6  ρ̄^(T)/(ρ̄^(0)+ε)
         tang5,                          # 7-11
         norm5,                          # 12-16
     ], dim=-1)  # (H, W, 17)

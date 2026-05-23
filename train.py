@@ -81,8 +81,12 @@ def build_l0_pix(
 
 def build_cells_flat(cells: dict) -> dict:
     for key in (
-        "L_plus", "L_minus", "C_plus", "C_minus",
-        "s_photo",
+        "L_plus",
+        "L_minus",
+        "C_plus",
+        "C_minus",
+        "s_lum",
+        "s_chr",
     ):
         if key not in cells:
             raise KeyError(
@@ -104,7 +108,8 @@ def build_cells_flat(cells: dict) -> dict:
         "C_minus": torch.from_numpy(
             cells["C_minus"].reshape(N, 2, 3).astype(np.float32)
         ),
-        "s_photo": torch.from_numpy(cells["s_photo"].reshape(N, 2).astype(np.float32)),
+        "s_lum": torch.from_numpy(cells["s_lum"].reshape(N, 2).astype(np.float32)),
+        "s_chr": torch.from_numpy(cells["s_chr"].reshape(N, 2).astype(np.float32)),
         "lam": torch.from_numpy(cells["lam"].reshape(N, 2).astype(np.float32)),
         "lam3": torch.from_numpy(cells["lam3"].reshape(N).astype(np.float32)),
         "z0": torch.from_numpy(cells["z0"].reshape(N).astype(np.float32)),
@@ -112,10 +117,6 @@ def build_cells_flat(cells: dict) -> dict:
         "cy_z2": torch.from_numpy(cells["cy_z2"].reshape(N).astype(np.float32)),
         "is_border": torch.from_numpy(cells["is_border"].reshape(N).astype(np.bool_)),
     }
-    # Optional: s_lum/s_chr for diagnostics
-    for k in ("s_lum", "s_chr"):
-        if k in cells:
-            result[k] = torch.from_numpy(cells[k].reshape(N, 2).astype(np.float32))
     return result
 
 
@@ -337,7 +338,8 @@ def _cache_entry_valid(data: dict) -> bool:
         "z0",
         "q",
         "kappa",
-        "s_photo",
+        "s_lum",
+        "s_chr",
         "L_plus",
     ):
         if key not in cf:

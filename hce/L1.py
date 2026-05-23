@@ -628,10 +628,8 @@ def run_l1(
         dC_sq = dC * dC
         s_lum = (dL_sq / (dL_sq + eta_l_sq)).clamp(0.0, 1.0 - 1e-6)
         s_chr = (dC_sq / (dC_sq + eta_c_sq)).clamp(0.0, 1.0 - 1e-6)
-        s_photo = (s_lum + s_chr - s_lum * s_chr).clamp(0.0, 1.0 - 1e-6)
         s_lum[is_border_flat] = 0.0
         s_chr[is_border_flat] = 0.0
-        s_photo[is_border_flat] = 0.0
 
         color_out = {
             "L_plus": L_plus.reshape(nH, nW, L1.N_BRANCHES),
@@ -640,7 +638,6 @@ def run_l1(
             "C_minus": C_minus.reshape(nH, nW, L1.N_BRANCHES, 3),
             "s_lum": s_lum.to(torch.float32).reshape(nH, nW, L1.N_BRANCHES),
             "s_chr": s_chr.to(torch.float32).reshape(nH, nW, L1.N_BRANCHES),
-            "s_photo": s_photo.to(torch.float32).reshape(nH, nW, L1.N_BRANCHES),
         }
 
     if verbose:
@@ -688,10 +685,6 @@ def run_l1(
                 f"  s_chr₀: mean={float(color_out['s_chr'][..., 0].mean()):.3f}  "
                 f"max={float(color_out['s_chr'][..., 0].max()):.3f}"
             )
-            print(
-                f"  s_photo₀: mean={float(color_out['s_photo'][..., 0].mean()):.3f}  "
-                f"max={float(color_out['s_photo'][..., 0].max()):.3f}"
-            )
 
     def _to_np(t):
         return t.cpu().numpy()
@@ -726,5 +719,4 @@ def run_l1(
         out["C_minus"] = _to_np(color_out["C_minus"])
         out["s_lum"] = _to_np(color_out["s_lum"])
         out["s_chr"] = _to_np(color_out["s_chr"])
-        out["s_photo"] = _to_np(color_out["s_photo"])
     return out

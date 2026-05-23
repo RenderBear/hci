@@ -817,7 +817,7 @@ def cell_s_chr_grid(cells_flat, nH, nW, *, branch=0):
     return _cell_signal_grid(cells_flat, "s_chr", nH, nW, branch=branch)
 
 
-def viz_infer_cell_photo(
+def viz_infer_l1_photometry(
     cells_flat: dict,
     nH: int,
     nW: int,
@@ -826,11 +826,10 @@ def viz_infer_cell_photo(
     *,
     branch: int = 0,
 ) -> None:
-    """ΔL, ‖ΔC‖, s_lum, s_chr, s_photo per cell (branch 0)."""
+    """ΔL, ‖ΔC‖, s_lum, s_chr per cell (branch 0)."""
     dL, dC_norm = cell_photo_diff_grids(cells_flat, nH, nW, branch=branch)
     s_lum = cell_s_lum_grid(cells_flat, nH, nW, branch=branch)
     s_chr = cell_s_chr_grid(cells_flat, nH, nW, branch=branch)
-    s_photo = _cell_signal_grid(cells_flat, "s_photo", nH, nW, branch=branch)
     interior = ~np.asarray(is_border, dtype=bool)
     panels = [
         (apply_border_zero(dL, is_border), r"$\Delta L = L^+ - L^-$", "coolwarm", None),
@@ -852,15 +851,9 @@ def viz_infer_cell_photo(
             "viridis",
             (0.0, 1.0),
         ),
-        (
-            apply_border_zero(s_photo, is_border),
-            r"$s_{\mathrm{photo}}$ (OR combination of lum/chr asymmetries)",
-            "viridis",
-            (0.0, 1.0),
-        ),
     ]
 
-    fig, axes = plt.subplots(5, 1, figsize=(5.5, 5.2 * 5), facecolor=VIZ.BG)
+    fig, axes = plt.subplots(4, 1, figsize=(5.5, 5.2 * 4), facecolor=VIZ.BG)
     axes_flat = np.atleast_1d(axes).ravel()
     for ax, (arr, title_base, cmap, vlim) in zip(axes_flat, panels):
         ax.set_facecolor(VIZ.PANEL_BG)
@@ -897,7 +890,7 @@ def viz_infer_cell_photo(
 
     fig.suptitle(
         rf"L1 photometry — $\Delta L$, $\|\Delta C\|$, $s_{{\mathrm{{lum}}}}$, "
-        rf"$s_{{\mathrm{{chr}}}}$, $s_{{\mathrm{{photo}}}}$ "
+        rf"$s_{{\mathrm{{chr}}}}$ "
         rf"(z₂-centroid partition, branch {branch})",
         fontsize=10,
         color=VIZ.FG,

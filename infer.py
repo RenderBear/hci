@@ -30,7 +30,7 @@ from hce.renderer import (
 from hce.diagnostics_viz import (
     viz_infer_l0_pinwheel,
     viz_infer_l1_lambdas,
-    viz_infer_cell_photo,
+    viz_infer_l1_photometry,
     viz_infer_rho_map_hist_cdf,
     viz_infer_rho_seed_final_dual_maps,
     viz_infer_rho_seed_final_hist_cdf,
@@ -402,7 +402,7 @@ def main():
         "-d",
         "--diagnostics",
         action="store_true",
-        help="Save additional diagnostics: base, l0_pinwheel, l1_lambdas, photo, "
+        help="Save additional diagnostics: base, l0_pinwheel, l1_lambdas, l1_photometry, "
         "rho (map+histogram+CDF), rho_seed vs rho_after_collinear (dual map + hist/CDF), "
         "iters_snapshot.png (pixel ρ via renderer bilinear at up to 5 collinear milestones), "
         "render_softmap, render_theta_bins, overlay (base RGB with thresholded edges).",
@@ -491,15 +491,15 @@ def main():
         viz_infer_l1_lambdas(prep["lam_grid"], prep["lam3_grid"], is_border, p_lam)
         saved_files.append(p_lam)
 
-        p_photo = os.path.join(od, f"{stem}_photo.png")
-        viz_infer_cell_photo(
+        p_l1_ph = os.path.join(od, f"{stem}_l1_photometry.png")
+        viz_infer_l1_photometry(
             prep["cells_flat"],
             prep["nH"],
             prep["nW"],
             is_border,
-            p_photo,
+            p_l1_ph,
         )
-        saved_files.append(p_photo)
+        saved_files.append(p_l1_ph)
 
         p_rho = os.path.join(od, f"{stem}_rho.png")
         viz_infer_rho_map_hist_cdf(rho_post, is_border, p_rho, eta_z=eta_z)

@@ -78,10 +78,6 @@ s_{\text{lum}} = \frac{(\Delta L)^2}{(\Delta L)^2 + \eta_{\text{lum}}^2}, \qquad
 s_{\text{chr}} = \frac{\|\Delta C\|^2}{\|\Delta C\|^2 + \eta_{\text{chr}}^2}
 $$
 
-$$
-s_{\text{photo}} = s_{\text{lum}} + s_{\text{chr}} - s_{\text{lum}}\,s_{\text{chr}}
-$$
-
 ---
 
 ## Seed — NR-normalized cell strength (learned $\eta_z$, $\eta_\rho$)
@@ -255,7 +251,14 @@ $$
 \bar{\theta}(p) = \tfrac{1}{2}\,\text{atan2}\!\bigl(\bar{v}/\bar{\rho},\;\bar{u}/\bar{\rho}\bigr)
 $$
 
-Similarly interpolated: $\bar{\kappa}_{\text{col}}(p)$, $\bar{s}_{\text{photo}}(p)$.
+Similarly interpolated: $\bar{\kappa}_{\text{col}}(p)$, and the **pre-recurrence**
+seed $\bar{\rho}^{(0)}(p)$ (same bilinear map; border cells contribute $0$).
+
+The thinning head uses the **collinear preservation ratio**
+$r(p) = \bar{\rho}^{(T)}(p) / (\bar{\rho}^{(0)}(p) + \varepsilon)$
+(clamped to a modest upper bound for numerical stability), which is high when
+recurrence leaves $\rho$ intact (long coherent edges) and low when texture is
+suppressed despite a strong initial seed.
 
 ---
 
@@ -280,8 +283,9 @@ and $s_t$, $s_n$ are learned stencil spacings.
 
 $$
 F_p = \bigl[\;h_{2m}^{\text{lum}},\; h_{2m}^{\text{chr}},\;
-\bar{\rho},\; \bar{u}/\bar{\rho},\; \bar{v}/\bar{\rho},\;
-\bar{\kappa}_{\text{col}},\; \bar{s}_{\text{photo}},\;
+\bar{\rho}^{(T)},\; \bar{u}/\bar{\rho}^{(T)},\; \bar{v}/\bar{\rho}^{(T)},\;
+\bar{\kappa}_{\text{col}},\;
+\frac{\bar{\rho}^{(T)}}{\bar{\rho}^{(0)} + \varepsilon},\;
 \text{tang}_5,\; \text{norm}_5\;\bigr]
 \;\in\;\mathbb{R}^{17}
 $$
@@ -304,8 +308,8 @@ Structural priors at initialization:
 | Unit | Wired to | Purpose |
 |------|----------|---------|
 | 0 | tang5 (flat 0.2), norm5 (Mexican hat) | Ridge profile detection |
-| 1 | $\bar{\rho}$ | Cell-grid edge strength |
-| 2 | $\bar{\rho} \times \bar{s}_{\text{photo}}$ | Photometric confirmation |
+| 1 | $\bar{\rho}^{(T)}$ | Cell-grid edge strength after recurrence |
+| 2 | $\bar{\rho}^{(T)}/(\bar{\rho}^{(0)}+\varepsilon)$ (clamped) | Collinear preservation — texture crushed → low |
 | 3 | $h_{2m}^{\text{lum}} + h_{2m}^{\text{chr}}$ | Harmonic evidence |
 | 4 | $\bar{\kappa}_{\text{col}}$ | Collinear coherence boost |
 
