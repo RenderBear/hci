@@ -60,7 +60,7 @@ RENDER = SimpleNamespace(
     COL_K_BINS=24,
     COL_SIGMA_D=None,       # default: R/2
     COL_SIGMA_T=1.0,
-    COL_PASSES=3,
+    COL_PASSES=5,
 )
 
 # ── Training ─────────────────────────────────────────────────────────────────

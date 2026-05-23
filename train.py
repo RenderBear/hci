@@ -183,14 +183,13 @@ class HarmonicContourE2E(nn.Module):
         self.eps = eps
         self.render_eps = max(float(eps), 1e-6)
 
-        # Learned η modulation: η₀·σ(a - b·κ + c·Ē_col + d·r̄_pres)
-        # Init: a=2, b=c=d=0 → σ(2) ≈ 0.88 → near-identity
+        # Learned η modulation: η₀·σ(a - b·κ + c·Ē_col)
+        # Init: a=2, b=c=0 → σ(2) ≈ 0.88 → near-identity
         self.eta_mod_enabled = eta_mod_enabled
         if eta_mod_enabled:
             self.eta_mod_a = nn.Parameter(torch.tensor(2.0, dtype=torch.float32))
             self.eta_mod_b = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
             self.eta_mod_c = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
-            self.eta_mod_d = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
 
     def forward_batch(self, meta_list):
         from hci.L0 import compute_eta_modulation
@@ -247,7 +246,7 @@ class HarmonicContourE2E(nn.Module):
                     theta_c.reshape(nH, nW), rho_grid, ib_grid,
                 )
 
-                kappa_col, rho_mod_grid, e_col = compute_collinear_coherence(
+                kappa_col, _, e_col = compute_collinear_coherence(
                     theta_combed.detach(),
                     rho_grid,
                     ib_grid,
@@ -259,13 +258,6 @@ class HarmonicContourE2E(nn.Module):
                     eps=self.render_eps,
                 )
 
-                rho_seed_cell = torch.where(
-                    ib_grid, torch.zeros_like(rho_grid), rho_grid,
-                )
-                pres_cell = rho_mod_grid / (rho_seed_cell + self.render_eps)
-                pres_cell = pres_cell.clamp(max=10.0)
-                pres_cell = torch.where(ib_grid, torch.zeros_like(pres_cell), pres_cell)
-
                 # Compute per-pixel η maps
                 H, W = m["proj_dev"]["H"], m["proj_dev"]["W"]
                 eta_lum_map, eta_chr_map = compute_eta_modulation(
@@ -276,8 +268,6 @@ class HarmonicContourE2E(nn.Module):
                     a=self.eta_mod_a,
                     b=self.eta_mod_b,
                     c=self.eta_mod_c,
-                    d=self.eta_mod_d,
-                    pres_ratio_grid=pres_cell,
                 )
 
                 # Fast L0 pass 2: reuse d_lum/d_chr, apply modulated η
@@ -692,12 +682,15 @@ def remap_checkpoint_state_dict(sd: dict) -> dict:
     """Load STRIATE ``dynamics._eta_z`` into ``seed``; drop other dynamics keys.
 
     ``seed._eta_rho_raw`` / ``dynamics._eta_rho_raw`` are omitted — NR pool on
-    the seed was removed; those tensors are not loaded.
+    the seed was removed; those tensors are not loaded.  ``eta_mod_d`` is
+    dropped if present (removed from the model).
     """
     skip = frozenset({"seed._eta_rho_raw", "dynamics._eta_rho_raw"})
     out: dict = {}
     for k, v in sd.items():
         if k in skip:
+            continue
+        if k == "eta_mod_d":
             continue
         if k == "dynamics._eta_z_raw":
             out["seed._eta_z_raw"] = v
@@ -764,7 +757,7 @@ def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
         else:
             print(f"    thinning.{name}: |grad|={t.grad.abs().mean().item():.2e}")
     if hasattr(model, "eta_mod_a"):
-        for label in ("eta_mod_a", "eta_mod_b", "eta_mod_c", "eta_mod_d"):
+        for label in ("eta_mod_a", "eta_mod_b", "eta_mod_c"):
             t = getattr(model, label, None)
             if t is None:
                 continue
@@ -869,8 +862,7 @@ def _format_render_params(model: HarmonicContourE2E):
     if hasattr(model, "eta_mod_a"):
         eta_str = (f" + η-mod σ(a={model.eta_mod_a.item():.1f},"
                    f"b={model.eta_mod_b.item():.1f},"
-                   f"c={model.eta_mod_c.item():.1f},"
-                   f"d={model.eta_mod_d.item():.1f})")
+                   f"c={model.eta_mod_c.item():.1f})")
     return (f"renderer={n_r} params  (harmonic-native, s_t, s_n, "
             f"thinning 18→16→1, collinear R={r.col_radius}{eta_str})")
 
@@ -879,7 +871,7 @@ def save_checkpoint(model, path):
     torch.save({"model_state": model.state_dict()}, path)
 
 
-_ETA_MOD_STATE_KEYS = frozenset({"eta_mod_a", "eta_mod_b", "eta_mod_c", "eta_mod_d"})
+_ETA_MOD_STATE_KEYS = frozenset({"eta_mod_a", "eta_mod_b", "eta_mod_c"})
 
 
 def report_checkpoint_compatibility(incompatible, context="checkpoint load"):
@@ -897,9 +889,9 @@ def report_checkpoint_compatibility(incompatible, context="checkpoint load"):
         print(
             f"[{context}] WARNING: checkpoint is missing η-mod weights {miss_eta}. "
             "Those parameters were not loaded and still use PyTorch init values "
-            "(a=2.0, b=0.0, c=0.0, d=0.0). Pass-2 η maps then reflect only that default σ, "
+            "(a=2.0, b=0.0, c=0.0). Pass-2 η maps then reflect only that default σ, "
             "not a trained modulation. Retrain with the current train.py to learn "
-            "eta_mod_a/b/c/d and write them into the checkpoint."
+            "eta_mod_a/b/c and write them into the checkpoint."
         )
 
 

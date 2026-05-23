@@ -247,7 +247,7 @@ def run_image_inference(model, img_path, device, *, verbose: bool = False):
                 theta_c.reshape(nH, nW), rho_grid, ib_grid,
             )
 
-            kappa_col, rho_mod_grid, e_col = compute_collinear_coherence(
+            kappa_col, _, e_col = compute_collinear_coherence(
                 theta_combed.detach(),
                 rho_grid,
                 ib_grid,
@@ -259,14 +259,6 @@ def run_image_inference(model, img_path, device, *, verbose: bool = False):
                 eps=model.render_eps,
             )
 
-            rho_seed_cell = torch.where(
-                ib_grid, torch.zeros_like(rho_grid), rho_grid,
-            )
-            pres_cell = rho_mod_grid / (rho_seed_cell + model.render_eps)
-            pres_cell = pres_cell.clamp(max=10.0)
-            pres_cell = torch.where(ib_grid, torch.zeros_like(pres_cell), pres_cell)
-
-            d_val = model.eta_mod_d if hasattr(model, "eta_mod_d") else 0.0
             eta_lum_map, eta_chr_map = compute_eta_modulation(
                 kappa_col, e_col, ib_grid,
                 nH, nW, H, W, S, P,
@@ -275,17 +267,13 @@ def run_image_inference(model, img_path, device, *, verbose: bool = False):
                 a=model.eta_mod_a,
                 b=model.eta_mod_b,
                 c=model.eta_mod_c,
-                d=d_val,
-                pres_ratio_grid=pres_cell,
             )
 
             if verbose:
-                d_show = model.eta_mod_d.item() if hasattr(model, "eta_mod_d") else 0.0
                 print(
                     f"  η-mod: a={model.eta_mod_a.item():.3f}  "
                     f"b={model.eta_mod_b.item():.3f}  "
-                    f"c={model.eta_mod_c.item():.3f}  "
-                    f"d={d_show:.3f}"
+                    f"c={model.eta_mod_c.item():.3f}"
                 )
                 print(
                     f"  η_lum map: [{eta_lum_map.min():.4f}, {eta_lum_map.max():.4f}]  "

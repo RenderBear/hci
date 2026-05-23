@@ -327,36 +327,30 @@ and L0 is re-run with the updated $\eta$.
 
 ### Modulation signal
 
-Two signals from the collinear recurrence, interpolated to pixel resolution,
-plus the **preservation ratio** on the cell grid (same definition as in the
-renderer feature stack: $\rho^{(T)}/(\rho^{(0)}+\epsilon)$, clamped), normalized
-to $[0,1]$ by its maximum for the sigmoid:
+Two signals from the collinear recurrence, interpolated to pixel resolution:
 
 - $\bar{\kappa}(p)$: normalized collinear coherence — "does geometric structure
   exist here?"
 - $\bar{E}_{\text{col}}(p)$: raw (unnormalized) collinear energy, normalized to
   $[0, 1]$ by $E_{\max}$ — "how strong is the absolute evidence?"
-- $\bar{r}_{\text{pres}}(p)$: preservation ratio (cell grid, then interpolated) —
-  "did collinear recurrence keep much of the initial $\rho$?"
 
 ### Learned modulation
 
 $$
 \boxed{
-\eta(p) = \eta_0 \;\cdot\; \sigma\!\bigl(a - b\cdot\bar{\kappa}(p) + c\cdot\bar{E}_{\text{col}}(p) + d\cdot\bar{r}_{\text{pres}}(p)\bigr)
+\eta(p) = \eta_0 \;\cdot\; \sigma\!\bigl(a - b\cdot\bar{\kappa}(p) + c\cdot\bar{E}_{\text{col}}(p)\bigr)
 }
 $$
 
-Four learned scalars $(a, b, c, d)$ control the modulation:
+Three learned scalars $(a, b, c)$ control the modulation:
 
 | Parameter | Role | Effect when large |
 |-----------|------|-------------------|
 | $a$ | Bias | $\sigma(a) \to 1$, η stays near η₀ by default |
 | $b$ | κ coefficient | High κ (geometric structure) → η drops → L0 more sensitive |
 | $c$ | $E_{\text{col}}$ coefficient | High absolute energy → η rises → L0 stays stable |
-| $d$ | Preservation-ratio coefficient | High $\bar{r}_{\text{pres}}$ shifts η either way depending on sign |
 
-**Initialization:** $a = 2, b = c = d = 0$ → $\sigma(2) \approx 0.88$ everywhere,
+**Initialization:** $a = 2, b = 0, c = 0$ → $\sigma(2) \approx 0.88$ everywhere,
 so $\eta \approx 0.88\,\eta_0$ — near-identity, no modulation.
 
 ### Behavior
@@ -391,7 +385,7 @@ is **not** re-run; the cell grid ($\rho, \theta, \lambda$) is from pass 1.
 | $W_1$: 18×16 + $b_1$: 16 | 304 | thinning hidden layer |
 | $W_2$: 16×1 + $b_2$: 1 | 17 | thinning output |
 | $\tilde{\eta}_z$ | 1 | seed (softplus → $\eta_z$) |
-| $a, b, c, d$ | 4 | η modulation (sigmoid); $d$ scales normalized preservation ratio |
-| **Total learned** | **328** | |
+| $a, b, c$ | 3 | η modulation (sigmoid) |
+| **Total learned** | **327** | |
 | Collinear kernels | $K \times (2R+1)^2$ | fixed, not learned |
 | Pass-2 L0 recompute | $d_k$ cached | ~10× cheaper than full L0 |
