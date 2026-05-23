@@ -80,16 +80,34 @@ $$
 
 ---
 
-## Seed — NR-normalized cell strength (learned $\eta_z$, $\eta_\rho$)
+## Seed — cell strength from $\lambda_1$ (learned $\eta_z$; optional NR pool)
+
+**Implemented in** `hce/seed.py` (`RhoSeedModule`).
+
+Raw ratio (per cell, border cells forced to $0$):
 
 $$
-r_c = \frac{\lambda_{1,c}}{z_{0,c} + \eta_z}, \qquad
-\rho_c = \frac{r_c^2}{r_c^2 + \mu_R^2(r) + \eta_\rho^2}\;\cdot\;\mathbf{1}[\text{tile interior}]
+r_c = \frac{\lambda_{1,c}}{\max(z_{0,c} + \eta_z,\;\varepsilon)}
 $$
 
-where $\mu_R^2(r)$ is the local mean of $r^2$ in a pool of radius $R$ on the cell grid,
-and $\eta_z = \text{softplus}(\tilde{\eta}_z)$, $\eta_\rho = \text{softplus}(\tilde{\eta}_\rho)$
-are the two learned parameters.
+with $\eta_z = \text{softplus}(\tilde{\eta}_z)$ and small $\varepsilon$ for numerical stability.
+
+**Current default:** no Naka–Rushton pooling on $r$ — the seed passed to the renderer is
+
+$$
+\rho_c = r_c \cdot \mathbf{1}[\text{tile interior}],\qquad
+\text{tile interior} = (\neg\text{border}) \wedge \text{covered by the }(2R{+}1)^2\text{ tile grid (stride }S\text{)}.
+$$
+
+So $\rho$ is the **ratio** $r$, not $r^2$, and the tile mask is the same sliding-window coverage as before.
+
+**Optional NR pool** (same routine as STRIATE-style pooling; **present in code but currently commented out** in `rho_cell`): would map $x=r$ to
+
+$$
+\rho^{\text{NR}}_c = \frac{x_c^2}{x_c^2 + \mu_{R}^2(x^2) + \eta_\rho^2 + \varepsilon},
+$$
+
+where $\mu_{R}^2(x^2)$ is the **local average of $x^2=r^2$** over a $(2R{+}1)^2$ cell neighborhood (`avg_pool2d` on $r^2$), and $\eta_\rho = \text{softplus}(\tilde{\eta}_\rho)$. When that branch is off, $\tilde{\eta}_\rho$ is still a learned parameter but **does not affect** $\rho$ in the forward pass.
 
 ---
 
@@ -324,6 +342,6 @@ $b_2 = 2$ so $\sigma(2) \approx 0.88$ at initialization (near-identity gate).
 | $s_t$, $s_n$ | 2 | learned stencil spacings |
 | $W_1$: 17×16 + $b_1$: 16 | 288 | thinning hidden layer |
 | $W_2$: 16×1 + $b_2$: 1 | 17 | thinning output |
-| $\tilde{\eta}_z$, $\tilde{\eta}_\rho$ | 2 | seed (in RhoSeedModule) |
+| $\tilde{\eta}_z$, $\tilde{\eta}_\rho$ | 2 | seed (`RhoSeedModule`; $\eta_\rho$ unused unless NR pool branch is enabled) |
 | **Total learned** | **309** | |
 | Collinear kernels | $K \times (2R+1)^2$ | fixed, not learned |
