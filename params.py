@@ -36,7 +36,6 @@ SEED = SimpleNamespace(
     STRIDE=7,
     EPS=1e-9,
     ETA_Z_INIT=5.0,
-    ETA_RHO_INIT=0.1,
 )
 
 # ── Render: Gaussian-line splat + collinear coherence + thinning ─────────────

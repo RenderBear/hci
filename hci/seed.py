@@ -1,8 +1,8 @@
-r"""L1 → ρ_seed: eigendecomposition statistics, Naka–Rushton pool normalize, tile mask.
+r"""L1 → ρ_seed: eigendecomposition statistics and tile-interior mask.
 
-No tile dynamics: ``ρ`` is fixed from the L1 cell grid as in STRIATE's TileDynamics
-initial condition (``r = λ₁/(z₀+η_z)``, then ``NR_pool``), times the same
-tile-interior coverage mask used previously.
+No tile dynamics: ``ρ`` is fixed from the L1 cell grid as
+``ρ = (λ₁/(z₀+η_z)) · interior`` (no NR pool on the seed).  Learned scalar
+``η_z`` only.
 """
 
 from __future__ import annotations
@@ -18,45 +18,6 @@ from params import SEED
 
 def _inv_softplus(x: float) -> float:
     return math.log(math.expm1(max(float(x), 1e-8)))
-
-
-def naka_rushton_pool_normalize(
-    x_flat: torch.Tensor,
-    nH: int,
-    nW: int,
-    pool_radius: int,
-    eta: torch.Tensor,
-    is_border: torch.Tensor,
-    eps: float,
-) -> torch.Tensor:
-    """Local Naka–Rushton on the cell grid (same as STRIATE L2 seed / recurrent NR)."""
-    x_1d = x_flat.reshape(-1)
-    ib_1d = is_border.reshape(-1)
-    if x_1d.numel() != nH * nW:
-        raise ValueError(
-            f"naka_rushton_pool_normalize: x has {x_1d.numel()} elements, "
-            f"expected nH*nW={nH * nW} (nH={nH}, nW={nW})"
-        )
-    if ib_1d.numel() != nH * nW:
-        raise ValueError(
-            f"naka_rushton_pool_normalize: is_border has {ib_1d.numel()} elements, "
-            f"expected {nH * nW}"
-        )
-    R = int(pool_radius)
-    k = 2 * R + 1
-    x_sq = x_1d * x_1d
-    x_sq_g = x_sq.view(nH, nW)
-    mu_sq = Fn.avg_pool2d(
-        x_sq_g.unsqueeze(0).unsqueeze(0),
-        kernel_size=k,
-        stride=1,
-        padding=R,
-    ).squeeze(0).squeeze(0).reshape(-1)
-    et = eta.to(dtype=x_1d.dtype, device=x_1d.device)
-    eta_sq = et * et
-    denom = x_sq + mu_sq + eta_sq + eps
-    out = x_sq / denom
-    return torch.where(ib_1d, torch.zeros_like(out), out)
 
 
 def _build_tile_grid(nH, nW, R, stride, dev):
@@ -79,7 +40,7 @@ def _build_tile_membership(ti, tj, nW, R, dev):
 
 
 class RhoSeedModule(nn.Module):
-    """Learned ``η_z`` for raw ratio seed; ``η_ρ`` only used if NR pool is enabled."""
+    """Learned ``η_z`` for raw ratio seed ``r = λ₁/(z₀+η_z)`` (no NR-pool param)."""
 
     def __init__(
         self,
@@ -95,17 +56,10 @@ class RhoSeedModule(nn.Module):
         self._eta_z_raw = nn.Parameter(
             torch.tensor(_inv_softplus(max(eta_z_init, 1e-6)), dtype=torch.float32)
         )
-        self._eta_rho_raw = nn.Parameter(
-            torch.tensor(_inv_softplus(float(SEED.ETA_RHO_INIT)), dtype=torch.float32)
-        )
 
     @property
     def eta_z(self) -> torch.Tensor:
         return Fn.softplus(self._eta_z_raw)
-
-    @property
-    def eta_rho(self) -> torch.Tensor:
-        return Fn.softplus(self._eta_rho_raw)
 
     def rho_cell(self, cells_flat: dict) -> tuple[torch.Tensor, torch.Tensor]:
         """Return per-cell ``ρ`` and branch index (always 0)."""
@@ -117,10 +71,6 @@ class RhoSeedModule(nn.Module):
         is_border = cells_flat["is_border"].to(device)
         r_raw = lam1 / (z0 + self.eta_z).clamp_min(self.eps)
         r_raw = torch.where(is_border, torch.zeros_like(r_raw), r_raw)
-        # NR pool off: compare against pooled NR (bounded ~[0,1]-ish contrast norm).
-        # rho_seed = naka_rushton_pool_normalize(
-        #     r_raw, nH, nW, self.R, self.eta_rho, is_border, self.eps,
-        # )
         rho_seed = r_raw
 
         ti, tj = _build_tile_grid(nH, nW, self.R, self.stride, device)

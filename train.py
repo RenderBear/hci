@@ -1,7 +1,7 @@
 r"""train.py — harmonic-contour-integration: L1 seed + splat render.
 
 Pipeline per image: L0 contrast/harmonics → L1 eigendecomposition on the cell grid
-→ ``ρ_seed = NR_pool(λ₁/(z₀+η_z))`` (learned ``η_z``, ``η_ρ``) with the same
+→ ``ρ_seed = (λ₁/(z₀+η_z)) × tile_interior`` (learned ``η_z`` only) with the same
 tile-interior mask as STRIATE's seed-only path → **renderer** splat to pixels.
 
 Loss combines soft-Dice and per-pixel BCE on the η± valid band.
@@ -680,13 +680,18 @@ def bce_loss_with_ignore(
 
 
 def remap_checkpoint_state_dict(sd: dict) -> dict:
-    """Load STRIATE ``dynamics._eta_*`` into ``seed._eta_*``; drop other dynamics keys."""
+    """Load STRIATE ``dynamics._eta_z`` into ``seed``; drop other dynamics keys.
+
+    ``seed._eta_rho_raw`` / ``dynamics._eta_rho_raw`` are omitted — NR pool on
+    the seed was removed; those tensors are not loaded.
+    """
+    skip = frozenset({"seed._eta_rho_raw", "dynamics._eta_rho_raw"})
     out: dict = {}
     for k, v in sd.items():
+        if k in skip:
+            continue
         if k == "dynamics._eta_z_raw":
             out["seed._eta_z_raw"] = v
-        elif k == "dynamics._eta_rho_raw":
-            out["seed._eta_rho_raw"] = v
         elif k.startswith("dynamics."):
             continue
         else:
@@ -728,12 +733,9 @@ def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
 
     print("\n--- seed + renderer grad debug ---")
     print("\n  learned (value):")
-    print(f"    eta_z={float(s.eta_z.detach()):.4f}  eta_rho={float(s.eta_rho.detach()):.4f}")
+    print(f"    eta_z={float(s.eta_z.detach()):.4f}")
     print("\n  |grad| on raw params:")
-    for raw, label in (
-        ("_eta_rho_raw", "eta_rho"),
-        ("_eta_z_raw", "eta_z"),
-    ):
+    for raw, label in (("_eta_z_raw", "eta_z"),):
         t = getattr(s, raw, None)
         if t is None or t.grad is None:
             print(f"    {label}: grad=None")
@@ -818,7 +820,7 @@ def format_seed_param_lines(seed: RhoSeedModule, *, indent: str = "  ") -> list[
     """Learned NR seed scalars (infer / train logging)."""
     return [
         f"{indent}tile geometry:  R={seed.R}  stride={seed.stride}",
-        f"{indent}NR half-sat:  η_z={seed.eta_z.item():.3f}  η_ρ={seed.eta_rho.item():.3f}",
+        f"{indent}seed ratio:  η_z={seed.eta_z.item():.3f}",
     ]
 
 
@@ -957,7 +959,7 @@ def main():
     )
     print(
         f"Seed: R={SEED.R_POOL}  stride={SEED.STRIDE}  "
-        f"ρ = NR_pool(λ₁/(z₀+η_z)) × tile_interior  (learned η_z, η_ρ; no dynamics)"
+        f"ρ = (λ₁/(z₀+η_z)) × tile_interior  (learned η_z; no NR pool on seed; no dynamics)"
     )
     print(
         f"Render: harmonic-native h2m·gate + collinear coherence "
