@@ -1,15 +1,16 @@
 r"""Seed module — thin wrapper providing renderer-compatible interface.
 
-With the hypercolumn architecture, the seed is just η_z normalization
-on the K-bin energies.  The GABA recurrence handles all competitive
-normalization.  This module provides the forward() signature that
-train.py and the renderer expect.
+HypercolumnSeed applies min-subtraction across bins per cell, then a
+Naka-Rushton squash vs learned eta_z only.  GABA recurrence handles
+competitive normalization.  This module forwards cached rho for the renderer.
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
+
+from params import SEED
 
 from .L1 import HypercolumnSeed
 
@@ -26,7 +27,7 @@ class RhoSeedModule(nn.Module):
     during L1 hypercolumn construction, not here.
     """
 
-    def __init__(self, r_pool=10, stride=7, eps=1e-9, eta_z_init=5.0):
+    def __init__(self, r_pool=10, stride=7, eps=1e-9, eta_z_init=SEED.ETA_Z_INIT):
         super().__init__()
         self.hc_seed = HypercolumnSeed(
             r_pool=r_pool, stride=stride,

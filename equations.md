@@ -51,17 +51,27 @@ orientation selectivity.
 
 ### Local energy and normalization
 
-Total energy at cell $c$ (sum over all bins):
+Total energy at cell $c$ (sum over all bins; used elsewhere, not in the seed NR):
 
 $$
 z_0(c) = \sum_{k=0}^{K-1} \rho_k^{\text{raw}}(c)
 $$
 
-Normalized cell strength per bin (learned $\eta_z$):
+**Baseline removal** per cell: subtract the weakest bin so all channels are
+non-negative *excess* orientation energy relative to the patch minimum:
 
 $$
-\rho_k^{(0)}(c) = \frac{\rho_k^{\text{raw}}(c)}{z_0(c) + \eta_z}
+\tilde{\rho}_k^{\text{raw}}(c) = \rho_k^{\text{raw}}(c) - \min_{j} \rho_j^{\text{raw}}(c)
 $$
+
+**Naka–Rushton vs.\ the learned floor only** (no $z_0$ in the denominator —
+L0 NR and GABA fair-share already handle contrast and competition):
+
+$$
+\rho_k^{(0)}(c) = \frac{\bigl(\tilde{\rho}_k^{\text{raw}}(c)\bigr)^2}{\bigl(\tilde{\rho}_k^{\text{raw}}(c)\bigr)^2 + \eta_z^2}
+$$
+
+$\eta_z$ sets how much excess counts as a “real” oriented response; values lie in $[0, 1)$.
 
 This is a K-vector at each cell position: the hypercolumn's orientation
 response profile.  Edges produce a sharply peaked profile (one dominant
@@ -80,8 +90,8 @@ bin).  Junctions produce 2–3 peaks.  Texture produces a flat profile.
 
 - **Patch geometry**: same $P, S$, overlap as before.
 - **Cell grid**: same $n_H \times n_W$ spatial layout.
-- **Divisive normalization**: $z_0 + \eta_z$ denominator is the same
-  gain control as the old seed.
+- **Divisive normalization**: per-cell min subtraction + NR vs.\ $\eta_z$
+  only (`params.SEED.ETA_Z_INIT`); GABA handles cross-bin competition.
 
 ---
 

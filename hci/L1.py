@@ -7,7 +7,7 @@ K orientation-tuned units pooling over the same receptive field (patch).
 Pipeline:
   1. Extract patches from pixel-level h2m and θ_h fields (from L0).
   2. Project each patch's oriented energy onto K bins via cos² tuning.
-  3. Normalize per-bin energy by total energy + η_z (learned).
+  3. Per cell: subtract min bin (excess), then NR vs eta_z only: rho = rho_tilde^2/(rho_tilde^2+eta_z^2).
   4. Run recurrent GABA-budget collinear facilitation (T passes).
   5. Extract dominant orientation, ρ, κ per cell for the renderer.
 
@@ -405,12 +405,11 @@ def _inv_softplus(x: float) -> float:
 
 
 class HypercolumnSeed(nn.Module):
-    """Learned η_z for hypercolumn K-bin normalization.
+    """Learned eta_z: NR squash of per-bin *excess* orientation energy.
 
-    ρ_k = rho_k_raw / (z0 + η_z)
-
-    Single learned parameter.  The GABA recurrence handles all
-    competitive normalization; η_z just sets the gain floor.
+    Per cell, subtract the weakest bin (baseline removal), then apply
+    Naka-Rushton vs eta_z only: rho_sq / (rho_sq + eta_z**2 + eps).
+    Contrast pooling across bins is left to GABA; L0 already NR-compresses d_k.
     """
 
     def __init__(
@@ -433,17 +432,24 @@ class HypercolumnSeed(nn.Module):
         return F.softplus(self._eta_z_raw)
 
     def normalize(self, rho_k_raw: torch.Tensor, z0: torch.Tensor) -> torch.Tensor:
-        """Normalize K-bin energies: ρ_k = rho_k_raw / (z0 + η_z).
+        """Min-subtract per cell, then NR: rho_k = rho_tilde^2 / (rho_tilde^2 + eta_z^2 + eps).
+
+        ``rho_tilde_k = rho_k_raw - min_j rho_j_raw`` (excess over the weakest bin).
+        ``z0`` is kept for call-site compatibility but not used here.
 
         Args:
             rho_k_raw: (N, K) raw per-bin energies from hypercolumn construction
-            z0: (N,) total energy per cell
+            z0: (N,) total raw energy per cell (unused)
 
         Returns:
-            rho_k: (N, K) normalized per-bin energies
+            rho_k: (N, K) in [0, 1) after NR squash
         """
-        denom = (z0 + self.eta_z).clamp_min(self.eps).unsqueeze(-1)  # (N, 1)
-        return rho_k_raw / denom
+        _ = z0
+        rho_min = rho_k_raw.amin(dim=-1, keepdim=True)
+        rho_t = rho_k_raw - rho_min
+        rho_sq = rho_t * rho_t
+        eta_sq = self.eta_z * self.eta_z
+        return rho_sq / (rho_sq + eta_sq + self.eps)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -604,7 +610,8 @@ def run_l1(
 
     If seed, h2m, theta_h are provided: runs the new hypercolumn pipeline.
     Otherwise: falls back to computing h2m/theta_h from z2 and running
-    the hypercolumn pipeline with a default seed (η_z=5.0).
+    the hypercolumn pipeline with a default seed (``HypercolumnSeed``, η_z from
+    ``params.SEED.ETA_Z_INIT``).
 
     ``img`` is accepted for API compatibility and ignored (RGB partition
     photometry was removed).
