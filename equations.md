@@ -11,9 +11,12 @@ $$
 \hat{B}(p) \;=\; h_{2m}(p)\;\cdot\;\sigma\!\bigl(\text{MLP}(F_p)\bigr)
 $$
 
+Two-pass pipeline: L0 (fixed η) → L1 → seed → collinear recurrence →
+η modulation → L0 (spatially-varying η) → render with updated $h_{2m}$.
+
 ---
 
-## L0 — split-channel harmonic projection (precomputed, fixed)
+## L0 — split-channel harmonic projection
 
 RGB split into luminance $L = (R+G+B)/3$ and chrominance $C = I - L\cdot\mathbf{1}$.
 
@@ -31,9 +34,12 @@ $$
 $$
 
 $$
-h_k^{\text{lum}} = \gamma\,\frac{\tilde{d}_k^2}{\eta_{\text{lum}}^2 + \tilde{d}_k^2}, \qquad
-h_k^{\text{chr}} = \gamma\,\frac{\tilde{d}_k^2}{\eta_{\text{chr}}^2 + \tilde{d}_k^2}
+h_k^{\text{lum}} = \gamma\,\frac{\tilde{d}_k^2}{\eta_{\text{lum}}(p)^2 + \tilde{d}_k^2}, \qquad
+h_k^{\text{chr}} = \gamma\,\frac{\tilde{d}_k^2}{\eta_{\text{chr}}(p)^2 + \tilde{d}_k^2}
 $$
+
+Pass 1: $\eta_{\text{lum}}(p) = \eta_0^{\text{lum}}$ (scalar, fixed).
+Pass 2: $\eta(p)$ is spatially varying (see Step 7).
 
 Combined harmonic projection:
 
@@ -55,6 +61,10 @@ h_{2m}^{\text{lum}}(p) = \Bigl|\sum_k h_k^{\text{lum}}\, e^{2i\varphi_k}\Bigr|, 
 h_{2m}^{\text{chr}}(p) = \Bigl|\sum_k h_k^{\text{chr}}\, e^{2i\varphi_k}\Bigr|
 $$
 
+**Key optimization:** the directional differences $d_k^{\text{lum}}, d_k^{\text{chr}}$
+depend only on the image, not on $\eta$.  They are computed once and cached.
+Pass 2 reuses them and only reapplies the Naka–Rushton with the modulated $\eta(p)$.
+
 ---
 
 ## L1 — per-patch eigendecomposition (precomputed, fixed)
@@ -71,7 +81,7 @@ $$
 Eigendecomposition $M = V \Lambda V^*$ yields eigenvalues $\lambda_1 \ge \lambda_2 \ge \lambda_3$
 and orientations $\theta_0, \theta_1$ from the leading eigenvectors.
 
-Photometric separability from partition means (same $\eta$ as L0):
+Photometric separability from partition means:
 
 $$
 s_{\text{lum}} = \frac{(\Delta L)^2}{(\Delta L)^2 + \eta_{\text{lum}}^2}, \qquad
@@ -80,34 +90,21 @@ $$
 
 ---
 
-## Seed — cell strength from $\lambda_1$ (learned $\eta_z$; optional NR pool)
+## Seed — cell strength (learned $\eta_z$)
 
-**Implemented in** `hci/seed.py` (`RhoSeedModule`).
-
-Raw ratio (per cell, border cells forced to $0$):
+Raw eigenvalue ratio, normalized by total harmonic energy:
 
 $$
-r_c = \frac{\lambda_{1,c}}{\max(z_{0,c} + \eta_z,\;\varepsilon)}
+r_c = \frac{\lambda_{1,c}}{\max(z_{0,c} + \eta_z,\;\epsilon)}
 $$
 
-with $\eta_z = \text{softplus}(\tilde{\eta}_z)$ and small $\varepsilon$ for numerical stability.
+with $\eta_z = \text{softplus}(\tilde{\eta}_z)$.
 
-**Current default:** no Naka–Rushton pooling on $r$ — the seed passed to the renderer is
-
-$$
-\rho_c = r_c \cdot \mathbf{1}[\text{tile interior}],\qquad
-\text{tile interior} = (\neg\text{border}) \wedge \text{covered by the }(2R{+}1)^2\text{ tile grid (stride }S\text{)}.
-$$
-
-So $\rho$ is the **ratio** $r$, not $r^2$, and the tile mask is the same sliding-window coverage as before.
-
-**Optional NR pool** (same routine as STRIATE-style pooling; **present in code but currently commented out** in `rho_cell`): would map $x=r$ to
+Seed output (no NR pool in current configuration):
 
 $$
-\rho^{\text{NR}}_c = \frac{x_c^2}{x_c^2 + \mu_{R}^2(x^2) + \eta_\rho^2 + \varepsilon},
+\rho^{(0)}_c = r_c \cdot \mathbf{1}[\text{tile interior}]
 $$
-
-where $\mu_{R}^2(x^2)$ is the **local average of $x^2=r^2$** over a $(2R{+}1)^2$ cell neighborhood (`avg_pool2d` on $r^2$), and $\eta_\rho = \text{softplus}(\tilde{\eta}_\rho)$. When that branch is off, $\tilde{\eta}_\rho$ is still a learned parameter but **does not affect** $\rho$ in the forward pass.
 
 ---
 
@@ -126,12 +123,11 @@ Repeated for $T$ passes (default 4).  Border cells are excluded.
 
 ---
 
-## Step 2 — recurrent collinear facilitation + cross-orientation suppression
+## Step 2 — recurrent collinear facilitation (GABA-budget normalization)
 
 V1-style horizontal connections on the cell grid.  Each pass facilitates
-co-aligned collinear neighbors and suppresses cross-oriented cells via
-divisive normalization.  Recurrence propagates facilitation along contours
-(effective range ≈ $T \times R$) and cascades cross-orientation suppression.
+co-aligned collinear neighbors and suppresses all other orientations via
+a firing-budget normalization modeled on GABAergic untuned inhibition.
 
 ### Kernels
 
@@ -152,23 +148,22 @@ Default: $\sigma_d = R/2$, $\sigma_t = 1.0$.
 
 ### Recurrent dynamics
 
-Initialize $\rho^{(0)} = \rho$ (seed output, border-masked).  Each cell has
-a fixed bin assignment $b(c) = \lfloor \theta_c K / \pi \rfloor$ and orthogonal
-bin $b_\perp(c) = (b(c) + K/2) \bmod K$.
+Initialize $\rho^{(0)}$ from the seed (border-masked).  Each cell has
+a fixed bin assignment $b(c) = \lfloor \theta_c K / \pi \rfloor$.
 
 **For** $t = 0, \dots, T-1$:
 
+**Stage A — convolutions.**
 Convolve with all $K$ kernels using the current $\rho^{(t)}$:
 
 $$
 S_u^{(k)} = W_k * \bigl(\rho^{(t)} \cos 2\theta\bigr), \qquad
-S_v^{(k)} = W_k * \bigl(\rho^{(t)} \sin 2\theta\bigr)
+S_v^{(k)} = W_k * \bigl(\rho^{(t)} \sin 2\theta\bigr), \qquad
+S_\rho^{(k)} = W_k * \rho^{(t)}
 $$
 
-Each cell reads from its own bin (collinear) and the orthogonal bin (cross),
-then projects onto its own orientation $(\cos 2\theta_c,\, \sin 2\theta_c)$:
-
-**Collinear energy** — projection of collinear-kernel neighbors onto cell's orientation:
+**Stage B — collinear energy.**
+Each cell reads from its own θ-bin and projects onto its own orientation:
 
 $$
 E_{\text{col}}(c) = \Bigl[S_u^{(b(c))}(c)\Bigr] \cos 2\theta_c
@@ -179,70 +174,64 @@ $$
 = \sum_{c' \in \mathcal{N}_{\text{col}}} W_{b(c)}(c'-c)\;\rho^{(t)}_{c'}\;\cos 2(\theta_{c'} - \theta_c)
 $$
 
-Clamped to $\ge 0$ (negative means anti-aligned; treated as co-aligned since
-orientations are $\pi$-periodic).
+Clamped to $\ge 0$.
 
-**Cross-oriented energy** — projection of orthogonal-kernel neighbors onto cell's
-normal direction:
-
-$$
-E_{\text{cross}}(c) = \Bigl|\Bigl[S_v^{(b_\perp(c))}(c)\Bigr] \cos 2\theta_c
-\;-\; \Bigl[S_u^{(b_\perp(c))}(c)\Bigr] \sin 2\theta_c\Bigr|
-$$
+**Stage C — GABA budget.**
+Total ρ pooled across all $K$ bins (untuned inhibitory pool):
 
 $$
-= \Bigl|\sum_{c' \in \mathcal{N}_{\text{cross}}} W_{b_\perp(c)}(c'-c)\;\rho^{(t)}_{c'}\;\sin 2(\theta_{c'} - \theta_c)\Bigr|
+E_{\text{total}}(c) = \sum_{k=0}^{K-1} S_\rho^{(k)}(c)
 $$
 
-Absolute value since cross-orientation can be $\pm 90°$.
-
-**Divisive normalization** (Naka–Rushton):
+Fair-share normalization:
 
 $$
-\kappa^{(t)}_{\text{col}}(c) = \frac{E_{\text{col}}(c)}{E_{\text{col}}(c) + E_{\text{cross}}(c) + \epsilon}
+\kappa^{(t)}(c) = \frac{E_{\text{col}}(c)}{E_{\text{total}}(c) / K + \epsilon}
 $$
 
-**Modulate ρ:**
+Clamped to $[0, 1]$.
+
+**Stage D — modulate ρ:**
 
 $$
-\rho^{(t+1)}_c = \rho^{(t)}_c \cdot \kappa^{(t)}_{\text{col}}(c)
+\rho^{(t+1)}_c = \rho^{(t)}_c \cdot \kappa^{(t)}(c)
+$$
+
+### Full per-pass update (compact)
+
+$$
+\boxed{
+\rho^{(t+1)}_c = \rho^{(t)}_c \;\cdot\; \min\!\Biggl(1,\;\;
+\frac{E_{\text{col}}(c)}{E_{\text{total}}(c)/K + \epsilon}\Biggr)
+}
 $$
 
 ### Properties
 
-After $T$ passes (default 3):
-
-- **Collinear facilitation:** where $E_{\text{col}} \gg E_{\text{cross}}$,
-  $\kappa \approx 1$ and $\rho$ is preserved.  Co-aligned neighbors along the
-  tangent mutually reinforce across passes, propagating facilitation along
+- **Collinear facilitation:** where $E_{\text{col}}$ dominates the budget,
+  $\kappa = 1$ and $\rho$ is preserved.  Facilitation propagates along
   contours with effective range $\approx T \times R$.
 
-- **Cross-orientation suppression:** where $E_{\text{cross}} \gg E_{\text{col}}$,
-  $\kappa \approx 0$ and $\rho$ is killed.  A vertical cell in a horizontal field
-  receives strong cross energy and gets fully suppressed.  This cascades across
-  passes — once a cross-oriented cell is suppressed, it stops contributing cross
-  energy to its neighbors in subsequent passes.
+- **All-orientation competition:** unlike the old col-vs-cross formulation
+  (two bins), the GABA budget sees all $K$ bins — edges at any angle
+  compete, not just orthogonal ones.
 
-- **Iso-orientation surround suppression:** in a uniform random field, both
-  $E_{\text{col}}$ and $E_{\text{cross}}$ are moderate, giving $\kappa \approx 0.3$–$0.5$.
-  After 3 multiplicative passes, $\rho_{\text{random}} \to \rho \times 0.3^3 \approx 0.03$.
-  Incoherent texture is strongly suppressed.
+- **Texture suppression:** in an incoherent field, energy is spread across
+  many bins, so $E_{\text{col}} \ll E_{\text{total}}/K$ and $\kappa \ll 1$.
 
-- **Junction handling:** at T- and L-junctions, cells along each arm have strong
-  collinear support from their own arm and weak cross energy.  The junction cell
-  itself has moderate support from both arms — it survives with reduced $\kappa$
-  rather than being fully suppressed.
+- **Self-stabilizing:** the denominator $E_{\text{total}}$ scales with $\rho$.
+  Uniform collinear fields converge gently ($\rho \approx 0.95^T$), not collapse.
 
-- **Modulatory, not driving:** the recurrence can only preserve or suppress $\rho$,
-  never amplify it.  $\rho^{(t+1)} \le \rho^{(t)}$ at every cell.  This matches
-  V1 horizontal connections which are modulatory (boost gain) rather than driving
-  (create response).
+- **Junction handling:** at junctions, competing orientations inflate the
+  budget proportionally to the number of arms.
 
-- **Zero learned parameters.** The kernels are fixed geometry.  The recurrent
-  dynamics are parameter-free Naka–Rushton.
+- **Zero learned parameters.** Kernels are fixed geometry.  The GABA-budget
+  dynamics are parameter-free.
 
-**Detached from the gradient graph** — inputs to collinear coherence are detached
-to prevent gradient flow through the iterative conv chain back into seed parameters.
+**Detached from the gradient graph.** $\bar{\theta}(p)$ at pixel resolution
+is also detached.
+
+$E_{\text{col}}$ (raw, unnormalized) is returned for use in Step 7.
 
 ---
 
@@ -251,9 +240,7 @@ to prevent gradient flow through the iterative conv chain back into seed paramet
 Cell-grid fields are interpolated to pixel resolution via `F.grid_sample`.
 Cell $c$ at grid position $(i, j)$ has pixel coordinates $(jS + P/2,\; iS + P/2)$.
 
-The interpolated $\rho$ is the **modulated** $\rho^{(T)}$ from Step 2 — after
-collinear facilitation and cross-orientation suppression have reshaped the
-cell-grid signal.
+The interpolated $\rho$ is the **modulated** $\rho^{(T)}$ from Step 2.
 
 Orientation is interpolated in double-angle representation to handle $\pi$-periodicity:
 
@@ -269,14 +256,8 @@ $$
 \bar{\theta}(p) = \tfrac{1}{2}\,\text{atan2}\!\bigl(\bar{v}/\bar{\rho},\;\bar{u}/\bar{\rho}\bigr)
 $$
 
-Similarly interpolated: $\bar{\kappa}_{\text{col}}(p)$, and the **pre-recurrence**
-seed $\bar{\rho}^{(0)}(p)$ (same bilinear map; border cells contribute $0$).
-
-The thinning head uses the **collinear preservation ratio**
-$r(p) = \bar{\rho}^{(T)}(p) / (\bar{\rho}^{(0)}(p) + \varepsilon)$
-(clamped to a modest upper bound for numerical stability), which is high when
-recurrence leaves $\rho$ intact (long coherent edges) and low when texture is
-suppressed despite a strong initial seed.
+Similarly interpolated: $\bar{\kappa}_{\text{col}}(p)$ and $\bar{\rho}^{(0)}(p)$
+(pre-recurrence seed).
 
 ---
 
@@ -301,12 +282,15 @@ and $s_t$, $s_n$ are learned stencil spacings.
 
 $$
 F_p = \bigl[\;h_{2m}^{\text{lum}},\; h_{2m}^{\text{chr}},\;
-\bar{\rho}^{(T)},\; \bar{u}/\bar{\rho}^{(T)},\; \bar{v}/\bar{\rho}^{(T)},\;
+\bar{\rho}^{(T)},\; \cos 2\bar{\theta},\; \sin 2\bar{\theta},\;
 \bar{\kappa}_{\text{col}},\;
-\frac{\bar{\rho}^{(T)}}{\bar{\rho}^{(0)} + \varepsilon},\;
-\text{tang}_5,\; \text{norm}_5\;\bigr]
-\;\in\;\mathbb{R}^{17}
+\bar{\rho}^{(T)}/(\bar{\rho}^{(0)}+\epsilon),\;
+\text{tang}_5,\; \text{norm}_5,\;
+\eta_{\mathrm{lum}}(p)\;\bigr]
+\;\in\;\mathbb{R}^{18}
 $$
+
+The last entry is the pass-2 luminance $\eta$ map (zeros when absent). Training detaches the NR/harmonics path into $h_{2m}^{*}$ but keeps $\eta_{\mathrm{lum}}$ in $F_p$ so gradients to the modulation scalars $(a,b,c)$ flow through the thinning MLP only.
 
 All pixel-native or bilinearly interpolated — no scatter artifacts.
 
@@ -319,7 +303,7 @@ $$
 \sigma\!\bigl(W_2\,\text{ReLU}(W_1\,F_p + b_1) + b_2\bigr)
 $$
 
-17→16→1 MLP.  The gate $\in (0,1)$ can only thin the harmonic edge signal.
+18→16→1 MLP on $F_p \in \mathbb{R}^{18}$ (last component: pass-2 luminance $\eta_{\mathrm{lum}}(p)$ when provided; otherwise zero).  The gate $\in (0,1)$ can only thin the harmonic edge signal.
 
 Structural priors at initialization:
 
@@ -327,11 +311,69 @@ Structural priors at initialization:
 |------|----------|---------|
 | 0 | tang5 (flat 0.2), norm5 (Mexican hat) | Ridge profile detection |
 | 1 | $\bar{\rho}^{(T)}$ | Cell-grid edge strength after recurrence |
-| 2 | $\bar{\rho}^{(T)}/(\bar{\rho}^{(0)}+\varepsilon)$ (clamped) | Collinear preservation — texture crushed → low |
+| 2 | $\bar{\rho}^{(T)}/(\bar{\rho}^{(0)}+\epsilon)$ | Collinear preservation ratio |
 | 3 | $h_{2m}^{\text{lum}} + h_{2m}^{\text{chr}}$ | Harmonic evidence |
 | 4 | $\bar{\kappa}_{\text{col}}$ | Collinear coherence boost |
 
 $b_2 = 2$ so $\sigma(2) \approx 0.88$ at initialization (near-identity gate).
+
+---
+
+## Step 7 — η modulation (two-pass L0 feedback)
+
+After pass 1 produces the collinear recurrence signals $\bar{\kappa}$ and
+$E_{\text{col}}$, the L0 semi-saturation constants are spatially modulated
+and L0 is re-run with the updated $\eta$.
+
+### Modulation signal
+
+Two signals from the collinear recurrence, interpolated to pixel resolution:
+
+- $\bar{\kappa}(p)$: normalized collinear coherence — "does geometric structure
+  exist here?"
+- $\bar{E}_{\text{col}}(p)$: raw (unnormalized) collinear energy, normalized to
+  $[0, 1]$ by $E_{\max}$ — "how strong is the absolute evidence?"
+
+### Learned modulation
+
+$$
+\boxed{
+\eta(p) = \eta_0 \;\cdot\; \sigma\!\bigl(a - b\cdot\bar{\kappa}(p) + c\cdot\bar{E}_{\text{col}}(p)\bigr)
+}
+$$
+
+Three learned scalars $(a, b, c)$ control the modulation:
+
+| Parameter | Role | Effect when large |
+|-----------|------|-------------------|
+| $a$ | Bias | $\sigma(a) \to 1$, η stays near η₀ by default |
+| $b$ | κ coefficient | High κ (geometric structure) → η drops → L0 more sensitive |
+| $c$ | $E_{\text{col}}$ coefficient | High absolute energy → η rises → L0 stays stable |
+
+**Initialization:** $a = 2, b = 0, c = 0$ → $\sigma(2) \approx 0.88$ everywhere,
+so $\eta \approx 0.88\,\eta_0$ — near-identity, no modulation.
+
+### Behavior
+
+| Condition | κ | $E_{\text{col}}$ | $\sigma(\cdot)$ | $\eta(p)$ | Effect |
+|-----------|---|-----------------|-----------------|-----------|--------|
+| Faint collinear edge | high | low | small | $\ll \eta_0$ | L0 more sensitive, recovers edge |
+| Strong edge | high | high | $\approx 1$ | $\approx \eta_0$ | Already detected, no change |
+| Incoherent texture | low | varies | $\approx \sigma(a)$ | $\approx \eta_0$ | No structure → don't boost |
+| Flat region | low | low | $\approx \sigma(a)$ | $\approx \eta_0$ | Nothing to recover |
+
+### Two-pass pipeline (compact)
+
+$$
+\text{Pass 1:}\quad d_k \;\xrightarrow{\;\eta_0\;}\; h_{2m}^{(1)} \;\to\; \text{L1} \;\to\; \rho \;\to\; \text{collinear} \;\to\; \kappa,\, E_{\text{col}}
+$$
+
+$$
+\text{Pass 2:}\quad d_k \;\xrightarrow{\;\eta(p)\;}\; h_{2m}^{(2)} \;\to\; \hat{B} = h_{2m}^{(2)} \cdot \text{gate}(F_p)
+$$
+
+$d_k$ (directional differences) are cached from pass 1.  L1 eigendecomposition
+is **not** re-run; the cell grid ($\rho, \theta, \lambda$) is from pass 1.
 
 ---
 
@@ -340,8 +382,10 @@ $b_2 = 2$ so $\sigma(2) \approx 0.88$ at initialization (near-identity gate).
 | Component | Params | Note |
 |---|---:|---|
 | $s_t$, $s_n$ | 2 | learned stencil spacings |
-| $W_1$: 17×16 + $b_1$: 16 | 288 | thinning hidden layer |
+| $W_1$: 18×16 + $b_1$: 16 | 304 | thinning hidden layer |
 | $W_2$: 16×1 + $b_2$: 1 | 17 | thinning output |
-| $\tilde{\eta}_z$, $\tilde{\eta}_\rho$ | 2 | seed (`RhoSeedModule`; $\eta_\rho$ unused unless NR pool branch is enabled) |
-| **Total learned** | **309** | |
+| $\tilde{\eta}_z$ | 1 | seed (softplus → $\eta_z$) |
+| $a, b, c$ | 3 | η modulation (sigmoid) |
+| **Total learned** | **327** | |
 | Collinear kernels | $K \times (2R+1)^2$ | fixed, not learned |
+| Pass-2 L0 recompute | $d_k$ cached | ~10× cheaper than full L0 |

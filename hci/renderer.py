@@ -8,13 +8,15 @@ Pipeline:
      Effective range ≈ n_passes × R.
   3. Bilinear interpolation of modulated cell-grid fields (ρ_mod, θ,
      κ_col) to pixel coordinates — no scatter-add splat.
-  4. Per-pixel feature vector F_p ∈ R¹⁷:
+  4. Per-pixel feature vector F_p ∈ R¹⁸:
        [h2m_lum, h2m_chr, ρ̄^(T), θ̄_cos2, θ̄_sin2, κ̄_col,
-        ρ̄^(T)/(ρ̄^(0)+ε), tang5(5), norm5(5)]
+        ρ̄^(T)/(ρ̄^(0)+ε), tang5(5), norm5(5), η_lum_map]
      where ρ̄^(0) is pre–collinear-recurrence ρ (same bilinear interp as ρ̄^(T)),
-     and tang5/norm5 are sampled from h2m (pixel-native).
+     tang5/norm5 are sampled from h2m (pixel-native), and η_lum_map is the
+     pass-2 luminance η field (optional key ``eta_mod_map`` in ``l0_pix``;
+     zeros if absent).
   5. Thinning head: B̂(p) = h2m(p) · σ(W₂ ReLU(W₁ F_p + b₁) + b₂).
-     17→16→1 MLP.
+     18→16→1 MLP.
 
 Collinear coherence (Step 2):
   Recurrent divisive normalization on the cell grid.  Each cell's θ-bin
@@ -25,9 +27,9 @@ Collinear coherence (Step 2):
   contours and cross-orientation suppression cascades — gap bridging
   and junction resolution emerge from the recurrence.
 
-Learned: s_t (1), s_n (1), ThinningHead 17→16→1 (305 params).
+Learned: s_t (1), s_n (1), ThinningHead 18→16→1 (321 params).
 Fixed: collinear kernels (precomputed), recurrent dynamics (0 params).
-Total: 307 learned scalars.
+Total: 323 learned scalars.
 """
 
 from __future__ import annotations
@@ -280,9 +282,10 @@ def compute_collinear_coherence(
         if want_snaps and (t + 1) in snap_want:
             snaps[t + 1] = rho_m.detach().clone()
 
+    # Return final-pass raw collinear energy alongside κ and ρ_mod
     if want_snaps:
-        return kappa_col, rho_m, snaps
-    return kappa_col, rho_m
+        return kappa_col, rho_m, col_proj, snaps
+    return kappa_col, rho_m, col_proj
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -379,17 +382,17 @@ def _sample_stencil_5(
 
 
 # ═══════════════════════════════════════════════════════════════
-# Thinning head (17 → 16 → 1 MLP)
+# Thinning head (18 → 16 → 1 MLP)
 # ═══════════════════════════════════════════════════════════════
 
 class ThinningHead(nn.Module):
-    """17→16→1 MLP: σ(W₂ ReLU(W₁ F + b₁) + b₂).
+    """18→16→1 MLP: σ(W₂ ReLU(W₁ F + b₁) + b₂).
 
     F = [h2m_lum, h2m_chr, ρ̄^(T), θ̄_cos2, θ̄_sin2, κ̄_col, ρ̄^(T)/(ρ̄^(0)+ε),
-         tang5(5), norm5(5)] ∈ R¹⁷.
+         tang5(5), norm5(5), η_lum_map] ∈ R¹⁸.
     """
 
-    def __init__(self, in_dim: int = 17, hidden: int = 16):
+    def __init__(self, in_dim: int = 18, hidden: int = 16):
         super().__init__()
         self.in_dim = in_dim
         self.hidden = hidden
@@ -403,7 +406,7 @@ class ThinningHead(nn.Module):
             self.fc1.bias.zero_()
             self.fc2.weight.zero_()
 
-            # Feature layout (in_dim=17):
+            # Feature layout (in_dim=18):
             #   0: h2m_lum
             #   1: h2m_chr
             #   2: ρ̄^(T)  (after collinear recurrence, interpolated)
@@ -413,6 +416,7 @@ class ThinningHead(nn.Module):
             #   6: ρ̄^(T) / (ρ̄^(0) + ε)  collinear preservation ratio
             #   7-11: tang5 (on h2m)
             #   12-16: norm5 (on h2m)
+            #   17: η_lum map (pass-2 modulation; optional at inference)
 
             # Unit 0: Mexican-hat on norm5 (channels 12–16)
             mex_hat = torch.tensor([-0.25, -0.25, 1.0, -0.25, -0.25])
@@ -441,8 +445,13 @@ class ThinningHead(nn.Module):
             self.fc2.weight[0, 2] = 0.2  # preservation-ratio unit
             self.fc2.weight[0, 4] = 0.3  # collinear unit
 
+            # η_lum map (index 17): tiny random coupling so ∂gate/∂η is not
+            # identically zero when this column was all zeros after the priors.
+            if self.in_dim > 17:
+                self.fc1.weight[:, 17].normal_(0.0, 0.02)
+
     def forward(self, features: torch.Tensor) -> torch.Tensor:
-        """features: (N, 17). Returns: (N,) gate in (0, 1)."""
+        """features: (N, in_dim). Returns: (N,) gate in (0, 1)."""
         h = F.relu(self.fc1(features))
         return torch.sigmoid(self.fc2(h).squeeze(-1))
 
@@ -458,9 +467,9 @@ class ModulationRenderer(nn.Module):
     interpolated to pixel coordinates via F.grid_sample.  The edge
     map is the pixel-native h2m, gated by a per-pixel MLP.
 
-    Learned: s_t (1), s_n (1), ThinningHead 17→16→1 (305).
+    Learned: s_t (1), s_n (1), ThinningHead 18→16→1 (321).
     Fixed: collinear kernels.
-    Total: 307 learned scalars.
+    Total: 323 learned scalars.
     """
 
     def __init__(
@@ -478,7 +487,7 @@ class ModulationRenderer(nn.Module):
         _ = (hidden, kwargs)
         self.s_t = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
         self.s_n = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
-        self.thinning = ThinningHead(in_dim=17, hidden=16)
+        self.thinning = ThinningHead(in_dim=18, hidden=16)
 
         self.col_radius = col_radius
         self.col_k_bins = col_k_bins
@@ -517,7 +526,24 @@ class ModulationRenderer(nn.Module):
 
 
 def upgrade_renderer_state_dict(state_dict: dict, prefix: str = "") -> dict:
-    """Best-effort upgrade from old splat-based state dicts."""
+    """Best-effort upgrade from old splat-based state dicts.
+
+    Also upgrades thinning ``fc1`` weight (16, 17) → (16, 18) by appending a
+    small random η-feature column (same scale as ``ThinningHead`` init) so
+    older checkpoints load without dropping the thinning head and receive
+    nonzero ∂gate/∂η from the start.
+    """
+    state_dict = dict(state_dict)
+    wkey = f"{prefix}thinning.fc1.weight"
+    if wkey in state_dict:
+        w = state_dict[wkey]
+        if tuple(w.shape) == (16, 17):
+            # Match fresh-init coupling on the new η column (see ThinningHead).
+            gen = torch.Generator(device=w.device)
+            gen.manual_seed(0)
+            zcol = torch.randn(16, 1, dtype=w.dtype, device=w.device, generator=gen) * 0.02
+            state_dict[wkey] = torch.cat([w, zcol], dim=1)
+
     remove = {
         f"{prefix}_sigma_par_raw",
         f"{prefix}_sigma_pre_raw",
@@ -539,8 +565,7 @@ def upgrade_renderer_state_dict(state_dict: dict, prefix: str = "") -> dict:
             continue
         if any(k.startswith(rp) or k == rp for rp in remove_prefixes):
             continue
-        # Old thinning dimensions don't map cleanly to the new layout;
-        # drop them and let the new priors take over.
+        # Drop thinning tensors with unknown shapes (fc1 is upgraded above).
         if "thinning." in k and v.shape != _expected_shape(k):
             continue
         out[k] = v
@@ -548,9 +573,9 @@ def upgrade_renderer_state_dict(state_dict: dict, prefix: str = "") -> dict:
 
 
 def _expected_shape(key: str):
-    """Expected shapes for the 17→16→1 thinning head."""
+    """Expected shapes for the 18→16→1 thinning head."""
     shapes = {
-        "thinning.fc1.weight": (16, 17),
+        "thinning.fc1.weight": (16, 18),
         "thinning.fc1.bias": (16,),
         "thinning.fc2.weight": (1, 16),
         "thinning.fc2.bias": (1,),
@@ -663,7 +688,7 @@ def render_boundary_map_torch(
             int(renderer.col_passes),
             max_timestamps=int(rho_collinear_iter_max_snapshots),
         )
-        kappa_col_grid, rho_mod_grid, rho_cell_snaps = compute_collinear_coherence(
+        kappa_col_grid, rho_mod_grid, e_col_grid, rho_cell_snaps = compute_collinear_coherence(
             theta_combed.detach(),
             rho_grid.detach(),
             ib_grid,
@@ -677,7 +702,7 @@ def render_boundary_map_torch(
             rho_snapshots_t_after=frozenset(sched),
         )
     else:
-        kappa_col_grid, rho_mod_grid = compute_collinear_coherence(
+        kappa_col_grid, rho_mod_grid, e_col_grid = compute_collinear_coherence(
             theta_combed.detach(),
             rho_grid.detach(),
             ib_grid,
@@ -772,11 +797,19 @@ def render_boundary_map_torch(
     # Combined h2m as the base edge signal (pixel-native, smooth)
     h2m_combined = h2m_lum + h2m_chr
 
+    if l0_pix is not None and "eta_mod_map" in l0_pix:
+        eta_mod_pix = l0_pix["eta_mod_map"].to(device=device, dtype=dtype)
+        if eta_mod_pix.shape != (H, W):
+            eta_mod_pix = eta_mod_pix[:H, :W]
+    else:
+        eta_mod_pix = torch.zeros(H, W, device=device, dtype=dtype)
+
     # ── Step 5: Stencils on h2m (pixel-native, no staircase) ─
     tang5 = _sample_stencil_5(h2m_combined, theta_pix, renderer.s_t, "tangent", eps)
     norm5 = _sample_stencil_5(h2m_combined, theta_pix, renderer.s_n, "normal", eps)
 
-    # ── Step 6: Feature vector F_p ∈ R¹⁷ ────────────────────
+    # ── Step 6: Feature vector F_p ∈ R¹⁸ ────────────────────
+    fdim = int(renderer.thinning.in_dim)
     features = torch.cat([
         h2m_lum.unsqueeze(-1),          # 0
         h2m_chr.unsqueeze(-1),          # 1
@@ -787,10 +820,15 @@ def render_boundary_map_torch(
         rho_pres_ratio.unsqueeze(-1),   # 6  ρ̄^(T)/(ρ̄^(0)+ε)
         tang5,                          # 7-11
         norm5,                          # 12-16
-    ], dim=-1)  # (H, W, 17)
+        eta_mod_pix.unsqueeze(-1),      # 17  η_lum map (grad to η_mod when set)
+    ], dim=-1)  # (H, W, 18)
 
     # ── Step 7: Thinning head → B̂(p) = h2m(p) · gate(p) ────
-    feat_flat = features.reshape(H * W, 17)
+    if features.shape[-1] != fdim:
+        raise RuntimeError(
+            f"feature dim {features.shape[-1]} != thinning.in_dim {fdim}"
+        )
+    feat_flat = features.reshape(H * W, fdim)
     gate = renderer.thinning(feat_flat).reshape(H, W)
     bmap = h2m_combined * gate
 

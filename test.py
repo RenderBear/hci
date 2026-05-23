@@ -27,7 +27,7 @@ from PIL import Image
 from scipy.ndimage import binary_dilation
 
 from params import L0, L1, RENDER, SEED, TEST
-from hci.L0 import compute_l0_rgb, compute_interior
+from hci.L0 import compute_l0_rgb, compute_interior, _compute_d_lum_chroma
 from hci.L1 import z_from_l0_harmonics, pad_for_patch_grid, run_l1
 from hci.renderer import (
     compute_render_features,
@@ -35,11 +35,14 @@ from hci.renderer import (
     proj_to_device,
     ridge_nms,
     upgrade_renderer_state_dict,
+    compute_collinear_coherence,
+    _smooth_theta_rho_double_angle,
 )
 from train import (
     HarmonicContourE2E,
     build_cells_flat,
     build_l0_pix,
+    fast_l0_pass2,
     remap_checkpoint_state_dict,
     report_checkpoint_compatibility,
 )
@@ -137,7 +140,7 @@ def _ap_from_pr(results):
     return float(((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1]).sum())
 
 
-def run_image_inference(model, img_path, device):
+def run_image_inference(model, img_path, device, *, verbose: bool = False):
 
     ir_np = np.array(Image.open(img_path).convert("RGB"), dtype=np.float32) / 255.0
     ir_p, H0, W0 = pad_for_patch_grid(ir_np, L1.PATCH_SIZE, L1.PATCH_OVERLAP)
@@ -145,6 +148,10 @@ def run_image_inference(model, img_path, device):
     gc.collect()
 
     ir_t = torch.from_numpy(ir_p).to(device)
+
+    # Compute directional differences (reusable across η values)
+    d_lum, d_chr = _compute_d_lum_chroma(ir_t, L0.OFFSETS)
+
     h, vld, _, _, _, s, h1m, h2m, h2m_lum, h2m_chr = compute_l0_rgb(
         ir_t,
         eta_lum=L0.ETA_LUM,
@@ -189,6 +196,8 @@ def run_image_inference(model, img_path, device):
     gc.collect()
 
     Hp, Wp = ir_p.shape[:2]
+    S = cells.get("S", 2)
+    P = cells.get("P", L1.PATCH_SIZE)
     cells_flat = build_cells_flat(cells)
     del cells, ir_p
     gc.collect()
@@ -202,6 +211,8 @@ def run_image_inference(model, img_path, device):
 
     with torch.no_grad():
         rho_out, branch, _, _, _, _, _ = model.seed(cells_flat=cf_dev)
+
+        # Pass 1: render with fixed-η l0_pix
         bmap_t, theta_t = render_boundary_map_torch(
             rho_out,
             proj_dev,
@@ -217,6 +228,88 @@ def run_image_inference(model, img_path, device):
             content_w=W0,
             return_dominant_theta=True,
         )
+
+        # Pass 2: η modulation if model has learned params
+        if hasattr(model, "eta_mod_a") and model.eta_mod_enabled:
+            from hci.L0 import compute_eta_modulation
+
+            H, W = proj_dev["H"], proj_dev["W"]
+            dtype = rho_out.dtype
+
+            theta_all = cf_dev["theta"].to(device=device, dtype=dtype)
+            bp = branch.reshape(-1).long()
+            idx_n = torch.arange(nH * nW, device=device)
+            theta_c = theta_all[idx_n, bp]
+            rho_grid = rho_out.reshape(nH, nW).detach()
+            ib_grid = cf_dev["is_border"].to(device=device).reshape(nH, nW).bool()
+
+            theta_combed = _smooth_theta_rho_double_angle(
+                theta_c.reshape(nH, nW), rho_grid, ib_grid,
+            )
+
+            kappa_col, _, e_col = compute_collinear_coherence(
+                theta_combed.detach(),
+                rho_grid,
+                ib_grid,
+                R=model.renderer.col_radius,
+                K=model.renderer.col_k_bins,
+                sigma_d=model.renderer.col_sigma_d,
+                sigma_t=model.renderer.col_sigma_t,
+                n_passes=model.renderer.col_passes,
+                eps=model.render_eps,
+            )
+
+            eta_lum_map, eta_chr_map = compute_eta_modulation(
+                kappa_col, e_col, ib_grid,
+                nH, nW, H, W, S, P,
+                eta0_lum=L0.ETA_LUM,
+                eta0_chr=L0.ETA_CHR,
+                a=model.eta_mod_a,
+                b=model.eta_mod_b,
+                c=model.eta_mod_c,
+            )
+
+            if verbose:
+                print(
+                    f"  η-mod: a={model.eta_mod_a.item():.3f}  "
+                    f"b={model.eta_mod_b.item():.3f}  "
+                    f"c={model.eta_mod_c.item():.3f}"
+                )
+                print(
+                    f"  η_lum map: [{eta_lum_map.min():.4f}, {eta_lum_map.max():.4f}]  "
+                    f"(base {L0.ETA_LUM:.4f})"
+                )
+                print(
+                    f"  η_chr map: [{eta_chr_map.min():.4f}, {eta_chr_map.max():.4f}]  "
+                    f"(base {L0.ETA_CHR:.4f})"
+                )
+
+            border_mask = (~compute_interior(H, W, device)).to(device)
+            l0_pix_pass2 = fast_l0_pass2(
+                d_lum.to(device), d_chr.to(device),
+                eta_lum_map, eta_chr_map,
+                L0.GAMMA, L0.OFFSETS,
+                border_mask,
+            )
+            l0_pix_pass2 = {k: v.to(device) for k, v in l0_pix_pass2.items()}
+            l0_pix_pass2["eta_mod_map"] = eta_lum_map
+            l0_dev2 = l0_pix_pass2
+
+            bmap_t, theta_t = render_boundary_map_torch(
+                rho_out,
+                proj_dev,
+                model.renderer,
+                cf_dev,
+                Hp,
+                Wp,
+                l0_dev2,
+                eps=model.render_eps,
+                training=False,
+                branch_pick=branch.reshape(-1).long(),
+                content_h=H0,
+                content_w=W0,
+                return_dominant_theta=True,
+            )
 
     bmap = bmap_t.cpu().numpy()[:H0, :W0]
     theta = theta_t.cpu().numpy()[:H0, :W0]
@@ -240,6 +333,12 @@ def main():
         default=None,
         help="Tolerance factor for precision matching radius: max_dist = tol * diagonal "
         "(default: 0.0075).",
+    )
+    ap.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print η-modulation coefficients and per-image η map ranges when pass-2 runs.",
     )
     args = ap.parse_args()
 
@@ -319,7 +418,7 @@ def main():
     for idx, (stem, img_path, gt_path) in enumerate(pairs):
         t0 = time.perf_counter()
         bmap_c, theta, H0, W0 = run_image_inference(
-            model, img_path, device,
+            model, img_path, device, verbose=args.verbose,
         )
         bmap_s = ridge_nms(bmap_c, theta=theta)
         gt = _load_gt(gt_path, gt_format)

@@ -28,6 +28,7 @@ from typing import Union
 
 import numpy as np
 import torch
+from hci.renderer import _interp_cell_to_pixel
 
 EtaArg = Union[float, Callable[[], float]]
 
@@ -169,15 +170,23 @@ def _compute_d_lum_chroma(
 
 def _naka_per_direction(
     d: torch.Tensor,
-    eta: float,
+    eta: float | torch.Tensor,
     gamma: float,
     device: torch.device,
 ) -> torch.Tensor:
-    """γ d̃² / (η² + d̃²) with d̃_k = d_k − min_j d_j (per pixel)."""
+    """γ d̃² / (η² + d̃²) with d̃_k = d_k − min_j d_j (per pixel).
+
+    eta can be a scalar or an (H, W) tensor for spatially-varying
+    semi-saturation (pass-2 η modulation).
+    """
     d_t = d - torch.amin(d, dim=-1, keepdim=True)
-    eta_sq = float(eta) * float(eta)
     d_sq = d_t * d_t
     g = torch.tensor(float(gamma), dtype=torch.float32, device=device)
+    if isinstance(eta, torch.Tensor):
+        # eta is (H, W) → expand to (H, W, 1) for broadcasting with (H, W, N)
+        eta_sq = (eta * eta).unsqueeze(-1)
+    else:
+        eta_sq = float(eta) * float(eta)
     return g * d_sq / (eta_sq + d_sq)
 
 
@@ -242,15 +251,15 @@ def compute_contrast_field_rgb(
 def compute_l0_rgb(
     img_rgb: torch.Tensor,
     *,
-    eta_lum: EtaArg,
-    eta_chr: EtaArg,
+    eta_lum: EtaArg | torch.Tensor,
+    eta_chr: EtaArg | torch.Tensor,
     gamma: float,
     offsets: list[tuple[int, int]],
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
-    float,
-    float,
+    float | torch.Tensor,
+    float | torch.Tensor,
     float,
     torch.Tensor,
     torch.Tensor,
@@ -259,6 +268,8 @@ def compute_l0_rgb(
     torch.Tensor,
 ]:
     """Split-channel L0 on (H,W,3) RGB.
+
+    eta_lum / eta_chr can be scalars (pass 1) or (H, W) tensors (pass 2).
 
     Returns
       h, vld, eta_lum_used, eta_chr_used, gamma_used,
@@ -269,9 +280,17 @@ def compute_l0_rgb(
     img_rgb = img_rgb.float()
     H, W, _ = img_rgb.shape
     device = img_rgb.device
-    eta_l = resolve_eta(eta_lum)
-    eta_c = resolve_eta(eta_chr)
     gamma_used = float(gamma)
+
+    # Resolve eta — scalar or per-pixel tensor
+    if isinstance(eta_lum, torch.Tensor):
+        eta_l = eta_lum.to(device=device, dtype=torch.float32)
+    else:
+        eta_l = resolve_eta(eta_lum)
+    if isinstance(eta_chr, torch.Tensor):
+        eta_c = eta_chr.to(device=device, dtype=torch.float32)
+    else:
+        eta_c = resolve_eta(eta_chr)
 
     vld = compute_valid(H, W, offsets, device)
     d_lum, d_chr = _compute_d_lum_chroma(img_rgb, offsets)
@@ -364,7 +383,7 @@ def run_l0(
         ) = compute_l0_rgb(
             ir, eta_lum=eta_lum, eta_chr=eta_chr, gamma=gamma, offsets=offsets,
         )
-        eta_used_print = float(eta_l)
+        eta_used_print = float(eta_l) if not isinstance(eta_l, torch.Tensor) else f"map[{eta_l.min():.4f},{eta_l.max():.4f}]"
     else:
         contrast_field, vld, eta_u, gamma_used = compute_contrast_field(
             ir, eta_lum, gamma, offsets,
@@ -385,14 +404,16 @@ def run_l0(
     a0[border_mask] = 0.0
     if verbose:
         if ir.ndim == 3 and ir.shape[-1] == 3:
-            print(
-                f"  η_lum={float(eta_l):.4f}  η_chr={float(eta_c):.4f}  "
-                f"γ={gamma_used:.3f}  (split RGB)"
-            )
+            el_str = f"{eta_used_print}" if isinstance(eta_used_print, str) else f"{eta_used_print:.4f}"
+            ec_str = (f"map[{eta_c.min():.4f},{eta_c.max():.4f}]"
+                      if isinstance(eta_c, torch.Tensor) else f"{float(eta_c):.4f}")
+            print(f"  η_lum={el_str}  η_chr={ec_str}  γ={gamma_used:.3f}  (split RGB)")
         else:
-            print(f"  η={eta_used_print:.4f}  γ={gamma_used:.3f}  (grayscale)")
+            print(f"  η={eta_used_print}  γ={gamma_used:.3f}  (grayscale)")
         print(f"  excluded {border_mask.sum().item()} border pixels")
         print(f"  h2m: mean={h2m.mean().item():.4f} max={h2m.max().item():.4f}")
+    eta_l_out = float(eta_l) if not isinstance(eta_l, torch.Tensor) else eta_l
+    eta_c_out = float(eta_c) if not isinstance(eta_c, torch.Tensor) else eta_c
     return {
         "contrast_field": contrast_field,
         "vld": vld,
@@ -404,8 +425,164 @@ def run_l0(
         "a0": a0,
         "border_mask": border_mask,
         "interior": interior,
-        "eta_lum_used": float(eta_l),
-        "eta_chr_used": float(eta_c),
+        "eta_lum_used": eta_l_out,
+        "eta_chr_used": eta_c_out,
         "eta_used": eta_used_print,
         "gamma_used": gamma_used,
     }
+
+
+# ═══════════════════════════════════════════════════════════════
+# η modulation from collinear coherence (pass-2 feedback)
+# ═══════════════════════════════════════════════════════════════
+
+def compute_eta_modulation(
+    kappa_col_grid: torch.Tensor,
+    e_col_grid: torch.Tensor,
+    is_border_grid: torch.Tensor,
+    nH: int, nW: int,
+    H: int, W: int,
+    S: int, P: int,
+    eta0_lum: float,
+    eta0_chr: float,
+    a: torch.Tensor | float,
+    b: torch.Tensor | float,
+    c: torch.Tensor | float,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    r"""Compute spatially-varying η maps for L0 pass 2.
+
+    Learned modulation via sigmoid:
+
+    .. math::
+        \eta(p) = \eta_0 \cdot \sigma\!\bigl(a - b\cdot\bar\kappa(p)
+                  + c\cdot\bar E_{\text{col}}(p)\bigr)
+
+    Three learned scalars (a, b, c) control the modulation:
+      - a: bias (positive → η starts near η₀, keeps L0 sensitive by default)
+      - b: κ coefficient (positive → high collinear coherence reduces η,
+            boosting sensitivity where geometric structure exists)
+      - c: E_col coefficient (positive → high absolute energy increases η,
+            keeping sensitivity low where edges are already strong)
+
+    At initialization (a=2, b=0, c=0): σ(2) ≈ 0.88, so η ≈ 0.88·η₀
+    everywhere — near-identity, no modulation.
+
+    Args:
+        kappa_col_grid: (nH, nW) normalized collinear coherence
+        e_col_grid:     (nH, nW) raw (unnormalized) collinear energy
+        is_border_grid: (nH, nW) bool
+        nH, nW: cell grid dimensions
+        H, W: pixel dimensions
+        S, P: cell grid stride and patch size
+        eta0_lum, eta0_chr: base η values from pass 1
+        a, b, c: learned modulation parameters (scalars or 0-d tensors)
+
+    Returns:
+        eta_lum_map: (H, W) per-pixel η for luminance
+        eta_chr_map: (H, W) per-pixel η for chrominance
+    """
+    device = kappa_col_grid.device
+    dtype = kappa_col_grid.dtype
+
+    # Mask borders
+    kappa = torch.where(is_border_grid, torch.zeros_like(kappa_col_grid), kappa_col_grid)
+    e_col = torch.where(is_border_grid, torch.zeros_like(e_col_grid), e_col_grid)
+
+    # Normalize E_col to [0, 1] for stable sigmoid input
+    e_max = e_col.max().clamp_min(eps)
+    e_col_norm = e_col / e_max
+
+    # Resolve scalars to tensors on the right device
+    def _t(x):
+        if isinstance(x, torch.Tensor):
+            return x.to(device=device, dtype=dtype)
+        return torch.tensor(float(x), device=device, dtype=dtype)
+
+    a_t, b_t, c_t = _t(a), _t(b), _t(c)
+
+    # σ(a - b·κ + c·E_col_norm) on cell grid
+    logit = a_t - b_t * kappa + c_t * e_col_norm
+    mod_grid = torch.sigmoid(logit)
+
+    # Interpolate to pixel resolution
+    mod_pix = _interp_cell_to_pixel(mod_grid, nH, nW, H, W, S, P)
+
+    eta_lum_map = eta0_lum * mod_pix
+    eta_chr_map = eta0_chr * mod_pix
+
+    return eta_lum_map.to(dtype=dtype, device=device), eta_chr_map.to(dtype=dtype, device=device)
+
+
+def run_l0_two_pass(
+    ir: torch.Tensor,
+    eta_lum: float,
+    eta_chr: float,
+    gamma: float,
+    offsets: list[tuple[int, int]],
+    kappa_col_grid: torch.Tensor,
+    e_col_grid: torch.Tensor,
+    is_border_grid: torch.Tensor,
+    nH: int, nW: int,
+    S: int, P: int,
+    a: torch.Tensor | float = 2.0,
+    b: torch.Tensor | float = 0.0,
+    c: torch.Tensor | float = 0.0,
+    verbose: bool = True,
+) -> dict:
+    """Run L0 pass 2 with η modulated by collinear coherence from pass 1.
+
+    η(p) = η₀ · σ(a - b·κ̄(p) + c·Ē_col(p))
+
+    Pass 1 is assumed to have already been run (producing the collinear
+    signals).  This function computes the η modulation map and re-runs
+    L0 with spatially-varying η.
+
+    Args:
+        ir: (H, W, 3) RGB image
+        eta_lum, eta_chr: base η values from pass 1
+        gamma: L0 gamma
+        offsets: L0 offsets
+        kappa_col_grid: (nH, nW) from pass-1 collinear recurrence
+        e_col_grid: (nH, nW) raw collinear energy from pass 1
+        is_border_grid: (nH, nW) bool
+        nH, nW, S, P: cell grid geometry
+        a, b, c: learned modulation params (scalar or 0-d tensor)
+        verbose: print diagnostics
+
+    Returns:
+        dict with same keys as run_l0, plus 'eta_lum_map' and 'eta_chr_map'
+    """
+    H, W = ir.shape[:2]
+
+    # Compute per-pixel η maps
+    eta_lum_map, eta_chr_map = compute_eta_modulation(
+        kappa_col_grid, e_col_grid, is_border_grid,
+        nH, nW, H, W, S, P,
+        eta0_lum=eta_lum, eta0_chr=eta_chr,
+        a=a, b=b, c=c,
+    )
+
+    if verbose:
+        print("L0 pass 2 (η-modulated)...")
+        print(f"  η_lum: [{eta_lum_map.min():.4f}, {eta_lum_map.max():.4f}]  "
+              f"(base {eta_lum:.4f})")
+        print(f"  η_chr: [{eta_chr_map.min():.4f}, {eta_chr_map.max():.4f}]  "
+              f"(base {eta_chr:.4f})")
+        a_v = a.item() if isinstance(a, torch.Tensor) else a
+        b_v = b.item() if isinstance(b, torch.Tensor) else b
+        c_v = c.item() if isinstance(c, torch.Tensor) else c
+        print(f"  σ params: a={a_v:.3f}  b={b_v:.3f}  c={c_v:.3f}")
+
+    # Re-run L0 with spatially-varying η
+    result = run_l0(
+        ir,
+        eta_lum=eta_lum_map,
+        eta_chr=eta_chr_map,
+        gamma=gamma,
+        offsets=offsets,
+        verbose=verbose,
+    )
+    result["eta_lum_map"] = eta_lum_map
+    result["eta_chr_map"] = eta_chr_map
+    return result

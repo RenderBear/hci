@@ -73,7 +73,7 @@ TRAIN = SimpleNamespace(
     NUM_WORKERS=2,
     LAM_DICE=1.0,
     LAM_BCE=0.0,
-    CACHE_VERSION=2,
+    CACHE_VERSION=3,
 )
 
 # ── Inference ────────────────────────────────────────────────────────────────

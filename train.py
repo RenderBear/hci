@@ -28,6 +28,10 @@ from hci.L0 import (
     load_image,
     compute_l0_rgb,
     compute_interior,
+    _compute_d_lum_chroma,
+    _naka_per_direction,
+    compute_harmonics,
+    compute_seed,
 )
 from hci.L1 import z_from_l0_harmonics, pad_for_patch_grid, run_l1
 from hci.seed import RhoSeedModule
@@ -77,6 +81,42 @@ def build_l0_pix(
         hc[border_mask_np] = 0.0
         out["h2m_chr"] = torch.from_numpy(hc)
     return out
+
+
+def fast_l0_pass2(
+    d_lum: torch.Tensor,
+    d_chr: torch.Tensor,
+    eta_lum_map: torch.Tensor,
+    eta_chr_map: torch.Tensor,
+    gamma: float,
+    offsets: list[tuple[int, int]],
+    border_mask: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Fast L0 pass 2: reuse precomputed d_lum/d_chr, apply new per-pixel η.
+
+    Skips the expensive directional-difference computation (which depends
+    only on the image, not on η).  Only reapplies the Naka–Rushton with
+    spatially-varying η and recomputes harmonics.
+
+    Returns a minimal ``l0_pix``-style dict with **differentiable**
+    ``h2m_lum`` / ``h2m_chr`` tensors only.  ``render_boundary_map_torch``
+    reads just those keys for the pixel feature stack; we intentionally do
+    **not** call ``build_l0_pix`` here (its numpy round-trip would detach
+    ``η_mod`` from the autograd graph during training).
+    """
+    device = d_lum.device
+
+    h_lum = _naka_per_direction(d_lum, eta_lum_map, gamma, device)
+    h_chr = _naka_per_direction(d_chr, eta_chr_map, gamma, device)
+    _, _, h2m_lum = compute_harmonics(h_lum, offsets)
+    _, _, h2m_chr = compute_harmonics(h_chr, offsets)
+
+    h2m_lum = h2m_lum.clone()
+    h2m_lum[border_mask] = 0.0
+    h2m_chr = h2m_chr.clone()
+    h2m_chr[border_mask] = 0.0
+
+    return {"h2m_lum": h2m_lum, "h2m_chr": h2m_chr}
 
 
 def build_cells_flat(cells: dict) -> dict:
@@ -129,6 +169,7 @@ class HarmonicContourE2E(nn.Module):
         eta_z_init: float = SEED.ETA_Z_INIT,
         render_cell_hidden: int = RENDER.CELL_HIDDEN,
         render_pixel_hidden: int = RENDER.PIXEL_HIDDEN,
+        eta_mod_enabled: bool = True,
     ):
         super().__init__()
         _ = render_cell_hidden
@@ -142,11 +183,24 @@ class HarmonicContourE2E(nn.Module):
         self.eps = eps
         self.render_eps = max(float(eps), 1e-6)
 
+        # Learned η modulation: η(p) = η₀ · σ(a - b·κ̄ + c·Ē_col)
+        # Init: a=2, b=0, c=0 → σ(2) ≈ 0.88 → near-identity
+        self.eta_mod_enabled = eta_mod_enabled
+        if eta_mod_enabled:
+            self.eta_mod_a = nn.Parameter(torch.tensor(2.0, dtype=torch.float32))
+            self.eta_mod_b = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+            self.eta_mod_c = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+
     def forward_batch(self, meta_list):
+        from hci.L0 import compute_eta_modulation
+        from hci.renderer import _interp_cell_to_pixel
+
         bmaps = []
         for m in meta_list:
             cf_flat = m["cells_flat_dev"]
             rho_out, branch, _, _, _, _, _ = self.seed(cells_flat=cf_flat)
+
+            # Pass 1: render with precomputed l0_pix to get κ_col and E_col
             bmap = render_boundary_map_torch(
                 rho_out,
                 m["proj_dev"],
@@ -161,6 +215,94 @@ class HarmonicContourE2E(nn.Module):
                 content_h=m["H0"],
                 content_w=m["W0"],
             )
+
+            # Pass 2: η modulation if enabled and data available
+            has_pass2_data = (
+                self.eta_mod_enabled
+                and "d_lum" in m
+                and "d_chr" in m
+                and "border_mask" in m
+            )
+            if has_pass2_data:
+                # Extract κ_col and E_col from the renderer's collinear pass
+                # (they were computed during render; re-run collinear on cell grid
+                # to get them — cheap, already detached)
+                from hci.renderer import compute_collinear_coherence
+                nH = int(cf_flat["nH"])
+                nW = int(cf_flat["nW"])
+                S = int(cf_flat.get("S", max(1, m["proj_dev"]["W"] // max(nW, 1))))
+                P = int(cf_flat.get("P", S + (S - 1)))
+                device = rho_out.device
+                dtype = rho_out.dtype
+
+                theta_all = cf_flat["theta"].to(device=device, dtype=dtype)
+                bp = branch.reshape(-1).long()
+                idx_n = torch.arange(nH * nW, device=device)
+                theta_c = theta_all[idx_n, bp]
+                rho_grid = rho_out.reshape(nH, nW).detach()
+                ib_grid = cf_flat["is_border"].to(device=device).reshape(nH, nW).bool()
+
+                from hci.renderer import _smooth_theta_rho_double_angle
+                theta_combed = _smooth_theta_rho_double_angle(
+                    theta_c.reshape(nH, nW), rho_grid, ib_grid,
+                )
+
+                kappa_col, _, e_col = compute_collinear_coherence(
+                    theta_combed.detach(),
+                    rho_grid,
+                    ib_grid,
+                    R=self.renderer.col_radius,
+                    K=self.renderer.col_k_bins,
+                    sigma_d=self.renderer.col_sigma_d,
+                    sigma_t=self.renderer.col_sigma_t,
+                    n_passes=self.renderer.col_passes,
+                    eps=self.render_eps,
+                )
+
+                # Compute per-pixel η maps
+                H, W = m["proj_dev"]["H"], m["proj_dev"]["W"]
+                eta_lum_map, eta_chr_map = compute_eta_modulation(
+                    kappa_col, e_col, ib_grid,
+                    nH, nW, H, W, S, P,
+                    eta0_lum=L0.ETA_LUM,
+                    eta0_chr=L0.ETA_CHR,
+                    a=self.eta_mod_a,
+                    b=self.eta_mod_b,
+                    c=self.eta_mod_c,
+                )
+
+                # Fast L0 pass 2: reuse d_lum/d_chr, apply modulated η
+                l0_pix_pass2 = fast_l0_pass2(
+                    m["d_lum"], m["d_chr"],
+                    eta_lum_map, eta_chr_map,
+                    L0.GAMMA, L0.OFFSETS,
+                    m["border_mask"],
+                )
+                # Detach NR/harmonics path (avoids fragile grad through atan2/NR);
+                # keep η map in-graph for thinning MLP feature 17 → η_mod a,b,c.
+                l0_pix_pass2 = {
+                    k: v.to(device).detach() for k, v in l0_pix_pass2.items()
+                }
+                l0_pix_pass2["eta_mod_map"] = eta_lum_map.to(
+                    device=device, dtype=rho_out.dtype,
+                )
+
+                # Re-render with updated h2m + η feature
+                bmap = render_boundary_map_torch(
+                    rho_out,
+                    m["proj_dev"],
+                    self.renderer,
+                    cf_flat,
+                    m["Hp"],
+                    m["Wp"],
+                    l0_pix_pass2,
+                    eps=self.render_eps,
+                    training=self.training,
+                    branch_pick=branch.reshape(-1).long(),
+                    content_h=m["H0"],
+                    content_w=m["W0"],
+                )
+
             bmaps.append(bmap)
         return bmaps
 
@@ -168,7 +310,8 @@ class HarmonicContourE2E(nn.Module):
 def prepare_batch(items, device):
     meta = []
     for item in items:
-        (gi, gt, Hp, Wp, Hg, Wg, H0, W0, cells_flat, l0_pix, img) = item
+        (gi, gt, Hp, Wp, Hg, Wg, H0, W0, cells_flat, l0_pix, img,
+         d_lum, d_chr, border_mask) = item
         cf_dev = {
             k: (v.to(device) if isinstance(v, torch.Tensor) else v)
             for k, v in cells_flat.items()
@@ -177,23 +320,29 @@ def prepare_batch(items, device):
             k: v.to(device) for k, v in l0_pix.items()
         }
         p_dev = proj_to_device(gi, device)
-        meta.append(
-            {
-                "nH": cells_flat["nH"],
-                "nW": cells_flat["nW"],
-                "proj_dev": p_dev,
-                "gt": gt.to(device),
-                "Hp": Hp,
-                "Wp": Wp,
-                "Hg": Hg,
-                "Wg": Wg,
-                "H0": H0,
-                "W0": W0,
-                "cells_flat_dev": cf_dev,
-                "l0_pix": l0_dev,
-                "img": img,
-            }
-        )
+        m = {
+            "nH": cells_flat["nH"],
+            "nW": cells_flat["nW"],
+            "proj_dev": p_dev,
+            "gt": gt.to(device),
+            "Hp": Hp,
+            "Wp": Wp,
+            "Hg": Hg,
+            "Wg": Wg,
+            "H0": H0,
+            "W0": W0,
+            "cells_flat_dev": cf_dev,
+            "l0_pix": l0_dev,
+            "img": img,
+        }
+        # Pass-2 η modulation data (may be None for old caches)
+        if d_lum is not None:
+            m["d_lum"] = d_lum.to(device)
+        if d_chr is not None:
+            m["d_chr"] = d_chr.to(device)
+        if border_mask is not None:
+            m["border_mask"] = border_mask.to(device)
+        meta.append(m)
     return meta
 
 
@@ -227,6 +376,10 @@ def precompute_image(img_path, gt_path, gt_format):
     del ir_np
 
     ir_t = torch.from_numpy(ir_p)
+
+    # Compute directional differences (image-dependent, η-independent)
+    d_lum, d_chr = _compute_d_lum_chroma(ir_t, L0.OFFSETS)
+
     h, vld, _, _, _, s, h1m, h2m, h2m_lum, h2m_chr = compute_l0_rgb(
         ir_t,
         eta_lum=L0.ETA_LUM,
@@ -305,6 +458,9 @@ def precompute_image(img_path, gt_path, gt_format):
         "cells_flat": cells_flat,
         "l0_pix": l0_pix,
         "img": img_cached,
+        "d_lum": d_lum.cpu(),
+        "d_chr": d_chr.cpu(),
+        "border_mask": border_mask_t.cpu(),
     }
 
 
@@ -463,6 +619,9 @@ class StriateDataset(Dataset):
             data["cells_flat"],
             data["l0_pix"],
             data.get("img"),
+            data.get("d_lum"),
+            data.get("d_chr"),
+            data.get("border_mask"),
         )
 
 
@@ -593,6 +752,13 @@ def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
             print(f"    thinning.{name}: grad=None")
         else:
             print(f"    thinning.{name}: |grad|={t.grad.abs().mean().item():.2e}")
+    if hasattr(model, "eta_mod_a"):
+        for label in ("eta_mod_a", "eta_mod_b", "eta_mod_c"):
+            t = getattr(model, label, None)
+            if t is None:
+                continue
+            g = "None" if t.grad is None else f"|grad|={t.grad.abs().mean().item():.2e}"
+            print(f"    {label}={t.item():.3f}  {g}")
     print(f"\n  loss={loss.item():.4f}  requires_grad={loss.requires_grad}\n")
 
 
@@ -662,7 +828,7 @@ def format_renderer_param_lines(r: ModulationRenderer, *, indent: str = "  ") ->
     return [
         f"{indent}harmonic-native:  h2m · gate(MLP)  (no Gaussian splat)",
         f"{indent}stencil spacings:  s_t={r.s_t.item():.3f}  s_n={r.s_n.item():.3f}",
-        f"{indent}thinning head:  17→16→1 MLP  ({n_th} params)",
+        f"{indent}thinning head:  18→16→1 MLP  ({n_th} params)",
         f"{indent}collinear:  R={r.col_radius}  K={r.col_k_bins}  "
         f"σ_d={sig_d:.1f}  σ_t={r.col_sigma_t:.1f}",
     ]
@@ -688,12 +854,20 @@ def format_model_param_counts(model: HarmonicContourE2E):
 def _format_render_params(model: HarmonicContourE2E):
     r = model.renderer
     n_r = sum(p.numel() for p in r.parameters())
+    eta_str = ""
+    if hasattr(model, "eta_mod_a"):
+        eta_str = (f" + η-mod σ(a={model.eta_mod_a.item():.1f},"
+                   f"b={model.eta_mod_b.item():.1f},"
+                   f"c={model.eta_mod_c.item():.1f})")
     return (f"renderer={n_r} params  (harmonic-native, s_t, s_n, "
-            f"thinning 17→16→1, collinear R={r.col_radius})")
+            f"thinning 18→16→1, collinear R={r.col_radius}{eta_str})")
 
 
 def save_checkpoint(model, path):
     torch.save({"model_state": model.state_dict()}, path)
+
+
+_ETA_MOD_STATE_KEYS = frozenset({"eta_mod_a", "eta_mod_b", "eta_mod_c"})
 
 
 def report_checkpoint_compatibility(incompatible, context="checkpoint load"):
@@ -706,6 +880,15 @@ def report_checkpoint_compatibility(incompatible, context="checkpoint load"):
         print(f"  missing_keys ({len(missing)}): {missing}")
     if unexpected:
         print(f"  unexpected_keys ({len(unexpected)}): {unexpected}")
+    miss_eta = sorted(_ETA_MOD_STATE_KEYS.intersection(missing))
+    if miss_eta:
+        print(
+            f"[{context}] WARNING: checkpoint is missing η-mod weights {miss_eta}. "
+            "Those parameters were not loaded and still use PyTorch init values "
+            "(a=2.0, b=0.0, c=0.0). Pass-2 η maps then reflect only that default σ, "
+            "not a trained modulation. Retrain with the current train.py to learn "
+            "eta_mod_a/b/c and write them into the checkpoint."
+        )
 
 
 def _detect_gt_format(gt_dir):
@@ -840,8 +1023,8 @@ def main():
         batch = next(iter(train_loader))
         moved = []
         for item in batch:
-            (gi, gt, Hp, Wp, Hg, Wg, H0, W0, cells_flat, l0_pix, img) = item
-            moved.append((gi, gt, Hp, Wp, Hg, Wg, H0, W0, cells_flat, l0_pix, img))
+            (gi, gt, Hp, Wp, Hg, Wg, H0, W0, cells_flat, l0_pix, img, d_lum, d_chr, border_mask) = item
+            moved.append((gi, gt, Hp, Wp, Hg, Wg, H0, W0, cells_flat, l0_pix, img, d_lum, d_chr, border_mask))
         debug_drive_batch(
             model,
             prepare_batch(moved, device),
@@ -869,8 +1052,8 @@ def main():
         for batch in train_loader:
             moved = []
             for item in batch:
-                (gi, gt, Hp, Wp, Hg, Wg, H0, W0, cells_flat, l0_pix, img) = item
-                moved.append((gi, gt, Hp, Wp, Hg, Wg, H0, W0, cells_flat, l0_pix, img))
+                (gi, gt, Hp, Wp, Hg, Wg, H0, W0, cells_flat, l0_pix, img, d_lum, d_chr, border_mask) = item
+                moved.append((gi, gt, Hp, Wp, Hg, Wg, H0, W0, cells_flat, l0_pix, img, d_lum, d_chr, border_mask))
 
             meta_list = prepare_batch(moved, device)
             bmaps = model.forward_batch(meta_list)

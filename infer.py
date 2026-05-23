@@ -18,7 +18,7 @@ import torch
 from PIL import Image
 
 from params import L0, L1, RENDER, INFER, SEED
-from hci.L0 import compute_l0_rgb, compute_interior
+from hci.L0 import compute_l0_rgb, compute_interior, _compute_d_lum_chroma
 from hci.L1 import z_from_l0_harmonics, pad_for_patch_grid, run_l1
 from hci.renderer import (
     compute_render_features,
@@ -26,6 +26,8 @@ from hci.renderer import (
     proj_to_device,
     ridge_nms,
     upgrade_renderer_state_dict,
+    compute_collinear_coherence,
+    _smooth_theta_rho_double_angle,
 )
 from hci.diagnostics_viz import (
     viz_infer_l0_pinwheel,
@@ -43,6 +45,7 @@ from train import (
     HarmonicContourE2E,
     build_cells_flat,
     build_l0_pix,
+    fast_l0_pass2,
     format_seed_param_lines,
     format_model_param_counts,
     format_renderer_param_lines,
@@ -110,6 +113,10 @@ def run_l0_l1(img_path, device):
     gc.collect()
 
     ir_t = torch.from_numpy(ir_p).to(device)
+
+    # Compute directional differences (reusable across η values)
+    d_lum, d_chr = _compute_d_lum_chroma(ir_t, L0.OFFSETS)
+
     h, vld, _, _, _, s, h1m, h2m, h2m_lum, h2m_chr = compute_l0_rgb(
         ir_t,
         eta_lum=L0.ETA_LUM,
@@ -148,7 +155,9 @@ def run_l0_l1(img_path, device):
         device=device,
         verbose=False,
     )
-    del z1, z2, bm_t, ir_t
+    del z1, z2, ir_t
+    border_mask_saved = bm_t.cpu()
+    del bm_t
     gc.collect()
     cells["is_border"] |= (cells["cy"] + cells["P"] / 2 > H0) | (
         cells["cx"] + cells["P"] / 2 > W0
@@ -191,6 +200,9 @@ def run_l0_l1(img_path, device):
         "is_border_grid": is_border_grid,
         "h_np": h_np,
         "img_pinwheel": img_pinwheel,
+        "d_lum": d_lum.cpu(),
+        "d_chr": d_chr.cpu(),
+        "border_mask": border_mask_saved,
     }
     return prep, timings
 
@@ -205,6 +217,7 @@ def _infer_seed_and_render(
     timings: dict[str, float] | None = None,
     return_rho_cell_grids: bool = False,
     return_rho_collinear_iter_pix: bool = False,
+    verbose: bool = False,
 ) -> tuple[
     np.ndarray,
     np.ndarray,
@@ -242,6 +255,77 @@ def _infer_seed_and_render(
         t1 = time.perf_counter()
     with torch.no_grad():
         want_cell_grids = bool(return_rho_cell_grids or return_rho_collinear_iter_pix)
+
+        # Determine which l0_pix to use (pass 1 or pass 2 with η modulation)
+        l0_for_render = l0_dev
+
+        if hasattr(model, "eta_mod_a") and model.eta_mod_enabled and "d_lum" in prep:
+            from hci.L0 import compute_eta_modulation
+
+            H, W = proj_dev["H"], proj_dev["W"]
+            dtype = rho_out.dtype
+            S = int(cf_dev.get("S", max(1, W // max(nW, 1))))
+            P = int(cf_dev.get("P", S + (S - 1)))
+
+            theta_all = cf_dev["theta"].to(device=device, dtype=dtype)
+            bp = branch.reshape(-1).long()
+            idx_n = torch.arange(nH * nW, device=device)
+            theta_c = theta_all[idx_n, bp]
+            rho_grid = rho_out.reshape(nH, nW).detach()
+            ib_grid = cf_dev["is_border"].to(device=device).reshape(nH, nW).bool()
+
+            theta_combed = _smooth_theta_rho_double_angle(
+                theta_c.reshape(nH, nW), rho_grid, ib_grid,
+            )
+
+            kappa_col, _, e_col = compute_collinear_coherence(
+                theta_combed.detach(),
+                rho_grid,
+                ib_grid,
+                R=model.renderer.col_radius,
+                K=model.renderer.col_k_bins,
+                sigma_d=model.renderer.col_sigma_d,
+                sigma_t=model.renderer.col_sigma_t,
+                n_passes=model.renderer.col_passes,
+                eps=model.render_eps,
+            )
+
+            eta_lum_map, eta_chr_map = compute_eta_modulation(
+                kappa_col, e_col, ib_grid,
+                nH, nW, H, W, S, P,
+                eta0_lum=L0.ETA_LUM,
+                eta0_chr=L0.ETA_CHR,
+                a=model.eta_mod_a,
+                b=model.eta_mod_b,
+                c=model.eta_mod_c,
+            )
+
+            if verbose:
+                print(
+                    f"  η-mod: a={model.eta_mod_a.item():.3f}  "
+                    f"b={model.eta_mod_b.item():.3f}  "
+                    f"c={model.eta_mod_c.item():.3f}"
+                )
+                print(
+                    f"  η_lum map: [{eta_lum_map.min():.4f}, {eta_lum_map.max():.4f}]  "
+                    f"(base {L0.ETA_LUM:.4f})"
+                )
+                print(
+                    f"  η_chr map: [{eta_chr_map.min():.4f}, {eta_chr_map.max():.4f}]  "
+                    f"(base {L0.ETA_CHR:.4f})"
+                )
+
+            border_mask = prep["border_mask"].to(device)
+            l0_pix_pass2 = fast_l0_pass2(
+                prep["d_lum"].to(device), prep["d_chr"].to(device),
+                eta_lum_map, eta_chr_map,
+                L0.GAMMA, L0.OFFSETS,
+                border_mask,
+            )
+            l0_pix_pass2 = {k: v.to(device) for k, v in l0_pix_pass2.items()}
+            l0_pix_pass2["eta_mod_map"] = eta_lum_map
+            l0_for_render = l0_pix_pass2
+
         render_out = render_boundary_map_torch(
             rho_out,
             proj_dev,
@@ -249,7 +333,7 @@ def _infer_seed_and_render(
             cf_dev,
             Hp,
             Wp,
-            l0_dev,
+            l0_for_render,
             eps=model.render_eps,
             training=False,
             branch_pick=branch.reshape(-1).long(),
@@ -310,6 +394,7 @@ def forward_with_diagnostics(
     apply_ridge_nms=True,
     return_rho_cell_grids: bool = False,
     return_rho_collinear_iter_pix: bool = False,
+    verbose: bool = False,
 ):
 
     timings: dict[str, float] = {}
@@ -333,6 +418,7 @@ def forward_with_diagnostics(
         timings=timings,
         return_rho_cell_grids=return_rho_cell_grids,
         return_rho_collinear_iter_pix=return_rho_collinear_iter_pix,
+        verbose=verbose,
     )
 
     return (
@@ -452,6 +538,7 @@ def main():
         apply_ridge_nms=args.ridge_nms,
         return_rho_cell_grids=args.diagnostics,
         return_rho_collinear_iter_pix=args.diagnostics,
+        verbose=args.verbose,
     )
 
     eta_z = float(model.seed.eta_z.detach().cpu().item())
