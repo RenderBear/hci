@@ -32,6 +32,8 @@ from hce.diagnostics_viz import (
     viz_infer_l1_lambdas,
     viz_infer_cell_photo,
     viz_infer_rho_map_hist_cdf,
+    viz_infer_rho_seed_final_dual_maps,
+    viz_infer_rho_seed_final_hist_cdf,
     save_rho_png,
     viz_infer_shape_readout,
     viz_infer_base_edges_overlay,
@@ -200,7 +202,18 @@ def _infer_seed_and_render(
     collect_diags: bool = False,
     apply_ridge_nms: bool = True,
     timings: dict[str, float] | None = None,
-) -> tuple[np.ndarray, np.ndarray, torch.Tensor, torch.Tensor, np.ndarray, dict | None, np.ndarray]:
+    return_rho_cell_grids: bool = False,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    torch.Tensor,
+    torch.Tensor,
+    np.ndarray,
+    dict | None,
+    np.ndarray,
+    np.ndarray | None,
+    np.ndarray | None,
+]:
     H0, W0 = prep["H0"], prep["W0"]
     Hp, Wp = prep["Hp"], prep["Wp"]
     nH, nW = prep["nH"], prep["nW"]
@@ -225,7 +238,7 @@ def _infer_seed_and_render(
         timings["seed"] = time.perf_counter() - t0
         t1 = time.perf_counter()
     with torch.no_grad():
-        bmap_t, theta_t = render_boundary_map_torch(
+        render_out = render_boundary_map_torch(
             rho_out,
             proj_dev,
             model.renderer,
@@ -239,7 +252,15 @@ def _infer_seed_and_render(
             content_h=H0,
             content_w=W0,
             return_dominant_theta=True,
+            return_rho_cell_grids=return_rho_cell_grids,
         )
+        if return_rho_cell_grids:
+            bmap_t, theta_t, rho_seed_cell_t, rho_final_cell_t = render_out
+            rho_seed_cell_np = rho_seed_cell_t.detach().cpu().numpy()
+            rho_final_cell_np = rho_final_cell_t.detach().cpu().numpy()
+        else:
+            bmap_t, theta_t = render_out
+            rho_seed_cell_np, rho_final_cell_np = None, None
     if timings is not None:
         _sync(device)
         timings["render"] = time.perf_counter() - t1
@@ -251,7 +272,17 @@ def _infer_seed_and_render(
     rho_post_grid = rho_out.cpu().numpy().reshape(nH, nW)
     branch_grid = branch.cpu().numpy().reshape(nH, nW)
     supp_nb_np = supp_nb.cpu().numpy().reshape(nH, nW)
-    return bmap, theta_map, rho_out, branch_grid, rho_post_grid, surface_diags, supp_nb_np
+    return (
+        bmap,
+        theta_map,
+        rho_out,
+        branch_grid,
+        rho_post_grid,
+        surface_diags,
+        supp_nb_np,
+        rho_seed_cell_np,
+        rho_final_cell_np,
+    )
 
 
 def forward_with_diagnostics(
@@ -261,6 +292,7 @@ def forward_with_diagnostics(
     *,
     collect_diags,
     apply_ridge_nms=True,
+    return_rho_cell_grids: bool = False,
 ):
 
     timings: dict[str, float] = {}
@@ -272,6 +304,8 @@ def forward_with_diagnostics(
         rho_post_grid,
         surface_diags,
         supp_nb_np,
+        rho_seed_cell_np,
+        rho_final_cell_np,
     ) = _infer_seed_and_render(
         model,
         prep,
@@ -279,6 +313,7 @@ def forward_with_diagnostics(
         collect_diags=collect_diags,
         apply_ridge_nms=apply_ridge_nms,
         timings=timings,
+        return_rho_cell_grids=return_rho_cell_grids,
     )
 
     return (
@@ -290,6 +325,8 @@ def forward_with_diagnostics(
         surface_diags,
         supp_nb_np,
         timings,
+        rho_seed_cell_np,
+        rho_final_cell_np,
     )
 
 
@@ -346,8 +383,8 @@ def main():
         "--diagnostics",
         action="store_true",
         help="Save additional diagnostics: base, l0_pinwheel, l1_lambdas, photo, "
-        "rho (map+histogram+CDF), render_softmap, render_theta_bins, "
-        "overlay (base RGB with thresholded edges).",
+        "rho (map+histogram+CDF), rho_seed vs rho_after_collinear (dual map + hist/CDF), "
+        "render_softmap, render_theta_bins, overlay (base RGB with thresholded edges).",
     )
     ap.add_argument("--device", default=None)
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -374,14 +411,24 @@ def main():
     prep, prep_t = run_l0_l1(img_path, device)
 
     collect_diags = args.verbose or args.diagnostics
-    (bmap, theta_map, rho_post, branch_grid, is_border, diags, _, fwd_t) = (
-        forward_with_diagnostics(
-            model,
-            prep,
-            device,
-            collect_diags=collect_diags,
-            apply_ridge_nms=args.ridge_nms,
-        )
+    (
+        bmap,
+        theta_map,
+        rho_post,
+        branch_grid,
+        is_border,
+        diags,
+        _,
+        fwd_t,
+        rho_seed_cell,
+        rho_final_cell,
+    ) = forward_with_diagnostics(
+        model,
+        prep,
+        device,
+        collect_diags=collect_diags,
+        apply_ridge_nms=args.ridge_nms,
+        return_rho_cell_grids=args.diagnostics,
     )
 
     eta_z = float(model.seed.eta_z.detach().cpu().item())
@@ -400,6 +447,7 @@ def main():
             if "mid_band_frac" in st0:
                 print(f"  midband={st0['mid_band_frac']:.6f}")
 
+    n_collinear_passes = int(model.renderer.col_passes)
     del model, ckpt
     gc.collect()
 
@@ -433,6 +481,21 @@ def main():
         p_rho = os.path.join(od, f"{stem}_rho.png")
         viz_infer_rho_map_hist_cdf(rho_post, is_border, p_rho, eta_z=eta_z)
         saved_files.append(p_rho)
+
+        p_rho_sf = os.path.join(od, f"{stem}_rho_seed_final_maps.png")
+        viz_infer_rho_seed_final_dual_maps(
+            rho_seed_cell,
+            rho_final_cell,
+            is_border,
+            p_rho_sf,
+            n_collinear_passes=n_collinear_passes,
+        )
+        saved_files.append(p_rho_sf)
+        p_rho_stats = os.path.join(od, f"{stem}_rho_seed_final_hist_cdf.png")
+        viz_infer_rho_seed_final_hist_cdf(
+            rho_seed_cell, rho_final_cell, is_border, p_rho_stats
+        )
+        saved_files.append(p_rho_stats)
     bmap_np = np.asarray(bmap, dtype=np.float64)
     if args.threshold is not None:
         threshold = float(args.threshold)

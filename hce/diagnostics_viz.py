@@ -541,6 +541,129 @@ def viz_infer_rho_map_hist_cdf(
     plt.close(fig)
 
 
+def viz_infer_rho_seed_final_dual_maps(
+    rho_seed: np.ndarray,
+    rho_final: np.ndarray,
+    is_border: np.ndarray,
+    out_path: str,
+    *,
+    n_collinear_passes: int,
+) -> None:
+    """Side-by-side cell ρ: L1 seed input to renderer vs after recurrent collinear passes."""
+    gs = apply_border_zero(np.asarray(rho_seed, dtype=np.float64), is_border)
+    gf = apply_border_zero(np.asarray(rho_final, dtype=np.float64), is_border)
+
+    fig, axes = plt.subplots(1, 2, figsize=(13.6, 5.4), facecolor=VIZ.BG)
+    cmap = rho_heatmap_cmap()
+    vmax = max(
+        float(np.max(gs)) if gs.size else 0.0,
+        float(np.max(gf)) if gf.size else 0.0,
+        float(VIZ.EPS),
+    )
+    norm_seed = np.clip(gs / vmax, 0.0, 1.0)
+    norm_fin = np.clip(gf / vmax, 0.0, 1.0)
+    titles = (
+        r"$\rho_{\mathrm{seed}}$ (cell, pre-collinear)",
+        r"$\rho_{\mathrm{final}}$ (after %d collinear passes)" % int(n_collinear_passes),
+    )
+    for ax, arr, title in zip(axes, (norm_seed, norm_fin), titles):
+        ax.set_facecolor(VIZ.PANEL_BG)
+        ax.imshow(arr, cmap=cmap, vmin=0.0, vmax=1.0, interpolation="nearest")
+        ax.set_title(title, fontsize=9, color=VIZ.FG, fontfamily="monospace")
+        ax.axis("off")
+    fig.suptitle(
+        "cell $\\rho$: seed vs after recurrent collinear modulation "
+        f"(shared color scale, max={vmax:.4g})",
+        fontsize=10,
+        color=VIZ.FG,
+        fontfamily="monospace",
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
+    plt.close(fig)
+
+
+def viz_infer_rho_seed_final_hist_cdf(
+    rho_seed: np.ndarray,
+    rho_final: np.ndarray,
+    is_border: np.ndarray,
+    out_path: str,
+    *,
+    n_bins: int = 64,
+) -> None:
+    """Interior histograms + empirical CDFs for ρ_seed and ρ_final (common ρ range)."""
+    ib = np.asarray(is_border, dtype=bool)
+    gs = apply_border_zero(np.asarray(rho_seed, dtype=np.float64), is_border)
+    gf = apply_border_zero(np.asarray(rho_final, dtype=np.float64), is_border)
+    flat_s = gs.ravel()[~ib.ravel()]
+    flat_f = gf.ravel()[~ib.ravel()]
+    mx_s = float(np.max(flat_s)) if flat_s.size else 0.0
+    mx_f = float(np.max(flat_f)) if flat_f.size else 0.0
+    xmax = max(mx_s, mx_f, float(VIZ.EPS))
+
+    fig, axes = plt.subplots(2, 2, figsize=(11.5, 8.2), facecolor=VIZ.BG)
+    fig.suptitle(
+        r"Interior $\rho_{\mathrm{seed}}$ vs $\rho_{\mathrm{final}}$ — histograms & CDFs "
+        f"(common range [0, {xmax:.4g}])",
+        fontsize=10,
+        color=VIZ.FG,
+        fontfamily="monospace",
+    )
+
+    rows = (
+        (flat_s, r"$\rho_{\mathrm{seed}}$ (pre-collinear)"),
+        (flat_f, r"$\rho_{\mathrm{final}}$ (post-collinear)"),
+    )
+    for row_i, (flat, row_title) in enumerate(rows):
+        ax_h = axes[row_i, 0]
+        ax_c = axes[row_i, 1]
+        ax_h.set_facecolor(VIZ.PANEL_BG)
+        ax_c.set_facecolor(VIZ.PANEL_BG)
+        n = int(flat.size)
+        if n > 0:
+            ax_h.hist(
+                flat,
+                bins=n_bins,
+                range=(0.0, xmax),
+                color=VIZ.ACCENT,
+                edgecolor=VIZ.PANEL_BG,
+                linewidth=0.3,
+            )
+            xs = np.sort(flat.astype(np.float64, copy=False))
+            ys = np.arange(1, n + 1, dtype=np.float64)
+            ax_c.plot(xs, ys, color=VIZ.FG, linewidth=1.2)
+        ax_h.set_xlim(0.0, xmax)
+        ax_h.set_title(
+            f"{row_title}\nvs count  n={n}",
+            fontsize=8,
+            color=VIZ.FG,
+            fontfamily="monospace",
+        )
+        ax_h.set_ylabel("count", fontsize=8, color=VIZ.FG)
+        ax_h.tick_params(colors=VIZ.FG, labelsize=7)
+        for s in ax_h.spines.values():
+            s.set_color(VIZ.ACCENT)
+
+        ax_c.set_xlim(0.0, xmax)
+        ax_c.set_ylim(0.0, float(max(n, 1)))
+        ax_c.set_xlabel(r"$\rho$", fontsize=8, color=VIZ.FG)
+        ax_c.set_ylabel("cumulative count", fontsize=8, color=VIZ.FG)
+        ax_c.set_title(
+            "empirical CDF (unnormalized y)",
+            fontsize=8,
+            color=VIZ.FG,
+            fontfamily="monospace",
+        )
+        ax_c.grid(True, alpha=0.25, color=VIZ.ACCENT)
+        ax_c.tick_params(colors=VIZ.FG, labelsize=7)
+        for s in ax_c.spines.values():
+            s.set_color(VIZ.ACCENT)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
+    plt.close(fig)
+
+
 def viz_pixel_projection_and_edges(
     pix_proj: np.ndarray,
     edges_u8: np.ndarray,

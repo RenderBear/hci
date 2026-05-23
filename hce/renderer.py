@@ -560,7 +560,13 @@ def render_boundary_map_torch(
     content_h: int | None = None,
     content_w: int | None = None,
     return_dominant_theta: bool = False,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    return_rho_cell_grids: bool = False,
+) -> (
+    torch.Tensor
+    | tuple[torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+):
 
     _ = training
     H, W = proj_dev["H"], proj_dev["W"]
@@ -587,8 +593,14 @@ def render_boundary_map_torch(
     if not active.any().item():
         z = (rho_cell.sum() * 0.0).to(dtype=dtype, device=device)
         out = z.expand(H, W)[:Hp, :Wp]
+        th_z = torch.zeros_like(out)
+        zs_grid = torch.zeros(nH, nW, device=device, dtype=dtype)
+        if return_dominant_theta and return_rho_cell_grids:
+            return out, th_z, zs_grid, zs_grid
         if return_dominant_theta:
-            return out, torch.zeros_like(out)
+            return out, th_z
+        if return_rho_cell_grids:
+            return out, zs_grid, zs_grid
         return out
 
     # ── Step 2: Recurrent collinear facilitation + cross suppression ─
@@ -603,6 +615,9 @@ def render_boundary_map_torch(
         n_passes=renderer.col_passes,
         eps=eps,
     )
+
+    # Cell grids for diagnostics: ρ before vs after recurrent collinear passes
+    rho_seed_cell = torch.where(ib_grid, torch.zeros_like(rho_grid), rho_grid)
 
     # ── Step 3: Interpolate cell-grid fields to pixel res ────
     # Use modulated ρ (after collinear facilitation + cross suppression)
@@ -702,8 +717,13 @@ def render_boundary_map_torch(
         theta_pix = theta_pix * crop
 
     out = bmap[:Hp, :Wp]
+    th_out = theta_pix[:Hp, :Wp]
+    if return_dominant_theta and return_rho_cell_grids:
+        return out, th_out, rho_seed_cell, rho_grid_m
     if return_dominant_theta:
-        return out, theta_pix[:Hp, :Wp]
+        return out, th_out
+    if return_rho_cell_grids:
+        return out, rho_seed_cell, rho_grid_m
     return out
 
 
