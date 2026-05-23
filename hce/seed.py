@@ -79,7 +79,7 @@ def _build_tile_membership(ti, tj, nW, R, dev):
 
 
 class RhoSeedModule(nn.Module):
-    """Learned ``η_z``, ``η_ρ`` for NR seed; fixed tile geometry ``R``, ``stride``."""
+    """Learned ``η_z`` for raw ratio seed; ``η_ρ`` only used if NR pool is enabled."""
 
     def __init__(
         self,
@@ -117,9 +117,11 @@ class RhoSeedModule(nn.Module):
         is_border = cells_flat["is_border"].to(device)
         r_raw = lam1 / (z0 + self.eta_z).clamp_min(self.eps)
         r_raw = torch.where(is_border, torch.zeros_like(r_raw), r_raw)
-        rho_seed = naka_rushton_pool_normalize(
-            r_raw, nH, nW, self.R, self.eta_rho, is_border, self.eps,
-        )
+        # NR pool off: compare against pooled NR (bounded ~[0,1]-ish contrast norm).
+        # rho_seed = naka_rushton_pool_normalize(
+        #     r_raw, nH, nW, self.R, self.eta_rho, is_border, self.eps,
+        # )
+        rho_seed = r_raw
 
         ti, tj = _build_tile_grid(nH, nW, self.R, self.stride, device)
         mi = _build_tile_membership(ti, tj, nW, self.R, device)
