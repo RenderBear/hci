@@ -126,6 +126,37 @@ def _build_collinear_kernels(
     return kernels.unsqueeze(1)
 
 
+def collinear_rho_snapshot_schedule(
+    n_passes: int, *, max_timestamps: int = 5,
+) -> list[int]:
+    """Pick ``t_after`` indices in ``[0, n_passes]`` for ρ collinear trajectory.
+
+    ``t_after`` counts completed collinear passes (``0`` = before the first pass).
+    At most ``max_timestamps`` values, spanning the full recurrence when
+    ``n_passes + 1`` exceeds the cap.
+    """
+    if n_passes < 0:
+        raise ValueError("n_passes must be non-negative")
+    if max_timestamps < 1:
+        raise ValueError("max_timestamps must be >= 1")
+    n_states = n_passes + 1
+    if n_states <= max_timestamps:
+        return list(range(n_states))
+    if max_timestamps == 1:
+        return [n_passes]
+    times: list[int] = []
+    denom = max_timestamps - 1
+    for k in range(max_timestamps):
+        x = (k * n_passes) / denom
+        times.append(int(round(x)))
+    times = [max(0, min(n_passes, t)) for t in times]
+    out: list[int] = []
+    for t in times:
+        if not out or out[-1] != t:
+            out.append(t)
+    return out
+
+
 def compute_collinear_coherence(
     theta_grid: torch.Tensor,
     rho_grid: torch.Tensor,
@@ -136,7 +167,8 @@ def compute_collinear_coherence(
     sigma_t: float = _COL_SIGMA_T,
     n_passes: int = _COL_PASSES,
     eps: float = 1e-6,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    rho_snapshots_t_after: set[int] | frozenset[int] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict[int, torch.Tensor]]:
     """Recurrent V1-style collinear facilitation + cross-orientation suppression.
 
     Each pass:
@@ -161,6 +193,9 @@ def compute_collinear_coherence(
     Returns:
         kappa_col: (nH, nW) final collinear coherence in [0, 1]
         rho_mod:   (nH, nW) modulated ρ after all passes
+
+        If ``rho_snapshots_t_after`` is not ``None``, also returns a dict mapping
+        ``t_after`` → detached cell-grid ``ρ`` snapshot (same shape as ``rho_mod``).
     """
     device, dtype = theta_grid.device, theta_grid.dtype
     nH, nW = theta_grid.shape
@@ -181,6 +216,17 @@ def compute_collinear_coherence(
     # Cell's own double-angle unit vector (fixed across passes)
     c2 = torch.cos(2.0 * theta_grid)  # cos(2θ_c)
     s2 = torch.sin(2.0 * theta_grid)  # sin(2θ_c)
+
+    want_snaps = rho_snapshots_t_after is not None
+    snaps: dict[int, torch.Tensor] = {}
+    snap_want: frozenset[int] = frozenset()
+    if want_snaps:
+        snap_want = frozenset(
+            int(x) for x in (rho_snapshots_t_after or ())
+            if 0 <= int(x) <= n_passes
+        )
+        if 0 in snap_want:
+            snaps[0] = rho_m.detach().clone()
 
     for t in range(n_passes):
         # Double-angle fields with current ρ
@@ -229,6 +275,11 @@ def compute_collinear_coherence(
         rho_m = rho_m * kappa_col
         rho_m = torch.where(is_border_grid, torch.zeros_like(rho_m), rho_m)
 
+        if want_snaps and (t + 1) in snap_want:
+            snaps[t + 1] = rho_m.detach().clone()
+
+    if want_snaps:
+        return kappa_col, rho_m, snaps
     return kappa_col, rho_m
 
 
@@ -561,14 +612,18 @@ def render_boundary_map_torch(
     content_w: int | None = None,
     return_dominant_theta: bool = False,
     return_rho_cell_grids: bool = False,
+    return_rho_collinear_iter_pix: bool = False,
+    rho_collinear_iter_max_snapshots: int = 5,
 ) -> (
     torch.Tensor
     | tuple[torch.Tensor, torch.Tensor]
     | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
     | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[tuple[int, torch.Tensor]]]
 ):
 
     _ = training
+    want_cell_grids = bool(return_rho_cell_grids or return_rho_collinear_iter_pix)
     H, W = proj_dev["H"], proj_dev["W"]
     device, dtype = rho_cell.device, rho_cell.dtype
 
@@ -595,7 +650,10 @@ def render_boundary_map_torch(
         out = z.expand(H, W)[:Hp, :Wp]
         th_z = torch.zeros_like(out)
         zs_grid = torch.zeros(nH, nW, device=device, dtype=dtype)
-        if return_dominant_theta and return_rho_cell_grids:
+        rho_iter_pix_list: list[tuple[int, torch.Tensor]] = []
+        if return_dominant_theta and want_cell_grids:
+            if return_rho_collinear_iter_pix:
+                return out, th_z, zs_grid, zs_grid, rho_iter_pix_list
             return out, th_z, zs_grid, zs_grid
         if return_dominant_theta:
             return out, th_z
@@ -604,20 +662,58 @@ def render_boundary_map_torch(
         return out
 
     # ── Step 2: Recurrent collinear facilitation + cross suppression ─
-    kappa_col_grid, rho_mod_grid = compute_collinear_coherence(
-        theta_combed.detach(),
-        rho_grid.detach(),
-        ib_grid,
-        R=renderer.col_radius,
-        K=renderer.col_k_bins,
-        sigma_d=renderer.col_sigma_d,
-        sigma_t=renderer.col_sigma_t,
-        n_passes=renderer.col_passes,
-        eps=eps,
-    )
+    rho_cell_snaps: dict[int, torch.Tensor] | None = None
+    if return_rho_collinear_iter_pix:
+        sched = collinear_rho_snapshot_schedule(
+            int(renderer.col_passes),
+            max_timestamps=int(rho_collinear_iter_max_snapshots),
+        )
+        kappa_col_grid, rho_mod_grid, rho_cell_snaps = compute_collinear_coherence(
+            theta_combed.detach(),
+            rho_grid.detach(),
+            ib_grid,
+            R=renderer.col_radius,
+            K=renderer.col_k_bins,
+            sigma_d=renderer.col_sigma_d,
+            sigma_t=renderer.col_sigma_t,
+            n_passes=renderer.col_passes,
+            eps=eps,
+            rho_snapshots_t_after=frozenset(sched),
+        )
+    else:
+        kappa_col_grid, rho_mod_grid = compute_collinear_coherence(
+            theta_combed.detach(),
+            rho_grid.detach(),
+            ib_grid,
+            R=renderer.col_radius,
+            K=renderer.col_k_bins,
+            sigma_d=renderer.col_sigma_d,
+            sigma_t=renderer.col_sigma_t,
+            n_passes=renderer.col_passes,
+            eps=eps,
+        )
 
     # Cell grids for diagnostics: ρ before vs after recurrent collinear passes
     rho_seed_cell = torch.where(ib_grid, torch.zeros_like(rho_grid), rho_grid)
+
+    ch_pre = Hp if content_h is None else content_h
+    cw_pre = Wp if content_w is None else content_w
+    ch_pre, cw_pre = min(ch_pre, H), min(cw_pre, W)
+
+    rho_iter_pix_list: list[tuple[int, torch.Tensor]] = []
+    if rho_cell_snaps is not None:
+        for t_after in sorted(rho_cell_snaps.keys()):
+            rho_snap = rho_cell_snaps[t_after]
+            rho_grid_m_snap = torch.where(ib_grid, torch.zeros_like(rho_snap), rho_snap)
+            rho_pix_s = _interp_cell_to_pixel(rho_grid_m_snap, nH, nW, H, W, S, P)
+            if content_h is not None and content_w is not None:
+                crop_s = torch.ones_like(rho_pix_s)
+                if ch_pre < H:
+                    crop_s[ch_pre:, :] = 0.0
+                if cw_pre < W:
+                    crop_s[:, cw_pre:] = 0.0
+                rho_pix_s = rho_pix_s * crop_s
+            rho_iter_pix_list.append((t_after, rho_pix_s[:Hp, :Wp].contiguous()))
 
     # ── Step 3: Interpolate cell-grid fields to pixel res ────
     # Use modulated ρ (after collinear facilitation + cross suppression)
@@ -718,11 +814,15 @@ def render_boundary_map_torch(
 
     out = bmap[:Hp, :Wp]
     th_out = theta_pix[:Hp, :Wp]
-    if return_dominant_theta and return_rho_cell_grids:
+    if return_dominant_theta and want_cell_grids:
+        if return_rho_collinear_iter_pix:
+            return out, th_out, rho_seed_cell, rho_grid_m, rho_iter_pix_list
         return out, th_out, rho_seed_cell, rho_grid_m
     if return_dominant_theta:
         return out, th_out
-    if return_rho_cell_grids:
+    if want_cell_grids:
+        if return_rho_collinear_iter_pix:
+            return out, rho_seed_cell, rho_grid_m, rho_iter_pix_list
         return out, rho_seed_cell, rho_grid_m
     return out
 

@@ -704,6 +704,53 @@ def save_rho_png(pix_proj: np.ndarray, out_path):
     Image.fromarray((rgba[..., :3] * 255).astype(np.uint8), "RGB").save(out_path)
 
 
+def viz_infer_rho_iters_snapshot(
+    panels: list[tuple[int, np.ndarray]],
+    out_path: str,
+    *,
+    n_collinear_passes: int,
+) -> None:
+    """Montage of pixel $\\rho$ from the renderer's cell→pixel bilinear path at
+    up to five milestones along the recurrent collinear recurrence.
+    """
+    if not panels:
+        return
+    panels = sorted(panels, key=lambda x: x[0])
+    vmax = max(float(np.max(p[1])) for p in panels)
+    vmax = max(vmax, VIZ.EPS)
+    cmap = rho_heatmap_cmap()
+    n = len(panels)
+    fig_w = max(12.0, 3.2 * n)
+    fig, axes = plt.subplots(1, n, figsize=(fig_w, 3.8), facecolor=VIZ.BG)
+    if n == 1:
+        axes = np.asarray([axes])
+    fig.suptitle(
+        (
+            rf"$\rho$ pixel projection (renderer bilinear) vs collinear passes "
+            rf"($N={int(n_collinear_passes)}$ total passes; "
+            rf"up to 5 timeline samples)"
+        ),
+        fontsize=10,
+        color=VIZ.FG,
+        fontfamily="monospace",
+    )
+    for ax, (t_after, pix) in zip(axes.ravel(), panels):
+        ax.set_facecolor(VIZ.PANEL_BG)
+        ax.axis("off")
+        rgba = cmap(
+            np.clip(np.asarray(pix, dtype=np.float64) / vmax, 0.0, 1.0)
+        )
+        ax.imshow(rgba[..., :3])
+        if int(t_after) == 0:
+            title = r"$\rho_{\mathrm{pix}}$ (pre-collinear)"
+        else:
+            title = rf"$\rho_{{\mathrm{{pix}}}}$ after pass {int(t_after)}"
+        ax.set_title(title, fontsize=8, color=VIZ.FG, fontfamily="monospace")
+    fig.tight_layout(rect=[0, 0, 1, 0.90])
+    fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
+    plt.close(fig)
+
+
 def viz_infer_l0_pinwheel(
     h_np: np.ndarray, img_pinwheel: np.ndarray, out_path: str
 ) -> None:
