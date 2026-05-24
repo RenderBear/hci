@@ -252,7 +252,7 @@ def run_image_inference(model, img_path, device, *, verbose: bool = False):
                 device=device, dtype=dtype,
             ).reshape(nH, nW)
 
-            eta_lum_map, eta_chr_map = compute_eta_modulation_mlp(
+            eta_lum_map, eta_chr_map, _mod_pix = compute_eta_modulation_mlp(
                 model.eta_mlp,
                 kappa_col, z0_c, rho_max_c, ib_grid,
                 nH, nW, H, W, S, P,
