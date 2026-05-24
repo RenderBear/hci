@@ -355,15 +355,15 @@ def render_boundary_map_torch(
     kappa_col_grid = cells_flat["kappa_col_cell"].to(
         device=device, dtype=dtype,
     ).reshape(nH, nW)
-    rho_mod_grid = rho_grid.detach()
 
     rho_seed_cell = torch.where(ib_grid, torch.zeros_like(rho_grid), rho_grid)
 
     # ── Step 3: Interpolate cell-grid fields to pixel res ────
     # theta_combed is detached — orientation is a geometric feature, not
-    # a learned signal.  Gradient flows through ρ̄, h2m, and the thinning MLP.
+    # a learned signal.  ρ̄ must stay connected to rho_cell so training loss
+    # reaches HypercolumnSeed (live L1); gradient also flows through h2m and gate.
     theta_combed_det = theta_combed.detach()
-    rho_grid_m = torch.where(ib_grid, torch.zeros_like(rho_mod_grid), rho_mod_grid)
+    rho_grid_m = torch.where(ib_grid, torch.zeros_like(rho_grid), rho_grid)
     theta_cos2 = torch.where(ib_grid, torch.zeros_like(theta_combed_det),
                               rho_grid_m * torch.cos(2.0 * theta_combed_det))
     theta_sin2 = torch.where(ib_grid, torch.zeros_like(theta_combed_det),
