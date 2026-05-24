@@ -1,7 +1,8 @@
 r"""Shared pipeline hyperparameters, module inits, and script defaults.
 
 L1 builds cos² hypercolumns → **scalar** ``η_z`` **seed NR** on raw ``μ`` → raw β +
-**spatial** ``η=η₀·σ(``MLP``(``pooled κ, \\bar z``))`` from the **first collinear pass** on.
+**spatial** ``η=η₀·σ(``MLP``(``pooled κ, \\bar z``))`` from collinear passes; inhibition uses
+**isotropic surround** on ``(1/K)\\sum_k ρ_k`` (mean bin energy; matches ``S_k`` scale; same radial kernel as ``G_k``, no tangential weight).
 ``κ`` is cosine ``(ρ·S)/(‖ρ‖‖S‖)``; ``\\bar z`` pools ``Σ_k u_k`` (not used for seed ``η``).
 The renderer interpolates ρ, θ, κ and applies ``h2m·ρ̄·gate`` (14-D readout, no η_mod).
 

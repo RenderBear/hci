@@ -10,9 +10,10 @@ Pipeline:
   3. **Seed NR (``t=0``):** raw ``μ`` with **learned scalar** ``η_z`` (``softplus`` of raw) —
      ``ρ ← μ²/(μ²+η_z²+ε)`` — no spatial MLP.  Detach as ``ρ^{\mathrm{seed}}`` for the fixed
      β_s branch.
-  4. ``T`` recurrent passes (``t \\ge 1`` in the recurrence story): conv ``S^{(t)}`` on
-     current ``ρ^{(t)}``, cosine ``κ`` vs ``S``, ``z=Σ_k u_k``, then **spatial**
-     ``η(c)=η₀·σ(``MLP``(``pooled κ, \\bar z``))`` (21×21 mean pool), NR on ``u``.
+  4. ``T`` recurrent passes (``t \\ge 1`` in the recurrence story): depthwise collinear
+     ``S_k^{(t)}``, isotropic surround ``I^{(t)} = H * ((1/K)\\sum_j \\rho_j)`` (same radial
+     kernel as ``G_k``, no tangential weight), cosine ``κ`` vs ``S``, ``z=Σ_k u_k``, then
+     **spatial** ``η(c)=η₀·σ(``MLP``(``pooled κ, \\bar z``))`` (21×21 mean pool), NR on ``u``.
   5. Extract dominant ``ρ``, ``θ``, and diagnostic ``κ`` (cosine sim, in ``[0,1]``) for the
      renderer / readout — **not** multiplied into ``ρ``.
 
@@ -132,6 +133,28 @@ def _build_collinear_kernels(
         w_t = torch.exp(-d_perp * d_perp / (2.0 * sigma_t * sigma_t))
         kernels[k] = w_d * w_t
     return kernels.unsqueeze(1)
+
+
+def _build_isotropic_surround_kernel(
+    R: int,
+    sigma_d: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Single-channel kernel ``(1,1,2R+1,2R+1)``: radial Gaussian × disk, center omitted.
+
+    Matches the **radial** factor ``w_d`` of ``_build_collinear_kernels`` (no tangential
+    selectivity). Used on **mean** bin energy ``(1/K)\\sum_k ρ_k`` so surround drive matches
+    per-bin collinear scale (not ``K``× larger than ``S_k``).
+    """
+    sigma_d = sigma_d.to(device=device, dtype=dtype).clamp_min(torch.tensor(1e-4, device=device, dtype=dtype))
+    offsets = torch.arange(-R, R + 1, device=device, dtype=dtype)
+    di, dj = torch.meshgrid(offsets, offsets, indexing="ij")
+    dist_sq = di * di + dj * dj
+    disc = (dist_sq <= float(R * R)).to(dtype=dtype)
+    omit_center = (dist_sq > 0).to(dtype=dtype)
+    w = torch.exp(-dist_sq / (2.0 * sigma_d * sigma_d)) * disc * omit_center
+    return w.unsqueeze(0).unsqueeze(0)
 
 
 def _build_tile_grid(nH, nW, R, stride, dev):
@@ -383,9 +406,10 @@ def gaba_recurrence(
     **Seed:** NR with learned **scalar** ``η_z`` only (no MLP, no ``κ``/``z`` for ``η``).
 
     **Passes:** Collinear pools ``S_k = G_k * ρ_k`` use **unnormalized** nonnegative
-    kernels ``G_k`` (weighted **sum** over the patch, same as ``_e_col_dominant_bin``).
-    Cross-orientation baseline is **per-bin leave-one-out**:
-    ``\\bar{S}_k = (\\sum_j S_j - S_k) / (K-1)``.
+    kernels ``G_k``. Inhibition uses an **isotropic surround** on
+    ``\\bar{Z} = (1/K)\\sum_j ρ_j`` (mean bin energy — same scale as one ``ρ_k`` channel), then
+    ``I = H * \\bar{Z}`` with the same radial Gaussian × disk as ``G_k`` (no tangential weight),
+    broadcast to all bins — comparable magnitude to ``S_k``, not ``K``× inflated.
     ``κ = (ρ·S)/(‖ρ‖‖S‖+ε)``, ``z=Σ_k u_k``, pool → ``η(c)=η₀·σ(``MLP``(·))``.
 
     ``kappa_k`` / ``kappa_*_cell`` store cosine ``κ`` from the first / last **collinear**
@@ -394,13 +418,13 @@ def gaba_recurrence(
     Returns:
         rho_k_out, kappa_k, kappa_k_pass0, rho_k_seed_snap, s_k_first, s_bar_first.
         ``s_k_first`` / ``s_bar_first`` are ``(1,K,nH,nW)`` from the **first** collinear pass
-        (``s_bar`` = leave-one-out mean of other bins per ``k``; zeros if ``n_passes==0``).
+        (``s_bar_first`` repeats isotropic surround ``I`` on every ``k`` for shape parity;
+        zeros if ``n_passes==0``).
     """
     device = rho_k_raw.device
     dtype = rho_k_raw.dtype
-    k_int = int(K)
-
     kernels = _build_collinear_kernels(R, K, sigma_d, sigma_t, device, dtype)
+    iso_kernel = _build_isotropic_surround_kernel(R, sigma_d, device, dtype)
 
     ib_grid = is_border.reshape(nH, nW)
     border_mask_4d = ib_grid.unsqueeze(0).unsqueeze(0)  # (1,1,nH,nW)
@@ -445,14 +469,15 @@ def gaba_recurrence(
 
         s_k = F.conv2d(rho_grid, kernels, padding=R, groups=K)
         kap_t = _cosine_kappa_grid(rho_grid, s_k, eps)
-        den_cross = max(k_int - 1, 1)
-        s_total = s_k.sum(dim=1, keepdim=True)
-        s_bar = (s_total - s_k) / float(den_cross)
+        rho_total = rho_grid.sum(dim=1, keepdim=True)
+        rho_mean = rho_total / float(max(int(K), 1))  # same scale as one ρ_k conv input
+        s_surround = F.conv2d(rho_mean, iso_kernel, padding=R)
+        s_inhib = s_surround.expand_as(s_k)
         if t == 0:
             s_k_first = s_k.detach().clone()
-            s_bar_first = s_bar.detach().clone()
+            s_bar_first = s_inhib.detach().clone()
 
-        u = beta_seed * rho_seed + beta_coll * s_k - beta_cross * s_bar
+        u = beta_seed * rho_seed + beta_coll * s_k - beta_cross * s_inhib
         u = u.clamp_min(0.0)
         u = torch.where(border_mask_4d.expand_as(u), torch.zeros_like(u), u)
 
@@ -697,9 +722,9 @@ def run_l1_hypercolumn(
 ) -> dict:
     """Run the full hypercolumn L1 pipeline.
 
-    L0 output → K-bin hypercolumns → **seed NR** (spatial ``η=η₀·σ(``MLP``)`` on pooled
-    ``κ,z`` from raw ``μ``) → detached ``ρ^{\\mathrm{seed}}`` → ``T`` passes of raw ``u``,
-    same η-head, divisive NR → dominant orientation for renderer.
+    L0 output → K-bin hypercolumns → **seed NR** (scalar ``η_z`` on raw ``μ``) → detached
+    ``ρ^{\\mathrm{seed}}`` → ``T`` passes: collinear ``S_k``, isotropic surround on
+    ``(1/K)\\sum_j ρ_j`` (mean bin energy, same scale as ``ρ_k``), spatial ``η=η₀·σ(``MLP``(``pooled κ,z``))``, divisive NR → dominant readout.
 
     Args:
         h2m: (H, W) from L0

@@ -79,7 +79,7 @@ Learned **scalar** $\eta_z = \mathrm{softplus}(\tilde\eta_z)$ (`HypercolumnSeed.
 
 From the **first collinear pass onward**, a learned $\eta_0 = \mathrm{softplus}(\tilde\eta_0)$ scales a **per-cell** modulation from a **2→8→1** MLP (`EtaGabaMLP`; sigmoid output clamped to $(10^{-3},1]$ in code).
 
-Let $\boldsymbol{\rho}^{(t)}(c)\in\mathbb{R}_+^K$ be the bin vector at the **start** of recurrence pass $t$ (the post–seed-NR grid for $t{=}0,1,\ldots$ inside the loop). Let $\mathbf{S}^{(t)}(c)\in\mathbb{R}_+^K$ stack the collinear pool outputs $\tilde S_k^{(t)}(c)$ **before** the $\beta$-mixture that forms $u$ (depthwise conv with **unnormalized** nonnegative kernels — a weighted **sum** over neighbors, not divided by $\sum G_k$). The cross-orientation term uses **leave-one-out** means $\bar S_k^{(t)}$ (mean of $\tilde S_j$ over $j\neq k$) so the dominant bin is not averaged into its own baseline. Define
+Let $\boldsymbol{\rho}^{(t)}(c)\in\mathbb{R}_+^K$ be the bin vector at the **start** of recurrence pass $t$ (the post–seed-NR grid for $t{=}0,1,\ldots$ inside the loop). Let $\mathbf{S}^{(t)}(c)\in\mathbb{R}_+^K$ stack the collinear pool outputs $\tilde S_k^{(t)}(c)$ **before** the $\beta$-mixture that forms $u$ (depthwise conv with **unnormalized** nonnegative kernels — a weighted **sum** over neighbors, not divided by $\sum G_k$). **Surround inhibition** uses **mean** bin energy $\bar Z^{(t)}(c)=\frac{1}{K}\sum_j \rho_j^{(t)}(c)$ convolved with the **same radial** Gaussian × disk as $G_k$ (center omitted), **without** tangential selectivity — an isotropic neighbor pool on the same scale as a single $\rho_k$ channel, then applied equally to every bin (center–surround normalization, not leave-one-out across other bins’ collinear chains). Define
 
 $$
 \kappa^{(t)}(c) = \frac{\boldsymbol{\rho}^{(t)}(c)\cdot \mathbf{S}^{(t)}(c)}{\bigl\|\boldsymbol{\rho}^{(t)}(c)\bigr\|\,\bigl\|\mathbf{S}^{(t)}(c)\bigr\| + \varepsilon}.
@@ -111,14 +111,15 @@ $$
 \sigma_t = \mathrm{softplus}(\tilde\alpha_t)\,R.
 $$
 
-For each bin $k$, a nonnegative kernel $G_k$ is built on the $(2R+1)^2$ patch (Gaussian × tangential selectivity, center omitted, disk clip). **Unnormalized depthwise convolution** (same as the ``e_col`` diagnostic conv):
+For each bin $k$, a nonnegative kernel $G_k$ is built on the $(2R+1)^2$ patch (Gaussian × tangential selectivity, center omitted, disk clip). Let $H$ be the **radial** factor alone (Gaussian × disk, center omitted — the isotropic weight shared with all $G_k$). **Unnormalized depthwise convolution** for collinear pools (same as the ``e_col`` diagnostic conv):
 
 $$
 \tilde S_k^{(t)}(c) = (G_k * \rho_k^{(t)})(c), \qquad
-S_{\mathrm{tot}}^{(t)}(c) = \sum_{j=0}^{K-1} \tilde S_j^{(t)}(c), \qquad
-\bar S_k^{(t)}(c) = \frac{1}{K-1}\sum_{j\neq k} \tilde S_j^{(t)}(c)
-= \frac{S_{\mathrm{tot}}^{(t)}(c) - \tilde S_k^{(t)}(c)}{\max(K-1,\,1)}.
+\bar Z^{(t)}(c) = \frac{1}{K}\sum_{j=0}^{K-1} \rho_j^{(t)}(c), \qquad
+\mathcal{I}^{(t)}(c) = (H * \bar Z^{(t)})(c).
 $$
+
+The inhibitory drive $\mathcal{I}^{(t)}(c)$ is **scalar per cell** (broadcast to all $k$ in code).
 
 **Raw-space β** (softplus of raw parameters):
 
@@ -142,7 +143,7 @@ $$
 u_k^{(t)}(c) = \max\Bigl(0,\;
 \beta_{\mathrm{seed}}\,\rho_k^{\mathrm{seed}}(c)
 + \beta_{\mathrm{coll}}\,\tilde S_k^{(t)}(c)
-- \beta_{\mathrm{cross}}\,\bar S_k^{(t)}(c)
+- \beta_{\mathrm{cross}}\,\mathcal{I}^{(t)}(c)
 \Bigr),
 $$
 
