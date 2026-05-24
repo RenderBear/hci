@@ -34,6 +34,7 @@ from hci.L0 import (
     _compute_d_lum_chroma,
     _naka_per_direction,
     compute_harmonics,
+    compute_h2m_safe,
     compute_seed,
     compute_eta_modulation_mlp,
     EtaRegionalMLP,
@@ -151,18 +152,16 @@ def fast_l0_pass2(
     only on the image, not on η).  Only reapplies the Naka–Rushton with
     spatially-varying η and recomputes harmonics.
 
-    Returns a minimal ``l0_pix``-style dict with **differentiable**
-    ``h2m_lum`` / ``h2m_chr`` tensors only.  ``render_boundary_map_torch``
-    reads just those keys for the pixel feature stack; we intentionally do
-    **not** call ``build_l0_pix`` here (its numpy round-trip would detach
-    ``η_mod`` from the autograd graph during training).
+    Uses ``compute_h2m_safe`` (floored sqrt) so autograd through
+    ``η_map → NR → harmonics → h2m → bmap`` stays finite at zero-energy
+    pixels (borders, flat regions).
     """
     device = d_lum.device
 
     h_lum = _naka_per_direction(d_lum, eta_lum_map, gamma, device)
     h_chr = _naka_per_direction(d_chr, eta_chr_map, gamma, device)
-    _, _, h2m_lum = compute_harmonics(h_lum, offsets)
-    _, _, h2m_chr = compute_harmonics(h_chr, offsets)
+    h2m_lum = compute_h2m_safe(h_lum, offsets)
+    h2m_chr = compute_h2m_safe(h_chr, offsets)
 
     h2m_lum = h2m_lum.clone()
     h2m_lum[border_mask] = 0.0
@@ -273,8 +272,9 @@ class HarmonicContourE2E(nn.Module):
 
         ``prepare_batch`` runs ``run_l1_live_cells`` so ``η_z`` and collinear
         ``α`` participate in the graph.  Pass-2 ``h2m_*`` from ``fast_l0_pass2``
-        stay **detached**; ``eta_mlp`` gradients use ``eta_mod_map`` in the
-        readout feature vector.
+        stay **in the graph** (``compute_h2m_safe`` prevents ``sqrt(0)`` grad
+        blow-up) so ``eta_mlp`` receives gradients through the NR → h2m → bmap
+        path.  ``mod_pix`` is also fed as the 15th renderer feature.
         """
         bmaps = []
         for m in meta_list:
@@ -331,17 +331,18 @@ class HarmonicContourE2E(nn.Module):
                     pool_radius=int(L0.ETA_POOL_RADIUS_CELLS),
                 )
 
-                # Fast L0 pass 2: reuse d_lum/d_chr, apply modulated η
+                # Fast L0 pass 2: reuse d_lum/d_chr, apply modulated η.
+                # h2m stays in graph (compute_h2m_safe floors sqrt to avoid
+                # ∞ grad at zero-energy pixels) so loss → h2m → NR → η_map
+                # → eta_mlp gradients flow.
                 l0_pix_pass2 = fast_l0_pass2(
                     m["d_lum"], m["d_chr"],
                     eta_lum_map, eta_chr_map,
                     L0.GAMMA, L0.OFFSETS,
                     m["border_mask"],
                 )
-                # Detach h2m to avoid NR backward instabilities.
-                # Gradients reach eta_mlp via mod_pix (the [0,1] modulation
-                # factor) in the 15th renderer gate feature.
-                l0_pix_pass2 = {k: v.detach() for k, v in l0_pix_pass2.items()}
+                # mod_pix ([0,1] factor) as the 15th renderer feature;
+                # h2m_lum / h2m_chr carry grad through the NR path.
                 l0_pix_pass2["eta_mod_map"] = mod_pix
 
                 # Re-render with updated h2m + η_mod feature for thinning MLP

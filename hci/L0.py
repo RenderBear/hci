@@ -334,6 +334,26 @@ def compute_harmonics(
     return s, h1m, h2m
 
 
+def compute_h2m_safe(
+    h: torch.Tensor,
+    offsets: list[tuple[int, int]],
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    r"""Grad-safe second-harmonic magnitude.
+
+    Same math as ``compute_harmonics`` but floors the squared magnitude
+    before ``sqrt`` so ``d/dx \sqrt{x}`` stays finite at ``x=0`` (flat
+    regions / borders).  Use in paths that carry autograd through η.
+    """
+    H, W = h.shape[:2]
+    N = len(offsets)
+    unit = _make_unit(offsets).to(h.device)
+    fm = _make_F(unit).to(h.device)
+    s = (h.reshape(-1, N) @ fm.T).reshape(H, W, 4)
+    h2m_sq = (s[..., 2] ** 2 + s[..., 3] ** 2).clamp_min(eps)
+    return h2m_sq.sqrt()
+
+
 def compute_seed(
     s: torch.Tensor,
     h1m: torch.Tensor,
@@ -544,19 +564,15 @@ class EtaRegionalMLP(nn.Module):
         self._init_near_identity()
 
     def _init_near_identity(self) -> None:
-        """Kaiming-uniform first layer, moderate second layer.
+        """Kaiming fc1, moderate fc2 — logits ≈ 2 ± O(1).
 
-        The goal: logits ≈ 2 on average (σ(2)≈0.88 → near-identity η
-        modulation) but with enough variance across cells that the MLP
-        output is *not* spatially flat at init.  Kaiming-uniform on fc1
-        gives hidden activations of O(1); fc2 with moderate σ and bias=2
-        centres the logit while allowing ±1–2 spread.
+        The mean σ(2) ≈ 0.88 gives near-identity η modulation at init,
+        but O(1) logit variance ensures the output *varies* spatially so
+        gradients can break symmetry from the first step.
         """
         with torch.no_grad():
-            # fc1: default Kaiming-uniform (PyTorch Linear default) — reset
             nn.init.kaiming_uniform_(self.fc1.weight, nonlinearity="relu")
             self.fc1.bias.zero_()
-            # fc2: moderate scale so logit std is O(1), centred at 2
             nn.init.normal_(self.fc2.weight, 0.0, 0.3)
             self.fc2.bias.fill_(2.0)
 
@@ -588,7 +604,7 @@ def compute_eta_modulation_mlp(
     Returns:
         eta_lum_map: (H, W) = η₀_lum · mod_pix
         eta_chr_map: (H, W) = η₀_chr · mod_pix
-        mod_pix:     (H, W) ∈ [1e-3, 1] — modulation factor (no η₀ scaling)
+        mod_pix:     (H, W) ∈ [1e-3, 1], the [0,1]-scale modulation factor
     """
     device = kappa_col_grid.device
     dtype = kappa_col_grid.dtype
