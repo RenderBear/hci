@@ -231,6 +231,13 @@ class HarmonicContourE2E(nn.Module):
             self.eta_mlp = EtaRegionalMLP()
 
     def forward_batch(self, meta_list):
+        """Render boundary maps from cached L1 cells.
+
+        Cached ``cells_flat`` fixes ρ/κ at precompute time, so **loss does not
+        reach** ``seed.hc_seed`` (``η_z``, collinear ``α``). Only ``renderer``
+        (and, when pass-2 data exist, ``eta_mlp``) receive gradients unless you
+        change the pipeline to re-run L1 inside the training step.
+        """
         bmaps = []
         for m in meta_list:
             cf_flat = m["cells_flat_dev"]
@@ -293,10 +300,8 @@ class HarmonicContourE2E(nn.Module):
                     L0.GAMMA, L0.OFFSETS,
                     m["border_mask"],
                 )
-                # Detach NR/harmonics path (avoids fragile grad through atan2/NR).
-                l0_pix_pass2 = {
-                    k: v.to(device).detach() for k, v in l0_pix_pass2.items()
-                }
+                # Keep ``h2m_*`` on the autograd graph so the loss can reach ``eta_mlp``
+                # (``fast_l0_pass2`` is written to avoid numpy round-trips for this reason).
 
                 # Re-render with updated h2m
                 bmap = render_boundary_map_torch(
