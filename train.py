@@ -322,7 +322,7 @@ class HarmonicContourE2E(nn.Module):
                 ).reshape(nH, nW)
 
                 H, W = m["proj_dev"]["H"], m["proj_dev"]["W"]
-                eta_lum_map, eta_chr_map = compute_eta_modulation_mlp(
+                eta_lum_map, eta_chr_map, mod_pix = compute_eta_modulation_mlp(
                     self.eta_mlp,
                     kappa_col, z0_c, rho_max_c, ib_grid,
                     nH, nW, H, W, S, P,
@@ -338,10 +338,11 @@ class HarmonicContourE2E(nn.Module):
                     L0.GAMMA, L0.OFFSETS,
                     m["border_mask"],
                 )
-                # Detach h2m — do not backprop through L0 pass 2 (NR/harmonics unstable).
-                # Gradients reach ``eta_mlp`` via ``eta_mod_map`` in the renderer gate features.
+                # Detach h2m to avoid NR backward instabilities.
+                # Gradients reach eta_mlp via mod_pix (the [0,1] modulation
+                # factor) in the 15th renderer gate feature.
                 l0_pix_pass2 = {k: v.detach() for k, v in l0_pix_pass2.items()}
-                l0_pix_pass2["eta_mod_map"] = eta_lum_map
+                l0_pix_pass2["eta_mod_map"] = mod_pix
 
                 # Re-render with updated h2m + η_mod feature for thinning MLP
                 bmap = render_boundary_map_torch(

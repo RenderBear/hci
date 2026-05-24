@@ -295,7 +295,7 @@ def _infer_seed_and_render(
                 device=device, dtype=dtype,
             ).reshape(nH, nW)
 
-            eta_lum_map, eta_chr_map = compute_eta_modulation_mlp(
+            eta_lum_map, eta_chr_map, mod_pix = compute_eta_modulation_mlp(
                 model.eta_mlp,
                 kappa_col, z0_c, rho_max_c, ib_grid,
                 nH, nW, H, W, S, P,
@@ -315,6 +315,9 @@ def _infer_seed_and_render(
                     f"  η_chr map: [{eta_chr_map.min():.4f}, {eta_chr_map.max():.4f}]  "
                     f"(base {L0.ETA_CHR:.4f})"
                 )
+                print(
+                    f"  mod_pix:   [{mod_pix.min():.4f}, {mod_pix.max():.4f}]"
+                )
 
             border_mask = prep["border_mask"].to(device)
             l0_pix_pass2 = fast_l0_pass2(
@@ -324,7 +327,7 @@ def _infer_seed_and_render(
                 border_mask,
             )
             l0_pix_pass2 = {k: v.detach() for k, v in l0_pix_pass2.items()}
-            l0_pix_pass2["eta_mod_map"] = eta_lum_map
+            l0_pix_pass2["eta_mod_map"] = mod_pix
             l0_for_render = l0_pix_pass2
 
         render_out = render_boundary_map_torch(

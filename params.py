@@ -56,7 +56,7 @@ SEED = SimpleNamespace(
     STRIDE=7,
     EPS=1e-9,
     # Softplus(·) → η_z for pre-GABA NR; keep O(1) vs typical cos² patch ρ_k (not ≫1).
-    ETA_Z_INIT=0.5,
+    ETA_Z_INIT=2.0,
 )
 
 # ── Render: θ combing + bilinear interp + minimal gate (κ_col, E_col from L1) ─

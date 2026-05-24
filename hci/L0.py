@@ -544,17 +544,20 @@ class EtaRegionalMLP(nn.Module):
         self._init_near_identity()
 
     def _init_near_identity(self) -> None:
-        """Small random first layer — **not** all-zero ``fc1``.
+        """Kaiming-uniform first layer, moderate second layer.
 
-        An all-zero ``fc1`` / ``fc2`` makes ``h = relu(W₁x)=0`` for every cell, so
-        logits are constant ``b₂`` and ``∂L/∂W₂`` vanishes (dead ReLU at init).  A
-        tiny random init keeps σ(logits) ≈ σ(2) on average while gradients can
-        flow into both layers from the first optimization step.
+        The goal: logits ≈ 2 on average (σ(2)≈0.88 → near-identity η
+        modulation) but with enough variance across cells that the MLP
+        output is *not* spatially flat at init.  Kaiming-uniform on fc1
+        gives hidden activations of O(1); fc2 with moderate σ and bias=2
+        centres the logit while allowing ±1–2 spread.
         """
         with torch.no_grad():
-            self.fc1.weight.normal_(0.0, 0.03)
+            # fc1: default Kaiming-uniform (PyTorch Linear default) — reset
+            nn.init.kaiming_uniform_(self.fc1.weight, nonlinearity="relu")
             self.fc1.bias.zero_()
-            self.fc2.weight.normal_(0.0, 0.03)
+            # fc2: moderate scale so logit std is O(1), centred at 2
+            nn.init.normal_(self.fc2.weight, 0.0, 0.3)
             self.fc2.bias.fill_(2.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -574,13 +577,18 @@ def compute_eta_modulation_mlp(
     eta0_chr: float,
     pool_radius: int,
     eps: float = 1e-6,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""Regional η from pooled ``(\bar\kappa, \bar z_0, \bar\rho_{\max})`` then MLP.
 
     Pooled statistics use ``regional_mean_pool_cells`` with radius ``pool_radius``
     in **cell** indices.  ``z0`` and ``\rho_{\max}`` are max-normalized on the
     pooled grid for stable MLP inputs (similar spirit to normalizing ``E_col`` in
     the legacy 3-scalar path).
+
+    Returns:
+        eta_lum_map: (H, W) = η₀_lum · mod_pix
+        eta_chr_map: (H, W) = η₀_chr · mod_pix
+        mod_pix:     (H, W) ∈ [1e-3, 1] — modulation factor (no η₀ scaling)
     """
     device = kappa_col_grid.device
     dtype = kappa_col_grid.dtype
@@ -603,7 +611,7 @@ def compute_eta_modulation_mlp(
     mod_pix = _interp_cell_to_pixel(mod_grid, nH, nW, H, W, S, P).clamp(1e-3, 1.0)
     eta_lum_map = torch.as_tensor(eta0_lum, device=device, dtype=dtype) * mod_pix
     eta_chr_map = torch.as_tensor(eta0_chr, device=device, dtype=dtype) * mod_pix
-    return eta_lum_map, eta_chr_map
+    return eta_lum_map, eta_chr_map, mod_pix
 
 
 def run_l0_two_pass(
