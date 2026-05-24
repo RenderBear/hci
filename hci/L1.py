@@ -7,12 +7,15 @@ K orientation-tuned units pooling over the same receptive field (patch).
 Pipeline:
   1. Extract patches from pixel-level h2m and θ_h fields (from L0).
   2. Project each patch's oriented energy onto K bins via cos² tuning → raw ``μ_k``.
-  3. **Seed NR:** ``ρ^{\\mathrm{seed}}_k = μ_k^2/(μ_k^2+η_z^2+ε)`` with learned ``η_z=\\mathrm{softplus}(\\tilde\\eta_z)``.
-     Detach ``ρ^{\\mathrm{seed}}`` as the multiplicative **envelope** for passes.
-  4. ``T`` passes on current ``ρ^{(t)}``: collinear ``\\tilde{S}_k``, LOO surround ``I_k``,
-     ``u_k = β_{\\mathrm{coll}} \\tilde{S}_k - β_{\\mathrm{cross}} I_k`` (signed),
-     ``g_k = 1 + α \\tanh(u_k/τ)`` with learned ``α\\in(0,0.49]``, ``τ>0``,
-     ``ρ^{(t+1)}_k = ρ^{\\mathrm{seed}}_k \\cdot g_k`` (no in-loop divisive NR).
+  3. **Seed NR (preprocess only):** ``ρ^{\\mathrm{seed}}_k = μ_k^2/(μ_k^2+η_z^2+ε)`` with learned
+     ``η_z`` — compresses raw drive to ``[0,1]`` so it matches normalized pools below.
+  4. ``T`` **Heeger** passes on ``ρ^{(t)}`` (starts from ``ρ^{(0)}=ρ^{\\mathrm{seed}}``):
+     collinear ``\\hat S_k`` and LOO **annular** surround ``\\hat I_k`` (``\\max(0,\\,H-G_k)`` conv,
+     excluding the collinear corridor from inhibition), **kernel-normalized** depthwise.
+     convs (response / conv(1, kernel)); ``\\mathrm{drive}_k = β_s ρ^{\\mathrm{seed}}_k + β_c \\hat S_k``;
+     ``ρ^{(t+1)}_k = \\mathrm{drive}_k^2/(\\mathrm{drive}_k^2 + σ^2 + β_x \\hat I_k^2 + ε)`` with
+     learned scalar ``σ`` (semi-saturation) and **fixed** tiny ``ε`` (numeric floor only).
+     No tanh / second NR on ``μ``.
   5. Extract dominant ``ρ``, ``θ``, and diagnostic ``κ`` for the renderer / readout.
 
 ``rho_k_initial`` stores **post–seed-NR** ``ρ^{\\mathrm{seed}}``.  ``kappa_pass0_cell`` /
@@ -30,6 +33,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from params import L1, SEED
+
+# Fixed floor in Heeger denominator (not learned); seed NR still uses ``SEED.EPS`` / module ``nr_eps``.
+HEEGER_DENOM_EPS = 1e-6
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -140,8 +146,9 @@ def _build_isotropic_surround_kernel(
     """Single-channel kernel ``(1,1,2R+1,2R+1)``: radial Gaussian × disk, center omitted.
 
     Matches the **radial** factor ``w_d`` of ``_build_collinear_kernels`` (no tangential
-    selectivity). Applied **per bin** to the leave-one-out mean map
-    ``(1/\\max(K-1,1))\\sum_{j\\neq k} ρ_j`` so inhibition excludes bin ``k`` from its own surround.
+    selectivity). Used to build **annular** per-bin kernels ``\\max(0, H - G_k)`` for surround
+    (``H`` this tensor; ``G_k`` collinear). LOO mean ``(1/\\max(K-1,1))\\sum_{j\\neq k} ρ_j`` is
+    then convolved with that annular kernel.
     """
     sigma_d = sigma_d.to(device=device, dtype=dtype).clamp_min(torch.tensor(1e-4, device=device, dtype=dtype))
     offsets = torch.arange(-R, R + 1, device=device, dtype=dtype)
@@ -151,6 +158,18 @@ def _build_isotropic_surround_kernel(
     omit_center = (dist_sq > 0).to(dtype=dtype)
     w = torch.exp(-dist_sq / (2.0 * sigma_d * sigma_d)) * disc * omit_center
     return w.unsqueeze(0).unsqueeze(0)
+
+
+def _build_annular_surround_kernels(
+    iso_kernel: torch.Tensor,
+    collinear_kernels: torch.Tensor,
+) -> torch.Tensor:
+    """Depthwise kernels ``(K,1,2R+1,2R+1)``: isotropic radial ``H`` minus collinear ``G_k``, clamped.
+
+    ``surround_k = \\max(0, H - G_k)`` so inhibition pools neighbors **off** the collinear corridor
+    for bin ``k`` (same disk / ``σ_d`` as ``G_k``; tangential selectivity only in ``G_k``).
+    """
+    return (iso_kernel - collinear_kernels).clamp_min(0.0)
 
 
 def _build_tile_grid(nH, nW, R, stride, dev):
@@ -349,11 +368,11 @@ def gaba_recurrence(
     sigma_d: torch.Tensor,
     sigma_t: torch.Tensor,
     n_passes: int,
+    beta_seed: torch.Tensor,
     beta_coll: torch.Tensor,
     beta_cross: torch.Tensor,
     eta_z: torch.Tensor,
-    tau: torch.Tensor,
-    gain_alpha: torch.Tensor,
+    sigma_sat: torch.Tensor,
     nr_eps: float,
     eps: float = 1e-6,
     eta_update_fn: Callable | None = None,
@@ -365,23 +384,29 @@ def gaba_recurrence(
     torch.Tensor,
     torch.Tensor,
 ]:
-    """Seed divisive NR, then multiplicative **tanh gate** passes (no in-loop NR).
+    """Seed NR on raw ``μ``, then Heeger-style divisive passes (no tanh / second squash on ``μ``).
 
-    **Seed:** ``ρ^{\\mathrm{seed}} = \\mathrm{NR}(μ, η_z)`` on raw hypercolumns; detach for the
-    envelope ``ρ^{\\mathrm{seed}}`` in ``ρ ← ρ^{\\mathrm{seed}} \\cdot (1 + α \\tanh(u/τ))``.
+    **Seed:** ``ρ^{\\mathrm{seed}} = \\mathrm{NR}(μ, η_z)`` maps raw cos² mass to ``[0,1]``.
+    The same tensor (per forward) is used as ``ρ^{\\mathrm{seed}}`` in ``\\mathrm{drive}`` every pass.
 
-    **Passes:** ``\\tilde{S}_k = G_k * ρ_k``, LOO ``I_k``, ``u_k = β_c \\tilde{S}_k - β_x I_k``,
-    ``g_k = 1 + α\\tanh(u_k/τ)`` (``α`` clamped ``\\le 0.49`` so ``g\\ge 1-α > 0``),
-    ``ρ^{(t+1)} = ρ^{\\mathrm{seed}} \\odot g``.  ``κ`` from ``(ρ,S)`` each pass.
+    **Passes:** depthwise collinear conv ``S^{\\mathrm{raw}}_k = G_k * ρ``, normalized
+    ``\\hat S_k = S^{\\mathrm{raw}}_k / (\\mathbf{1} * G_k)`` (per bin); LOO mean across bins,
+    then **annular** conv ``\\max(0, H-G_k)`` on that map → ``\\hat I_k`` (kernel-normalized).
+    ``\\mathrm{drive}_k = β_s ρ^{\\mathrm{seed}}_k + β_c \\hat S_k``,
+    ``ρ^{(t+1)}_k = \\mathrm{drive}_k^2/(\\mathrm{drive}_k^2 + σ^2 + β_x \\hat I_k^2 + ε)`` with
+    learned ``σ = \\mathrm{softplus}(\\tilde σ)`` (scalar) and fixed tiny ``ε`` = ``HEEGER_DENOM_EPS``.
+    Diagnostic ``κ`` uses **raw** collinear ``S^{\\mathrm{raw}}`` vs ``ρ``.
 
     Returns:
         rho_k_out, kappa_k, kappa_k_pass0, rho_k_seed_snap, s_k_first, s_bar_first.
         ``rho_k_seed_snap`` is post–seed-NR ``ρ^{\\mathrm{seed}}`` ``(N,K)`` (``rho_k_initial``).
+        ``s_bar_first`` holds **normalized** annular-surround ``\\hat I_k`` from pass 0.
     """
     device = rho_k_raw.device
     dtype = rho_k_raw.dtype
     kernels = _build_collinear_kernels(R, K, sigma_d, sigma_t, device, dtype)
     iso_kernel = _build_isotropic_surround_kernel(R, sigma_d, device, dtype)
+    surr_kernels = _build_annular_surround_kernels(iso_kernel, kernels)
 
     ib_grid = is_border.reshape(nH, nW)
     border_mask_4d = ib_grid.unsqueeze(0).unsqueeze(0)  # (1,1,nH,nW)
@@ -393,24 +418,32 @@ def gaba_recurrence(
     )
 
     eta_z_t = torch.as_tensor(eta_z, device=device, dtype=dtype)
-    rho_grid = nr_squash_k_bins(rho_grid, eta_z_t, nr_eps)
-    rho_grid = torch.where(
-        border_mask_4d.expand_as(rho_grid),
-        torch.zeros_like(rho_grid), rho_grid,
+    rho_seed = nr_squash_k_bins(rho_grid, eta_z_t, nr_eps)
+    rho_seed = torch.where(
+        border_mask_4d.expand_as(rho_seed),
+        torch.zeros_like(rho_seed), rho_seed,
     )
 
-    rho_seed = rho_grid.detach()
     rho_k_seed_snap = (
-        rho_grid.squeeze(0).permute(1, 2, 0).reshape(-1, K).detach().clone()
+        rho_seed.squeeze(0).permute(1, 2, 0).reshape(-1, K).detach().clone()
     )
+
+    rho_grid = rho_seed.clone()
 
     kappa_k_pass0 = torch.zeros_like(rho_k_raw)
     kappa_last_nw = torch.zeros(nH, nW, device=device, dtype=dtype)
     s_k_first: torch.Tensor | None = None
     s_bar_first: torch.Tensor | None = None
 
-    tau_t = torch.as_tensor(tau, device=device, dtype=dtype).view(()).clamp_min(1e-6)
-    alpha_t = torch.as_tensor(gain_alpha, device=device, dtype=dtype).view(()).clamp(max=0.49)
+    beta_s = torch.as_tensor(beta_seed, device=device, dtype=dtype).view(())
+    beta_c = torch.as_tensor(beta_coll, device=device, dtype=dtype).view(())
+    beta_x = torch.as_tensor(beta_cross, device=device, dtype=dtype).view(())
+    sig = torch.as_tensor(sigma_sat, device=device, dtype=dtype).view(()).clamp_min(1e-8)
+    sigma_sq = sig * sig
+    k_i = int(K)
+    den_other = float(max(k_i - 1, 1))
+    ones_rho = torch.ones_like(rho_grid)
+    heeger_ep = torch.as_tensor(HEEGER_DENOM_EPS, device=device, dtype=dtype)
 
     for t in range(n_passes):
         if eta_update_fn is not None:
@@ -425,24 +458,28 @@ def gaba_recurrence(
                 torch.zeros_like(rho_grid), rho_grid,
             )
 
-        s_k = F.conv2d(rho_grid, kernels, padding=R, groups=K)
-        kap_t = _cosine_kappa_grid(rho_grid, s_k, eps)
-        k_i = int(K)
-        den_other = float(max(k_i - 1, 1))
+        sum_col = F.conv2d(ones_rho, kernels, padding=R, groups=K).clamp_min(1e-6)
+        s_k_raw = F.conv2d(rho_grid, kernels, padding=R, groups=K)
+        s_k_hat = s_k_raw / sum_col
+
         rho_total = rho_grid.sum(dim=1, keepdim=True)
         rho_other_mean = (rho_total - rho_grid) / den_other
-        w_iso = iso_kernel.expand(k_i, 1, iso_kernel.shape[2], iso_kernel.shape[3])
-        s_surround = F.conv2d(rho_other_mean, w_iso, padding=R, groups=k_i)
-        s_inhib = s_surround
+        ones_other = torch.ones_like(rho_other_mean)
+        sum_surr = F.conv2d(ones_other, surr_kernels, padding=R, groups=K).clamp_min(1e-6)
+        s_surr_raw = F.conv2d(rho_other_mean, surr_kernels, padding=R, groups=K)
+        s_surr_hat = s_surr_raw / sum_surr
+
+        kap_t = _cosine_kappa_grid(rho_grid, s_k_raw, eps)
         if t == 0:
-            s_k_first = s_k.detach().clone()
-            s_bar_first = s_inhib.detach().clone()
+            s_k_first = s_k_raw.detach().clone()
+            s_bar_first = s_surr_hat.detach().clone()
 
-        u = beta_coll * s_k - beta_cross * s_inhib
-        u = torch.where(border_mask_4d.expand_as(u), torch.zeros_like(u), u)
-
-        gain = 1.0 + alpha_t * torch.tanh(u / tau_t)
-        rho_grid = rho_seed * gain
+        drive = beta_s * rho_seed + beta_c * s_k_hat
+        drive = torch.where(border_mask_4d.expand_as(drive), torch.zeros_like(drive), drive)
+        drive_sq = drive * drive
+        surr_sq = s_surr_hat * s_surr_hat
+        denom = drive_sq + sigma_sq + beta_x * surr_sq + heeger_ep
+        rho_grid = drive_sq / denom
         rho_grid = torch.where(
             border_mask_4d.expand_as(rho_grid),
             torch.zeros_like(rho_grid), rho_grid,
@@ -522,12 +559,12 @@ def extract_dominant(
 
 
 # ═══════════════════════════════════════════════════════════════
-# Seed module: learned η_z + tanh gate τ, α + raw β_coll/β_cross (HypercolumnSeed)
+# Seed module: seed η_z + Heeger σ + β_seed/β_coll/β_cross (HypercolumnSeed)
 # ═══════════════════════════════════════════════════════════════
 
 
 class HypercolumnSeed(nn.Module):
-    """Learned ``η_z`` (seed NR), ``τ``, ``α`` (tanh gain), ``β_coll``, ``β_cross``, σ_d/σ_t."""
+    """Learned ``η_z`` (seed NR), Heeger semi-saturation ``σ``, ``β_seed``, ``β_coll``, ``β_cross``, σ_d/σ_t."""
 
     def __init__(
         self,
@@ -537,10 +574,10 @@ class HypercolumnSeed(nn.Module):
         n_gaba_passes: int | None = None,
         eta_z_init: float | None = None,
         eta_pass_init: float | None = None,
-        tau_init: float | None = None,
-        gain_alpha_init: float | None = None,
+        beta_seed_init: float | None = None,
         beta_coll_init: float = SEED.BETA_COLL_INIT,
         beta_cross_init: float = SEED.BETA_CROSS_INIT,
+        sigma_sat_init: float | None = None,
     ):
         super().__init__()
         self.R = int(r_pool)
@@ -558,13 +595,12 @@ class HypercolumnSeed(nn.Module):
         self._eta_z_raw = nn.Parameter(
             torch.tensor(_inv_softplus(ez), dtype=torch.float32)
         )
-        t0 = float(tau_init if tau_init is not None else SEED.TAU_INIT)
-        self._tau_raw = nn.Parameter(
-            torch.tensor(_inv_softplus(max(t0, 1e-4)), dtype=torch.float32)
-        )
-        ga0 = float(gain_alpha_init if gain_alpha_init is not None else SEED.GAIN_ALPHA_INIT)
-        self._gain_alpha_raw = nn.Parameter(
-            torch.tensor(_inv_softplus(max(ga0, 1e-4)), dtype=torch.float32)
+        bs0 = float(beta_seed_init if beta_seed_init is not None else SEED.BETA_SEED_INIT)
+        self._beta_seed_raw = nn.Parameter(
+            torch.tensor(
+                _inv_softplus(max(float(bs0), 1e-6)),
+                dtype=torch.float32,
+            )
         )
         self._beta_coll_raw = nn.Parameter(
             torch.tensor(
@@ -577,6 +613,10 @@ class HypercolumnSeed(nn.Module):
                 _inv_softplus(max(float(beta_cross_init), 1e-6)),
                 dtype=torch.float32,
             )
+        )
+        s0 = float(sigma_sat_init if sigma_sat_init is not None else SEED.SIGMA_SAT_INIT)
+        self._sigma_sat_raw = nn.Parameter(
+            torch.tensor(_inv_softplus(max(float(s0), 1e-6)), dtype=torch.float32)
         )
         R_geom = float(L1.COL_RADIUS)
         sd0 = float(L1.COL_SIGMA_D) if L1.COL_SIGMA_D is not None else R_geom / 2.0
@@ -603,14 +643,9 @@ class HypercolumnSeed(nn.Module):
         return F.softplus(self._eta_z_raw).clamp_min(1e-6).view(())
 
     @property
-    def tau(self) -> torch.Tensor:
-        """Positive gate temperature ``τ`` (``softplus`` of raw)."""
-        return F.softplus(self._tau_raw)
-
-    @property
-    def gain_alpha(self) -> torch.Tensor:
-        """Gain span ``α``; ``gain = 1 + α·tanh(u/τ)``, ``α`` clamped ``≤ 0.49``."""
-        return F.softplus(self._gain_alpha_raw).clamp(max=0.49)
+    def beta_seed(self) -> torch.Tensor:
+        """``β_s`` weight on ``ρ^{\\mathrm{seed}}`` in drive."""
+        return F.softplus(self._beta_seed_raw)
 
     @property
     def beta_coll(self) -> torch.Tensor:
@@ -620,8 +655,13 @@ class HypercolumnSeed(nn.Module):
     def beta_cross(self) -> torch.Tensor:
         return F.softplus(self._beta_cross_raw)
 
+    @property
+    def sigma_sat(self) -> torch.Tensor:
+        """Heeger semi-saturation ``σ`` in ``drive^2/(drive^2+σ^2+…)`` (post–seed NR scale)."""
+        return F.softplus(self._sigma_sat_raw).clamp_min(1e-6).view(())
+
     def normalize_pre_gaba(self, rho_k_raw: torch.Tensor) -> torch.Tensor:
-        """Scalar ``η_z`` NR on flat ``(N,K)`` (matches seed NR before GABA passes)."""
+        """Scalar ``η_z`` NR on flat ``(N,K)`` (matches seed NR before Heeger passes)."""
         u = rho_k_raw
         if u.dim() != 2:
             raise ValueError("normalize_pre_gaba expects (N, K) flat tensor")
@@ -651,14 +691,14 @@ def run_l1_hypercolumn(
 ) -> dict:
     """Run the full hypercolumn L1 pipeline.
 
-    L0 output → K-bin hypercolumns → **seed NR** (learned ``η_z``) → ``T`` multiplicative
-    tanh-gate passes (``ρ ← ρ^{\\mathrm{seed}} \\odot (1+α\\tanh(u/τ))``), dominant readout.
+    L0 output → K-bin hypercolumns → **seed NR** (``μ`` → ``[0,1]``) → ``T`` **Heeger**
+    passes (learned ``σ^2`` + surround + fixed ``ε``), dominant readout.
 
     Args:
         h2m: (H, W) from L0
         theta_h: (H, W) from L0
         border_mask: (H, W) bool
-        seed: HypercolumnSeed (``η_z``, ``τ``, ``α``, ``β_coll``, ``β_cross``, σ_d/σ_t; all learned scalars)
+        seed: HypercolumnSeed (``η_z``, ``σ``, ``β_seed``, ``β_coll``, ``β_cross``, σ_d/σ_t)
         P, patch_overlap, border_patch_max_frac: patch geometry
         K, R, n_passes: recurrence params (``n_passes`` must match ``seed.n_gaba_passes``)
         sigma_d, sigma_t: optional **fixed** floats for tests; default uses
@@ -705,11 +745,11 @@ def run_l1_hypercolumn(
         interior = ~hc["is_border"]
         rho_max_raw = rho_k_raw[interior].max(dim=-1).values
         ez = float(seed.eta_z.detach().cpu().item())
-        ta = float(seed.tau.detach().cpu().item())
-        al = float(seed.gain_alpha.detach().cpu().item())
+        sg = float(seed.sigma_sat.detach().cpu().item())
         print(
-            f"  η_z={ez:.3f}  τ={ta:.4f}  α={al:.4f}  "
-            f"β_coll={seed.beta_coll.item():.3f}  β_cross={seed.beta_cross.item():.3f}",
+            f"  η_z={ez:.3f}  Heeger σ={sg:.4f}  ε={HEEGER_DENOM_EPS:g}  "
+            f"β_s={seed.beta_seed.item():.3f}  β_c={seed.beta_coll.item():.3f}  "
+            f"β_x={seed.beta_cross.item():.3f}",
         )
         print(f"  raw ρ_k max (interior): mean={rho_max_raw.mean():.4f} "
               f"max={rho_max_raw.max():.4f}")
@@ -719,11 +759,11 @@ def run_l1_hypercolumn(
             rho_k_raw, nH, nW, hc["is_border"], K,
             R=R_int, sigma_d=sigma_d_t, sigma_t=sigma_t_t,
             n_passes=n_passes,
+            beta_seed=seed.beta_seed,
             beta_coll=seed.beta_coll,
             beta_cross=seed.beta_cross,
             eta_z=seed.eta_z,
-            tau=seed.tau,
-            gain_alpha=seed.gain_alpha,
+            sigma_sat=seed.sigma_sat,
             nr_eps=float(seed.eps),
             eps=eps,
             eta_update_fn=None,

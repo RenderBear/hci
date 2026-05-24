@@ -75,11 +75,11 @@ Take $\mu_k(c) = \rho_k^{\mathrm{raw}}(c)$ as the nonnegative **drive** for the 
 
 ## 4. GABA — raw-space collinear recurrence + spatial $\eta$ (single NR per pass)
 
-**Seed NR (code):** $\boldsymbol{\rho}^{\mathrm{seed}}(c)$ applies divisive normalization $\mu_k^2/(\mu_k^2+\eta_z^2+\varepsilon)$ with **learned** $\eta_z=\mathrm{softplus}(\tilde\eta_z)$ (`HypercolumnSeed._eta_z_raw`), then detached as the envelope for multiplicative tanh-gate passes (§4 narrative below may still describe older MLP-$\eta$ experiments — trust `hci/L1.py` + `params.py` for the live pipeline).
+**Seed NR (code):** ``ρ^{\\mathrm{seed}} = μ^2/(μ^2+η_z^2+ε)`` with learned ``η_z`` maps raw cos² drive to ``[0,1]``. **Heeger passes:** kernel-normalized ``\\hat S_k``, ``\\hat I_k``; ``\\mathrm{drive}_k = β_s ρ^{\\mathrm{seed}}_k + β_c \\hat S_k``; ``ρ ← \\mathrm{drive}^2/(\\mathrm{drive}^2+σ^2+β_x \\hat I^2+ε_H)`` with learned scalar ``σ``, fixed tiny ``ε_H``. See ``hci/L1.py`` + ``params.py``.
 
 Learned $\eta_0 = \mathrm{softplus}(\tilde\eta_0)$ scales a **per-cell** modulation from a **2→8→1** MLP (`EtaGabaMLP`; sigmoid output clamped to $(10^{-3},1]$ in code).
 
-Let $\boldsymbol{\rho}^{(t)}(c)\in\mathbb{R}_+^K$ be the bin vector at the **start** of recurrence pass $t$ (so $\boldsymbol{\rho}^{(0)}=\boldsymbol{\mu}$). Let $\mathbf{S}^{(t)}(c)\in\mathbb{R}_+^K$ stack the collinear pool outputs $\tilde S_k^{(t)}(c)$ **before** the $\beta$-mixture that forms $u$ (depthwise conv with **unnormalized** nonnegative kernels — a weighted **sum** over neighbors, not divided by $\sum G_k$). **Surround inhibition** is **per bin** $k$: at each cell, form the leave-one-out mean of the *other* orientations $\bar Z_k^{(t)}(c)=\frac{1}{\max(K-1,1)}\sum_{j\neq k}\rho_j^{(t)}(c)$, then apply the **same radial** Gaussian × disk as $G_k$ (center omitted), **without** tangential selectivity — i.e.\ $\mathcal{I}_k^{(t)}(c)=(H*\bar Z_k^{(t)})(c)$ with isotropic neighbor pooling on the competing-orientation field (bin $k$ does not feed its own surround). Define
+Let $\boldsymbol{\rho}^{(t)}(c)\in\mathbb{R}_+^K$ be the bin vector at the **start** of recurrence pass $t$ (so $\boldsymbol{\rho}^{(0)}=\boldsymbol{\mu}$). Let $\mathbf{S}^{(t)}(c)\in\mathbb{R}_+^K$ stack the collinear pool outputs $\tilde S_k^{(t)}(c)$ **before** the $\beta$-mixture that forms $u$ (depthwise conv with **unnormalized** nonnegative kernels — a weighted **sum** over neighbors, not divided by $\sum G_k$). **Surround inhibition** is **per bin** $k$: form the leave-one-out mean $\bar Z_k^{(t)}(c)=\frac{1}{\max(K-1,1)}\sum_{j\neq k}\rho_j^{(t)}(c)$, then convolve with the **annular** nonnegative kernel $\max(H-G_k,0)$ (radial $H$ minus collinear $G_k$, clamped), so inhibition pools competing-orientation energy **off** the collinear corridor for channel $k$. Define
 
 $$
 \kappa^{(t)}(c) = \frac{\boldsymbol{\rho}^{(t)}(c)\cdot \mathbf{S}^{(t)}(c)}{\bigl\|\boldsymbol{\rho}^{(t)}(c)\bigr\|\,\bigl\|\mathbf{S}^{(t)}(c)\bigr\| + \varepsilon}.
@@ -116,10 +116,10 @@ For each bin $k$, a nonnegative kernel $G_k$ is built on the $(2R+1)^2$ patch (G
 $$
 \tilde S_k^{(t)}(c) = (G_k * \rho_k^{(t)})(c), \qquad
 \bar Z_k^{(t)}(c) = \frac{1}{\max(K-1,1)}\sum_{j\neq k} \rho_j^{(t)}(c), \qquad
-\mathcal{I}_k^{(t)}(c) = (H * \bar Z_k^{(t)})(c).
+\mathcal{I}_k^{(t)}(c) = \bigl(\max(H - G_k,\,0) * \bar Z_k^{(t)}\bigr)(c).
 $$
 
-The inhibitory drive $\mathcal{I}_k^{(t)}$ is **per orientation channel** (depthwise isotropic conv on the LOO mean map $\bar Z_k^{(t)}$).
+The inhibitory drive $\mathcal{I}_k^{(t)}$ uses an **annular** depthwise kernel $\max(H-G_k,0)$ so surround excludes the collinear corridor (same $H$ as the radial envelope of $G_k$).
 
 **Raw-space β** (softplus of raw parameters):
 

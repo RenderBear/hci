@@ -846,7 +846,7 @@ def viz_infer_gaba_geometry(
     *,
     n_collinear_passes: int | None = None,
 ) -> None:
-    r"""Single figure: $\max_k \tilde{S}_k$ and per-bin surround $\mathcal{I}_k=H*\bar{Z}_k$, $\bar{Z}_k=\frac{1}{\max(K-1,1)}\sum_{j\neq k}\rho_j$, on pass 0."""
+    r"""Single figure: $\max_k \tilde{S}_k$ and per-bin annular surround $\mathcal{I}_k=\max(0,H-G_k)*\bar{Z}_k$, $\bar{Z}_k=\frac{1}{\max(K-1,1)}\sum_{j\neq k}\rho_j$, on pass 0."""
     ib = np.asarray(is_border, dtype=bool)
     sk_a = np.asarray(sk_max, dtype=np.float64)
     sb_a = np.asarray(sbar, dtype=np.float64)
@@ -868,7 +868,7 @@ def viz_infer_gaba_geometry(
     )
     panels: list[tuple[np.ndarray, str]] = [
         (sk, r"$\max_k \tilde{S}_k^{(0)}$ — $G_k * \rho_k$ (unnormalized)"),
-        (sb, r"$\mathcal{I}_{k^*}^{(0)}$ at seed-$\rho$ dominant $k^*$ — $(H * \bar{Z}_{k^*})^{(0)}$, $\bar{Z}_k=\frac{1}{\max(K-1,1)}\sum_{j\neq k}\rho_j$"),
+        (sb, r"$\mathcal{I}_{k^*}^{(0)}$ at seed-$\rho$ dominant $k^*$ — $(\max(0,H-G_{k^*}) * \bar{Z}_{k^*})^{(0)}$, $\bar{Z}_k=\frac{1}{\max(K-1,1)}\sum_{j\neq k}\rho_j$"),
     ]
     for ax, (arr, title) in zip(axes, panels):
         ax.set_facecolor(VIZ.PANEL_BG)

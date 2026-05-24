@@ -1,7 +1,7 @@
 r"""Seed module — thin wrapper providing renderer-compatible interface.
 
-``HypercolumnSeed`` holds learned ``η_z`` (seed NR), tanh-gate ``τ``, ``α``,
-``β_coll`` / ``β_cross``, and collinear σ scales for ``run_l1_hypercolumn``.
+``HypercolumnSeed`` holds learned ``η_z`` (seed NR to ``[0,1]``), Heeger semi-saturation ``σ``,
+``β_seed`` / ``β_coll`` / ``β_cross``, and collinear σ scales for ``run_l1_hypercolumn``.
 Stored ``κ`` in ``cells_flat`` is cosine ``ρ·S/(‖ρ‖‖S‖)`` for the readout MLP.
 """
 from __future__ import annotations
