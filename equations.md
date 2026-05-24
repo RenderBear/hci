@@ -65,7 +65,7 @@ $$
 $$
 
 **Naka–Rushton vs.\ the learned floor only** (no $z_0$ in the denominator —
-L0 NR and GABA fair-share already handle contrast and competition):
+L0 NR and GABA κ gating already handle contrast and competition):
 
 $$
 \rho_k^{(0)}(c) = \frac{\bigl(\tilde{\rho}_k^{\text{raw}}(c)\bigr)^2}{\bigl(\tilde{\rho}_k^{\text{raw}}(c)\bigr)^2 + \eta_z^2}
@@ -122,37 +122,52 @@ This is a single `F.conv2d` on a $(1, K, n_H, n_W)$ tensor with $K$
 **depthwise** kernels — each channel convolved with its matched kernel.
 Cost: one depthwise conv2d per pass.
 
-**Stage B — GABA budget.**
-Total energy across all bins at each cell:
+**Stage B — GABA gate (κ).**
+
+Default (`L1.COL_KAPPA_NORM="cosine"`): one **scalar** $\kappa^{(t)}(c)$ per cell
+(cosine similarity between the cell's $K$-vector $\rho_k^{(t)}(c)$ and the
+collinear neighborhood response $S_k^{(t)}(c) = (W_k * \rho_k^{(t)})(c)$):
 
 $$
-E_{\text{total}}(c) = \sum_{k=0}^{K-1} S_k^{(t)}(c)
+\kappa^{(t)}(c) = \frac{\sum_k \rho_k^{(t)}(c)\, S_k^{(t)}(c)}{
+\sqrt{\sum_k \rho_k^{(t)}(c)^2}\;\sqrt{\sum_k S_k^{(t)}(c)^2} + \epsilon}
 $$
 
-Per-bin fair-share normalization:
+Clamped to $[0,1]$. High when the cell's orientation profile matches the
+neighborhood's pooled collinear support (coherent contour); lower when
+neighbors disagree (texture / orientation boundaries). The same $\kappa$
+multiplies **every** bin — recovering "do neighbors agree with *my* profile?"
+rather than only "am I as strong as the local max bin?"
 
-$$
-\kappa_k^{(t)}(c) = \frac{S_k^{(t)}(c)}{E_{\text{total}}(c) / K + \epsilon}
-$$
-
-Clamped to $[0, 1]$.
+**Alternative modes** (`L1.COL_KAPPA_NORM`): **max** — per-bin
+$\kappa_k^{(t)}(c) = S_k^{(t)}(c) / (\max_{j} S_j^{(t)}(c) + \epsilon)$;
+**fair-share** —
+$\kappa_k^{(t)}(c) = S_k^{(t)}(c) / (E_{\text{total}}(c)/K + \epsilon)$ with
+$E_{\text{total}}=\sum_k S_k$. Fair-share is degenerate with cos² + large $K$
+(active bins $\ll K$ ⇒ often $\kappa_k\approx 1$).
 
 **Stage C — modulate.**
 
+Cosine mode (scalar $\kappa$):
+
 $$
-\rho_k^{(t+1)}(c) = \rho_k^{(t)}(c) \cdot \kappa_k^{(t)}(c)
+\rho_k^{(t+1)}(c) = \rho_k^{(t)}(c) \cdot \kappa^{(t)}(c)
 $$
 
-### Compact per-pass update
+Per-bin modes (max / fair-share): $\rho_k^{(t+1)}(c) = \rho_k^{(t)}(c) \cdot \kappa_k^{(t)}(c)$.
+
+### Compact per-pass update (cosine default)
 
 $$
 \boxed{
 \rho_k^{(t+1)}(c) = \rho_k^{(t)}(c) \;\cdot\;
-\min\!\Biggl(1,\;\;
-\frac{(W_k * \rho_k^{(t)})(c)}{\frac{1}{K}\sum_{j=0}^{K-1}(W_j * \rho_j^{(t)})(c) + \epsilon}
-\Biggr)
+\frac{\sum_j \rho_j^{(t)}(c)\,(W_j * \rho_j^{(t)})(c)}{
+\sqrt{\sum_j \rho_j^{(t)}(c)^2}\;
+\sqrt{\sum_j \bigl((W_j * \rho_j^{(t)})(c)\bigr)^2} + \epsilon}
 }
 $$
+
+(Per-bin $\kappa_k$ variants use the same $S_k^{(t)}$ with different normalizations.)
 
 ### Key difference from current architecture
 
@@ -161,9 +176,9 @@ double-angle fields onto the cell's own orientation.  The projection acts
 as an implicit orientation filter.
 
 Hypercolumn version: K-channel $\rho$ per cell, each channel explicitly
-filtered by its own tangent-selective kernel.  No projection needed —
-each bin directly competes in the GABA budget.  The orientation selectivity
-is in the binning, not in the projection.
+filtered by its own tangent-selective kernel.  With **cosine** κ, a single
+scalar compares the full cell profile to the neighborhood's pooled $S_k$,
+restoring projection-like "agreement with me" semantics across bins.
 
 ### What this enables
 

@@ -4,6 +4,12 @@ Pipeline per image: L0 → L1 (cos² hypercolumns, min+NR vs ``η_z`` pre-GABA,
 GABA recurrence, dominant θ/ρ/κ) → cache → **renderer** (interp + thinning MLP).
 The seed module only forwards cached ``lam`` as scalar ρ for the renderer.
 
+**Cache:** ``TRAIN.CACHE_VERSION`` gates the full derived bundle (``cells_flat``,
+``l0_pix``, ``proj_info``, …). Pre-NR directional distances ``d_lum``/``d_chr``
+are expensive and η-independent; when ``L0.L0_DIST_CACHE_VERSION`` and the
+stored geometry signature still match, precompute **reuses** them from an
+existing ``.pt`` file and only recomputes L0 NR → L1 → render features.
+
 Loss combines soft-Dice and per-pixel BCE on the η± valid band.
 """
 
@@ -44,6 +50,51 @@ from hci.renderer import (
     proj_to_device,
 )
 from params import L0, L1, RENDER, SEED, TRAIN, VIZ
+
+
+def _l0_dist_signature(ir_p: np.ndarray, H0: int, W0: int) -> tuple:
+    """Identity for L0 directional-distance tensors (η-independent leg)."""
+    Hp, Wp = int(ir_p.shape[0]), int(ir_p.shape[1])
+    return (
+        tuple(tuple(int(a), int(b)) for a, b in L0.OFFSETS),
+        Hp,
+        Wp,
+        int(H0),
+        int(W0),
+        int(L1.PATCH_SIZE),
+        int(L1.PATCH_OVERLAP),
+    )
+
+
+def _can_reuse_l0_dist_tensors(
+    cached: dict | None,
+    sig: tuple,
+    ir_p: np.ndarray,
+) -> bool:
+    if not isinstance(cached, dict):
+        return False
+    if int(cached.get("l0_dist_cache_version", -1)) != int(L0.L0_DIST_CACHE_VERSION):
+        return False
+    if cached.get("l0_dist_signature") != sig:
+        return False
+    for k in ("d_lum", "d_chr", "img"):
+        if k not in cached:
+            return False
+    Hp, Wp = sig[1], sig[2]
+    if ir_p.shape[0] != Hp or ir_p.shape[1] != Wp:
+        return False
+    dl = cached["d_lum"]
+    dc = cached["d_chr"]
+    if not hasattr(dl, "shape") or not hasattr(dc, "shape"):
+        return False
+    if tuple(dl.shape[:2]) != (Hp, Wp) or tuple(dc.shape[:2]) != (Hp, Wp):
+        return False
+    if len(dl.shape) != 3 or len(dc.shape) != 3:
+        return False
+    im = cached["img"]
+    if np.asarray(im).shape[:2] != (Hp, Wp) or np.asarray(im).shape[2] != 3:
+        return False
+    return True
 
 
 def build_l0_pix(
@@ -335,16 +386,20 @@ def _find_gt_path_png(gt_dir, stem):
     return matches[0] if matches else None
 
 
-def precompute_image(img_path, gt_path, gt_format):
+def precompute_image(img_path, gt_path, gt_format, *, cached: dict | None = None):
     ir_np = np.array(Image.open(img_path).convert("RGB")).astype(np.float32) / 255.0
     ir_np = np.clip(ir_np, 0, 1)
     ir_p, H0, W0 = pad_for_patch_grid(ir_np, L1.PATCH_SIZE, L1.PATCH_OVERLAP)
     del ir_np
 
     ir_t = torch.from_numpy(ir_p)
+    sig = _l0_dist_signature(ir_p, H0, W0)
 
-    # Compute directional differences (image-dependent, η-independent)
-    d_lum, d_chr = _compute_d_lum_chroma(ir_t, L0.OFFSETS)
+    if _can_reuse_l0_dist_tensors(cached, sig, ir_p):
+        d_lum = cached["d_lum"].to(device=ir_t.device, dtype=torch.float32).contiguous()
+        d_chr = cached["d_chr"].to(device=ir_t.device, dtype=torch.float32).contiguous()
+    else:
+        d_lum, d_chr = _compute_d_lum_chroma(ir_t, L0.OFFSETS)
 
     h, vld, _, _, _, s, h1m, h2m, h2m_lum, h2m_chr = compute_l0_rgb(
         ir_t,
@@ -422,6 +477,8 @@ def precompute_image(img_path, gt_path, gt_format):
 
     return {
         "cache_version": TRAIN.CACHE_VERSION,
+        "l0_dist_cache_version": int(L0.L0_DIST_CACHE_VERSION),
+        "l0_dist_signature": sig,
         "proj_info": proj_info,
         "gt": torch.from_numpy(gt),
         "H_p": H_p,
@@ -441,8 +498,9 @@ def precompute_image(img_path, gt_path, gt_format):
 
 def _precompute_one(args):
     img_path, gt_path, gt_format, cache_path = args
+    cached = _load_cache_entry(cache_path) if os.path.exists(cache_path) else None
     try:
-        data = precompute_image(img_path, gt_path, gt_format)
+        data = precompute_image(img_path, gt_path, gt_format, cached=cached)
         torch.save(data, cache_path)
         return os.path.splitext(os.path.basename(img_path))[0]
     except Exception as e:
@@ -576,6 +634,8 @@ class StriateDataset(Dataset):
                 f'Cache for "{stem}" is stale or incomplete '
                 f"(cache_version={data.get('cache_version')!r}, "
                 f"expected {TRAIN.CACHE_VERSION}; "
+                f"l0_dist_cache_version={data.get('l0_dist_cache_version')!r}, "
+                f"expected {L0.L0_DIST_CACHE_VERSION}; "
                 f"proj_info must include render grid keys). "
                 f"Delete {self.cache_dir} and re-run training."
             )

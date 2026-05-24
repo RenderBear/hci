@@ -597,6 +597,87 @@ def viz_infer_rho_seed_final_dual_maps(
     plt.close(fig)
 
 
+def viz_infer_kappa_pass0_final_dual_maps(
+    kappa_pass0: np.ndarray,
+    kappa_final: np.ndarray,
+    is_border: np.ndarray,
+    out_path: str,
+    *,
+    n_collinear_passes: int,
+) -> None:
+    """Per-cell κ: first vs last GABA pass.
+
+    With ``L1.COL_KAPPA_NORM="cosine"``, κ is one scalar per cell (same for all
+    bins); the "winner bin" index is still taken post-recurrence for API
+    consistency but every bin carries the same value. With per-bin modes
+    (``"max"`` / ``"fair_share"``), maps show κ at the post-dominant bin only.
+
+    Values near 1 mean weak suppression that pass; near 0 mean strong
+    suppression. Both panels use a fixed [0, 1] intensity scale.
+    """
+    k0 = apply_border_zero(np.asarray(kappa_pass0, dtype=np.float64), is_border)
+    k1 = apply_border_zero(np.asarray(kappa_final, dtype=np.float64), is_border)
+
+    fig, axes = plt.subplots(1, 2, figsize=(13.6, 6.15), facecolor=VIZ.BG)
+    n_p = int(n_collinear_passes)
+    if n_p <= 0:
+        t_final = "—"
+        pass_note = "0 collinear passes (κ maps are zeros)"
+    elif n_p == 1:
+        t_final = "0"
+        pass_note = "1 collinear pass (first = final)"
+    else:
+        t_final = str(n_p - 1)
+        pass_note = f"{n_p} collinear passes"
+    titles = (
+        r"$\kappa$ at winner bin — GABA pass $t=0$ (first)",
+        rf"$\kappa$ at winner bin — GABA pass $t={t_final}$ (final)",
+    )
+    ims = []
+    for ax, arr, title in zip(axes, (k0, k1), titles):
+        ax.set_facecolor(VIZ.PANEL_BG)
+        im = ax.imshow(
+            np.clip(arr, 0.0, 1.0),
+            cmap="magma",
+            vmin=0.0,
+            vmax=1.0,
+            interpolation="nearest",
+        )
+        ims.append(im)
+        ax.set_title(title, fontsize=9, color=VIZ.FG, fontfamily="monospace")
+        ax.axis("off")
+    fig.suptitle(
+        "cell $\\kappa$ (GABA gate) at post-recurrence dominant bin — "
+        f"first vs final pass  ({pass_note})",
+        fontsize=10,
+        color=VIZ.FG,
+        fontfamily="monospace",
+    )
+    # Reserve lower figure area for colorbar + label; pad = gap under heatmaps.
+    fig.tight_layout(rect=[0, 0.24, 1, 0.88])
+    cbar = fig.colorbar(
+        ims[0],
+        ax=axes.ravel().tolist(),
+        orientation="horizontal",
+        fraction=0.048,
+        pad=0.26,
+        shrink=0.92,
+        aspect=36,
+    )
+    cbar.set_label(
+        r"$\kappa$  (0 suppressed $\rightarrow$ 1 kept)",
+        color=VIZ.FG,
+        fontsize=9,
+        fontfamily="monospace",
+    )
+    cbar.ax.tick_params(colors=VIZ.FG, labelsize=8)
+    cbar.ax.xaxis.label.set_color(VIZ.FG)
+    for spine in cbar.ax.spines.values():
+        spine.set_color(VIZ.ACCENT)
+    fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
+    plt.close(fig)
+
+
 def viz_infer_rho_seed_final_hist_cdf(
     rho_seed: np.ndarray,
     rho_final: np.ndarray,

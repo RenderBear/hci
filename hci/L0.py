@@ -132,7 +132,12 @@ def _compute_d_lum_chroma(
     img_rgb: torch.Tensor,
     offsets: list[tuple[int, int]],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Scalar |ΔL| and vector chroma L2 ‖ΔC‖₂ (no /√3 normalization)."""
+    """Scalar |ΔL| and vector chroma L2 ‖ΔC‖₂ (no /√3 normalization).
+
+    η-independent: training precompute can reuse stored tensors across
+    ``TRAIN.CACHE_VERSION`` bumps when ``params.L0.L0_DIST_CACHE_VERSION`` and
+    geometry match (see ``train._can_reuse_l0_dist_tensors``).
+    """
     H, W, _ = img_rgb.shape
     N = len(offsets)
     R = img_rgb[..., 0]

@@ -1,7 +1,12 @@
 r"""Shared pipeline hyperparameters, module inits, and script defaults.
 
 L1 builds cos² hypercolumns → min-subtract + η_z NR (pre-GABA) → GABA recurrence
-(no further squash).  The renderer interpolates ρ, θ, κ and applies ``h2m·ρ̄·gate``.
+(κ from ρ–S cosine similarity by default; see ``L1.COL_KAPPA_NORM``).
+The renderer interpolates ρ, θ, κ and applies ``h2m·ρ̄·gate``.
+
+Training disk cache: ``TRAIN.CACHE_VERSION`` invalidates derived L1/render fields;
+``L0.L0_DIST_CACHE_VERSION`` gates reuse of pre-NR ``d_lum``/``d_chr`` across
+those bumps when geometry is unchanged (see ``train.precompute_image``).
 """
 
 from __future__ import annotations
@@ -19,6 +24,9 @@ L0 = SimpleNamespace(
     ETA_CHR=0.05,
     ETA0=0.05,
     GAMMA=1.0,
+    # Bump when ``_compute_d_lum_chroma`` / ``L0.OFFSETS`` semantics change.
+    # Train cache can reuse stored ``d_lum``/``d_chr`` across ``TRAIN.CACHE_VERSION`` bumps.
+    L0_DIST_CACHE_VERSION=1,
 )
 
 # ── L1: hypercolumn cell grid + collinear recurrence (depthwise GABA) ───────
@@ -32,6 +40,10 @@ L1 = SimpleNamespace(
     COL_SIGMA_D=None,       # default: R/2 inside L1
     COL_SIGMA_T=1.0,
     COL_PASSES=5,
+    # κ after depthwise collinear conv S_k:
+    # "cosine" = scalar cos(ρ, S) per cell, same κ all bins (texture vs edge);
+    # "max" = per-bin S_k/(max_j S_j+ε); "fair_share" = S_k/(E_total/K+ε).
+    COL_KAPPA_NORM="cosine",
 )
 
 # ── SEED: tile geometry + learned η_z (HypercolumnSeed); no separate dynamics ─
@@ -58,7 +70,7 @@ TRAIN = SimpleNamespace(
     NUM_WORKERS=2,
     LAM_DICE=0.0,
     LAM_BCE=1.0,
-    CACHE_VERSION=12,
+    CACHE_VERSION=14,
 )
 
 # ── Inference ────────────────────────────────────────────────────────────────

@@ -15,7 +15,9 @@ Pipeline:
 
 ``rho_k_initial`` / ``rho_initial_cell`` store the **same** pre-GABA
 normalized ``ρ_k`` (for Δρ diagnostics: value at the post-recurrence
-dominant bin vs final ρ at that bin).
+dominant bin vs final ρ at that bin).  ``kappa_pass0_cell`` / ``kappa_col_cell``
+store κ after the first / final GABA pass (with ``L1.COL_KAPPA_NORM="cosine"``,
+κ is scalar per cell and equal in every bin, so "winner bin" is arbitrary).
 
 The collinear recurrence uses depthwise conv2d — each bin convolved with
 its own tangent-selective kernel.  Junctions with 3+ arms are naturally
@@ -290,7 +292,8 @@ def gaba_recurrence(
     sigma_t: float,
     n_passes: int,
     eps: float = 1e-6,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    kappa_norm: str = "cosine",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Recurrent GABA-budget collinear facilitation on K-channel cell grid.
 
     Args:
@@ -300,10 +303,17 @@ def gaba_recurrence(
         K: number of orientation bins
         R, sigma_d, sigma_t: collinear kernel parameters
         n_passes: number of recurrence iterations
+        kappa_norm:
+            ``"cosine"`` — scalar :math:`\\kappa(c)` = cosine sim between
+            :math:`\\rho_k(c)` and :math:`S_k(c)` at each cell; same :math:`\\kappa`
+            applied to every bin (neighborhood agrees with cell profile).
+            ``"max"`` — per-bin :math:`\\kappa_k=S_k/(\\max_j S_j+\\epsilon)`.
+            ``"fair_share"`` — per-bin :math:`\\kappa_k=S_k/(E_{\\text{total}}/K+\\epsilon)`.
 
     Returns:
         rho_k_out: (N, K) modulated per-bin energies after all passes
-        kappa_k: (N, K) final-pass per-bin collinear coherence
+        kappa_k: (N, K) final-pass κ stored per bin (cosine mode repeats scalar K-wise)
+        kappa_k_pass0: (N, K) κ after the first pass (zeros if ``n_passes == 0``)
     """
     device = rho_k.device
     dtype = rho_k.dtype
@@ -320,22 +330,43 @@ def gaba_recurrence(
     rho_grid = torch.where(border_mask_4d, torch.zeros_like(rho_grid), rho_grid)
 
     kappa_grid = torch.zeros_like(rho_grid)
+    kappa_k_pass0 = torch.zeros_like(rho_k)
 
     for t in range(n_passes):
         # Depthwise conv: each bin k convolved with its own kernel W_k
         # groups=K means each channel is convolved independently
         s_k = F.conv2d(rho_grid, kernels, padding=R, groups=K)  # (1, K, nH, nW)
 
-        # Total energy across all bins at each cell
-        e_total = s_k.sum(dim=1, keepdim=True)  # (1, 1, nH, nW)
-
-        # Per-bin fair-share: κ_k = S_k / (E_total / K + ε)
-        per_bin_avg = e_total / K
-        kappa_grid = s_k / (per_bin_avg + eps)
+        if kappa_norm == "cosine":
+            # Scalar gate: agreement between cell profile ρ and neighborhood pool S.
+            num = (rho_grid * s_k).sum(dim=1, keepdim=True)
+            norm_rho = (rho_grid * rho_grid).sum(dim=1, keepdim=True).clamp_min(0.0).sqrt()
+            norm_s = (s_k * s_k).sum(dim=1, keepdim=True).clamp_min(0.0).sqrt()
+            kappa_scalar = num / (norm_rho * norm_s + eps)
+            kappa_scalar = kappa_scalar.clamp(0.0, 1.0)
+            kappa_grid = kappa_scalar.expand_as(rho_grid)
+        elif kappa_norm == "max":
+            # Winner-referenced gate: strongest bin in neighborhood → κ=1, rest < 1.
+            s_max = s_k.amax(dim=1, keepdim=True)
+            kappa_grid = s_k / (s_max + eps)
+        elif kappa_norm == "fair_share":
+            e_total = s_k.sum(dim=1, keepdim=True)
+            per_bin_avg = e_total / K
+            kappa_grid = s_k / (per_bin_avg + eps)
+        else:
+            raise ValueError(
+                "kappa_norm must be 'cosine', 'max', or 'fair_share', "
+                f"got {kappa_norm!r}",
+            )
         kappa_grid = kappa_grid.clamp(0.0, 1.0)
 
         # Zero borders
         kappa_grid = torch.where(border_mask_4d, torch.zeros_like(kappa_grid), kappa_grid)
+
+        if t == 0:
+            kappa_k_pass0 = (
+                kappa_grid.squeeze(0).permute(1, 2, 0).reshape(-1, K).detach().clone()
+            )
 
         # Modulate
         rho_grid = rho_grid * kappa_grid
@@ -345,7 +376,7 @@ def gaba_recurrence(
     rho_k_out = rho_grid.squeeze(0).permute(1, 2, 0).reshape(-1, K)
     kappa_k_out = kappa_grid.squeeze(0).permute(1, 2, 0).reshape(-1, K)
 
-    return rho_k_out, kappa_k_out
+    return rho_k_out, kappa_k_out, kappa_k_pass0
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -469,6 +500,7 @@ def run_l1_hypercolumn(
     sigma_t: float = L1.COL_SIGMA_T,
     n_passes: int = L1.COL_PASSES,
     eps: float = 1e-6,
+    kappa_norm: str | None = None,
     verbose: bool = True,
 ) -> dict:
     """Run the full hypercolumn L1 pipeline.
@@ -483,12 +515,15 @@ def run_l1_hypercolumn(
         seed: HypercolumnSeed module (provides learned η_z)
         P, patch_overlap, border_patch_max_frac: patch geometry
         K, R, sigma_d, sigma_t, n_passes: recurrence params
+        kappa_norm: ``"cosine"``, ``"max"``, or ``"fair_share"``; default
+            ``L1.COL_KAPPA_NORM``.
         verbose: print diagnostics
 
     Returns:
         cells dict compatible with the renderer interface
     """
     device = h2m.device
+    kn = str(L1.COL_KAPPA_NORM) if kappa_norm is None else str(kappa_norm)
 
     # Step 1: Build hypercolumns
     hc = build_hypercolumns(
@@ -520,10 +555,10 @@ def run_l1_hypercolumn(
               f"max={rho_max_pre.max():.4f}")
 
     # Step 3: GABA-budget recurrence (no squashing inside or after)
-    rho_k_gaba, kappa_k = gaba_recurrence(
+    rho_k_gaba, kappa_k, kappa_k_pass0 = gaba_recurrence(
         rho_k_pre, nH, nW, hc["is_border"], K,
         R=R, sigma_d=sigma_d, sigma_t=sigma_t,
-        n_passes=n_passes, eps=eps,
+        n_passes=n_passes, eps=eps, kappa_norm=kn,
     )
 
     if verbose:
@@ -543,9 +578,16 @@ def run_l1_hypercolumn(
     interior_flat = tile_interior_flat(
         nH, nW, hc["is_border"], seed.R, seed.stride, device,
     )
+    idx_dom = dom["dominant_bin"].unsqueeze(-1)
+    kappa_pass0_dom = kappa_k_pass0.gather(1, idx_dom).squeeze(-1)
+    kappa_pass0_dom = torch.where(
+        hc["is_border"], torch.zeros_like(kappa_pass0_dom), kappa_pass0_dom,
+    )
+
     dom["rho"] = dom["rho"] * interior_flat
     dom["rho_initial"] = dom["rho_initial"] * interior_flat
     dom["kappa_col"] = dom["kappa_col"] * interior_flat
+    kappa_pass0_dom = kappa_pass0_dom * interior_flat
     dom["e_col"] = dom["e_col"] * interior_flat
     dom["rho_max"] = dom["rho_max"] * interior_flat
     rho_pair = torch.stack([dom["rho"], dom["rho"]], dim=-1)
@@ -553,6 +595,7 @@ def run_l1_hypercolumn(
 
     is_border_out = hc["is_border"].cpu().numpy()
     kappa_cell = dom["kappa_col"].reshape(nH, nW).detach().cpu().numpy()
+    kappa_pass0_cell = kappa_pass0_dom.reshape(nH, nW).detach().cpu().numpy()
     e_cell = dom["e_col"].reshape(nH, nW).detach().cpu().numpy()
     rho_initial_cell = dom["rho_initial"].reshape(nH, nW).detach().cpu().numpy()
 
@@ -582,6 +625,7 @@ def run_l1_hypercolumn(
         "dominant_bin": dom["dominant_bin"].cpu().numpy(),
         "K": K,
         "kappa_col_cell": kappa_cell,
+        "kappa_pass0_cell": kappa_pass0_cell,
         "e_col_cell": e_cell,
         "rho_initial_cell": rho_initial_cell,
     }
