@@ -70,12 +70,12 @@ RENDER = SimpleNamespace(
 TRAIN = SimpleNamespace(
     LR=5e-2,
     EPOCHS=15,
-    BATCH_SIZE=8,
+    BATCH_SIZE=4,
     GRAD_CLIP=1.0,
     NUM_WORKERS=2,
     LAM_DICE=0.0,
     LAM_BCE=1.0,
-    CACHE_VERSION=16,
+    CACHE_VERSION=17,
 )
 
 # ── Inference ────────────────────────────────────────────────────────────────

@@ -30,6 +30,7 @@ Learned parameters: η_z (1 scalar), collinear Gaussian widths via
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 
 import numpy as np
 import torch
@@ -299,28 +300,39 @@ def gaba_recurrence(
     n_passes: int,
     eps: float = 1e-6,
     kappa_norm: str = "cosine",
+    eta_update_fn: Callable | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Recurrent GABA-budget collinear facilitation on K-channel cell grid.
 
     Args:
-        rho_k: (N, K) per-bin cell energies
+        rho_k: (N, K) per-bin cell energies (post ``normalize_pre_gaba``)
         nH, nW: cell grid dimensions
         is_border: (N,) bool
         K: number of orientation bins
         R: kernel radius (integer support)
-        sigma_d, sigma_t: 0-dim tensors, Gaussian scales for isotropic / tangent factors
+        sigma_d, sigma_t: 0-dim tensors, Gaussian scales
         n_passes: number of recurrence iterations
-        kappa_norm:
-            ``"cosine"`` — scalar :math:`\\kappa(c)` = cosine sim between
-            :math:`\\rho_k(c)` and :math:`S_k(c)` at each cell; same :math:`\\kappa`
-            applied to every bin (neighborhood agrees with cell profile).
-            ``"max"`` — per-bin :math:`\\kappa_k=S_k/(\\max_j S_j+\\epsilon)`.
-            ``"fair_share"`` — per-bin :math:`\\kappa_k=S_k/(E_{\\text{total}}/K+\\epsilon)`.
+        kappa_norm: ``"cosine"`` | ``"max"`` | ``"fair_share"``
+        eta_update_fn: optional callback invoked at the **start** of each pass,
+            **before** depthwise conv and ``ρ *= κ`` (so κ suppression is not
+            overwritten by the refreshed ``ρ_k`` in the same iteration).
+
+            Signature::
+
+                eta_update_fn(rho_k_flat, kappa_flat, is_border, nH, nW, K, pass_idx)
+                    -> rho_k_new  (N, K)
+
+            ``rho_k_flat`` is the current grid state (initial pre-GABA ``ρ_k`` on
+            ``pass_idx == 0``, then the state left after the previous pass's
+            ``ρ *= κ``).  ``kappa_flat`` is the **previous** pass's per-bin κ
+            grid (zeros on ``pass_idx == 0``).  The callback may re-run L0 / re-bin
+            and return new ``ρ_k`` that then receives this pass's κ gate.  If
+            ``None``, GABA proceeds with no η feedback.
 
     Returns:
         rho_k_out: (N, K) modulated per-bin energies after all passes
-        kappa_k: (N, K) final-pass κ stored per bin (cosine mode repeats scalar K-wise)
-        kappa_k_pass0: (N, K) κ after the first pass (zeros if ``n_passes == 0``)
+        kappa_k: (N, K) final-pass κ stored per bin
+        kappa_k_pass0: (N, K) κ after the first pass
     """
     device = rho_k.device
     dtype = rho_k.dtype
@@ -340,6 +352,19 @@ def gaba_recurrence(
     kappa_k_pass0 = torch.zeros_like(rho_k)
 
     for t in range(n_passes):
+        # η feedback first: refresh ρ_k from L0 / MLP using prior pass's κ
+        # (kappa_grid is zero until after the first conv below on pass 0).
+        if eta_update_fn is not None:
+            rho_flat = rho_grid.squeeze(0).permute(1, 2, 0).reshape(-1, K)
+            kappa_flat = kappa_grid.squeeze(0).permute(1, 2, 0).reshape(-1, K)
+            rho_k_new = eta_update_fn(
+                rho_flat, kappa_flat, is_border, nH, nW, K, t,
+            )
+            rho_grid = rho_k_new.reshape(nH, nW, K).permute(2, 0, 1).unsqueeze(0)
+            rho_grid = torch.where(
+                border_mask_4d, torch.zeros_like(rho_grid), rho_grid,
+            )
+
         # Depthwise conv: each bin k convolved with its own kernel W_k
         # groups=K means each channel is convolved independently
         s_k = F.conv2d(rho_grid, kernels, padding=R, groups=K)  # (1, K, nH, nW)
@@ -535,6 +560,7 @@ def run_l1_hypercolumn(
     kappa_norm: str | None = None,
     verbose: bool = True,
     cells_format: str = "numpy",
+    eta_update_fn: Callable | None = None,
 ) -> dict:
     """Run the full hypercolumn L1 pipeline.
 
@@ -556,6 +582,8 @@ def run_l1_hypercolumn(
         cells_format: ``"numpy"`` (default, disk / infer) or ``"torch"`` — when
             ``"torch"``, return tensors on ``device`` so autograd can reach
             ``seed`` (training with live L1).
+        eta_update_fn: optional callback for per-pass η feedback; see
+            ``gaba_recurrence`` docstring for the full signature.
 
     Returns:
         cells dict compatible with the renderer interface
@@ -603,6 +631,7 @@ def run_l1_hypercolumn(
         rho_k_pre, nH, nW, hc["is_border"], K,
         R=R_int, sigma_d=sigma_d_t, sigma_t=sigma_t_t,
         n_passes=n_passes, eps=eps, kappa_norm=kn,
+        eta_update_fn=eta_update_fn,
     )
 
     if verbose:

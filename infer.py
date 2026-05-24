@@ -52,6 +52,7 @@ from train import (
     format_renderer_param_lines,
     remap_checkpoint_state_dict,
     report_checkpoint_compatibility,
+    _make_eta_update_fn,
 )
 
 
@@ -102,7 +103,14 @@ def _sync(device):
         torch.cuda.synchronize()
 
 
-def run_l0_l1(img_path, device, hc_seed: HypercolumnSeed | None = None):
+def run_l0_l1(
+    img_path,
+    device,
+    hc_seed: HypercolumnSeed | None = None,
+    model=None,
+    *,
+    verbose: bool = False,
+):
 
     timings = {}
 
@@ -147,6 +155,23 @@ def run_l0_l1(img_path, device, hc_seed: HypercolumnSeed | None = None):
 
     t1 = time.perf_counter()
     seed_l1 = hc_seed if hc_seed is not None else HypercolumnSeed().to(device)
+
+    # Build η-feedback callback if model has eta_mlp
+    eta_fn = None
+    eta_state = {}
+    if (
+        model is not None
+        and getattr(model, "eta_mod_enabled", False)
+        and getattr(model, "eta_mlp", None) is not None
+    ):
+        eta_fn, eta_state = _make_eta_update_fn(
+            model, d_lum, d_chr, theta_h, bm_t,
+            P=L1.PATCH_SIZE,
+            patch_overlap=L1.PATCH_OVERLAP,
+            border_patch_max_frac=L1.BORDER_PATCH_MAX_FRAC,
+            verbose=verbose,
+        )
+
     cells = run_l1_hypercolumn(
         h2m,
         theta_h,
@@ -157,7 +182,17 @@ def run_l0_l1(img_path, device, hc_seed: HypercolumnSeed | None = None):
         border_patch_max_frac=L1.BORDER_PATCH_MAX_FRAC,
         verbose=False,
         eps=float(L1.EPS),
+        eta_update_fn=eta_fn,
     )
+
+    # If η callback ran, override l0_pix with final η-modulated pixel fields
+    if eta_state:
+        l0_pix = {
+            "h2m_lum": eta_state["h2m_lum"].detach().cpu().numpy().astype(np.float32),
+            "h2m_chr": eta_state["h2m_chr"].detach().cpu().numpy().astype(np.float32),
+            "eta_mod_map": eta_state["mod_pix"].detach().cpu().numpy().astype(np.float32),
+        }
+
     del z1, z2, h2m, theta_h, ir_t
     border_mask_saved = bm_t.cpu()
     del bm_t
@@ -251,7 +286,10 @@ def _infer_seed_and_render(
         k: (v.to(device) if isinstance(v, torch.Tensor) else v)
         for k, v in prep["cells_flat"].items()
     }
-    l0_dev = {k: v.to(device) for k, v in prep["l0_pix"].items()}
+    l0_dev = {
+        k: (v.to(device) if isinstance(v, torch.Tensor) else torch.as_tensor(v, device=device))
+        for k, v in prep["l0_pix"].items()
+    }
     proj_dev = proj_to_device(prep["proj_info"], device)
 
     if timings is not None:
@@ -269,65 +307,13 @@ def _infer_seed_and_render(
     with torch.no_grad():
         want_cell_grids = bool(return_rho_cell_grids)
 
-        # Determine which l0_pix to use (pass 1 or pass 2 with η modulation)
+        # l0_pix already contains η-modulated h2m from the GABA callback
+        # (if the model has eta_mlp); no separate pass-2 needed.
         l0_for_render = l0_dev
 
-        if (
-            getattr(model, "eta_mlp", None) is not None
-            and model.eta_mod_enabled
-            and "d_lum" in prep
-            and "border_mask" in prep
-        ):
-            from hci.L0 import compute_eta_modulation_mlp
-
-            H, W = proj_dev["H"], proj_dev["W"]
-            dtype = rho_out.dtype
-            S = int(cf_dev.get("S", max(1, W // max(nW, 1))))
-            P = int(cf_dev.get("P", S + (S - 1)))
-
-            ib_grid = cf_dev["is_border"].to(device=device).reshape(nH, nW).bool()
-
-            kappa_col = cf_dev["kappa_col_cell"].to(
-                device=device, dtype=dtype,
-            ).reshape(nH, nW)
-            z0_c = cf_dev["z0"].to(device=device, dtype=dtype).reshape(nH, nW)
-            rho_max_c = cf_dev["rho_max_cell"].to(
-                device=device, dtype=dtype,
-            ).reshape(nH, nW)
-
-            eta_lum_map, eta_chr_map, mod_pix = compute_eta_modulation_mlp(
-                model.eta_mlp,
-                kappa_col, z0_c, rho_max_c, ib_grid,
-                nH, nW, H, W, S, P,
-                eta0_lum=L0.ETA_LUM,
-                eta0_chr=L0.ETA_CHR,
-                pool_radius=int(L0.ETA_POOL_RADIUS_CELLS),
-            )
-
-            if verbose:
-                n_eta_p = sum(p.numel() for p in model.eta_mlp.parameters())
-                print(f"  η-mod: regional MLP ({n_eta_p} params)")
-                print(
-                    f"  η_lum map: [{eta_lum_map.min():.4f}, {eta_lum_map.max():.4f}]  "
-                    f"(base {L0.ETA_LUM:.4f})"
-                )
-                print(
-                    f"  η_chr map: [{eta_chr_map.min():.4f}, {eta_chr_map.max():.4f}]  "
-                    f"(base {L0.ETA_CHR:.4f})"
-                )
-                print(
-                    f"  mod_pix:   [{mod_pix.min():.4f}, {mod_pix.max():.4f}]"
-                )
-
-            border_mask = prep["border_mask"].to(device)
-            l0_pix_pass2 = fast_l0_pass2(
-                prep["d_lum"].to(device), prep["d_chr"].to(device),
-                eta_lum_map, eta_chr_map,
-                L0.GAMMA, L0.OFFSETS,
-                border_mask,
-            )
-            l0_pix_pass2["eta_mod_map"] = mod_pix
-            l0_for_render = l0_pix_pass2
+        if verbose and getattr(model, "eta_mlp", None) is not None:
+            n_eta_p = sum(p.numel() for p in model.eta_mlp.parameters())
+            print(f"  η-mod: regional MLP ({n_eta_p} params) — applied inside GABA loop")
 
         render_out = render_boundary_map_torch(
             rho_out,
@@ -503,7 +489,13 @@ def main():
         print()
 
     img_path = os.path.join(args.input_dir, args.image)
-    prep, prep_t = run_l0_l1(img_path, device, hc_seed=model.seed.hc_seed)
+    prep, prep_t = run_l0_l1(
+        img_path,
+        device,
+        hc_seed=model.seed.hc_seed,
+        model=model,
+        verbose=args.verbose,
+    )
 
     collect_diags = args.verbose or args.diagnostics
     (

@@ -16,6 +16,7 @@ Loss combines soft-Dice and per-pixel BCE on the η± valid band.
 from __future__ import annotations
 
 import argparse, gc, glob, json, os, time
+from collections.abc import Callable
 from multiprocessing import Pool, cpu_count
 
 import numpy as np
@@ -40,6 +41,7 @@ from hci.L0 import (
     EtaRegionalMLP,
 )
 from hci.L1 import (
+    build_hypercolumns,
     pad_for_patch_grid,
     run_l1_hypercolumn,
     stride_from_patch_overlap,
@@ -209,6 +211,103 @@ def build_cells_flat(cells: dict) -> dict:
     return result
 
 
+def _make_eta_update_fn(
+    model: nn.Module,
+    d_lum: torch.Tensor,
+    d_chr: torch.Tensor,
+    theta_h: torch.Tensor,
+    border_mask: torch.Tensor,
+    P: int,
+    patch_overlap: int,
+    border_patch_max_frac: float,
+    *,
+    verbose: bool = False,
+) -> tuple[Callable, dict]:
+    """Build the per-GABA-pass η feedback closure.
+
+    Each call (at the **start** of GABA pass ``t``, before that pass's ``ρ *= κ``):
+    current ``ρ_k`` and **previous** pass's ``κ`` (zeros on ``t == 0``) → MLP →
+    η_lum/η_chr maps → fast L0 pass 2 → new h2m → re-bin hypercolumns →
+    ``normalize_pre_gaba`` → new ``ρ_k`` for that pass's conv and κ gate.
+
+    Returns:
+        (eta_update_fn, state_dict) — the state_dict is populated by the last
+        callback invocation with ``"eta_lum_map"``, ``"eta_chr_map"``,
+        ``"mod_pix"``, ``"h2m_lum"``, ``"h2m_chr"`` so the caller can pass
+        the final η-modulated pixel fields to the renderer.
+    """
+    from hci.L0 import (
+        compute_eta_modulation_mlp,
+        compute_h2m_safe,
+        _naka_per_direction,
+    )
+
+    state: dict = {}
+
+    def eta_update(
+        rho_k_flat: torch.Tensor,
+        kappa_flat: torch.Tensor,
+        is_border: torch.Tensor,
+        nH: int, nW: int,
+        K: int,
+        pass_idx: int,
+    ) -> torch.Tensor:
+        device = rho_k_flat.device
+
+        ib_grid = is_border.reshape(nH, nW).bool()
+
+        kappa_cell = kappa_flat.reshape(nH, nW, K).max(dim=-1).values
+        z0_cell = rho_k_flat.reshape(nH, nW, K).sum(dim=-1)
+        rho_max_cell = rho_k_flat.reshape(nH, nW, K).max(dim=-1).values
+
+        S = stride_from_patch_overlap(P, patch_overlap)
+        H_pix, W_pix = d_lum.shape[0], d_lum.shape[1]
+
+        eta_lum_map, eta_chr_map, mod_pix = compute_eta_modulation_mlp(
+            model.eta_mlp,
+            kappa_cell, z0_cell, rho_max_cell, ib_grid,
+            nH, nW, H_pix, W_pix, S, P,
+            eta0_lum=L0.ETA_LUM,
+            eta0_chr=L0.ETA_CHR,
+            pool_radius=int(L0.ETA_POOL_RADIUS_CELLS),
+        )
+
+        if verbose:
+            print(
+                f"    GABA pass {pass_idx}: "
+                f"η_lum [{eta_lum_map.min():.4f}, {eta_lum_map.max():.4f}]  "
+                f"η_chr [{eta_chr_map.min():.4f}, {eta_chr_map.max():.4f}]  "
+                f"mod [{mod_pix.min():.4f}, {mod_pix.max():.4f}]",
+            )
+
+        h_lum = _naka_per_direction(d_lum, eta_lum_map, L0.GAMMA, device)
+        h_chr = _naka_per_direction(d_chr, eta_chr_map, L0.GAMMA, device)
+        h2m_lum = compute_h2m_safe(h_lum, L0.OFFSETS)
+        h2m_chr = compute_h2m_safe(h_chr, L0.OFFSETS)
+        h2m_lum = h2m_lum.clone()
+        h2m_lum[border_mask] = 0.0
+        h2m_chr = h2m_chr.clone()
+        h2m_chr[border_mask] = 0.0
+        h2m_new = h2m_lum + h2m_chr
+
+        state["eta_lum_map"] = eta_lum_map
+        state["eta_chr_map"] = eta_chr_map
+        state["mod_pix"] = mod_pix
+        state["h2m_lum"] = h2m_lum
+        state["h2m_chr"] = h2m_chr
+
+        hc_new = build_hypercolumns(
+            h2m_new, theta_h, border_mask,
+            P=P, patch_overlap=patch_overlap,
+            border_patch_max_frac=border_patch_max_frac,
+            K=K,
+        )
+        rho_k_new = model.seed.hc_seed.normalize_pre_gaba(hc_new["rho_k"])
+        return rho_k_new
+
+    return eta_update, state
+
+
 def run_l1_live_cells(
     model: nn.Module,
     h2m: torch.Tensor,
@@ -216,8 +315,31 @@ def run_l1_live_cells(
     border_mask: torch.Tensor,
     H0: int,
     W0: int,
+    d_lum: torch.Tensor | None = None,
+    d_chr: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Run L1 with ``model.seed.hc_seed``; tensors stay on ``h2m.device`` for autograd."""
+    """Run L1 with ``model.seed.hc_seed``; tensors stay on ``h2m.device`` for autograd.
+
+    When ``d_lum`` / ``d_chr`` are provided and the model has ``eta_mlp``,
+    each GABA pass updates η_lum/η_chr via the MLP, re-runs L0, and re-bins
+    hypercolumns so the recurrence sees the effect of η feedback.
+    """
+    # Build eta callback if the model supports it and we have L0 data
+    eta_fn = None
+    eta_state = {}
+    if (
+        getattr(model, "eta_mod_enabled", False)
+        and getattr(model, "eta_mlp", None) is not None
+        and d_lum is not None
+        and d_chr is not None
+    ):
+        eta_fn, eta_state = _make_eta_update_fn(
+            model, d_lum, d_chr, theta_h, border_mask,
+            P=L1.PATCH_SIZE,
+            patch_overlap=L1.PATCH_OVERLAP,
+            border_patch_max_frac=L1.BORDER_PATCH_MAX_FRAC,
+        )
+
     cells = run_l1_hypercolumn(
         h2m,
         theta_h,
@@ -229,6 +351,7 @@ def run_l1_live_cells(
         verbose=False,
         eps=float(L1.EPS),
         cells_format="torch",
+        eta_update_fn=eta_fn,
     )
     P = int(cells["P"])
     nH, nW = int(cells["nH"]), int(cells["nW"])
@@ -237,7 +360,7 @@ def run_l1_live_cells(
     ib_hw = cells["is_border"].reshape(nH, nW)
     out_b = ib_hw | (cy_hw + P / 2 > float(H0)) | (cx_hw + P / 2 > float(W0))
     cells["is_border"] = out_b.reshape(-1)
-    return build_cells_flat(cells)
+    return build_cells_flat(cells), eta_state
 
 
 class HarmonicContourE2E(nn.Module):
@@ -268,20 +391,20 @@ class HarmonicContourE2E(nn.Module):
             self.eta_mlp = EtaRegionalMLP()
 
     def forward_batch(self, meta_list):
-        """Render boundary maps; each ``meta`` carries ``cells_flat_dev`` from live L1.
+        """Render boundary maps.
 
-        ``prepare_batch`` runs ``run_l1_live_cells`` so ``η_z`` and collinear
-        ``α`` participate in the graph.  Pass-2 ``h2m_*`` from ``fast_l0_pass2``
-        stay **in the graph** (``compute_h2m_safe`` prevents ``sqrt(0)`` grad
-        blow-up) so ``eta_mlp`` receives gradients through the NR → h2m → bmap
-        path.  ``mod_pix`` is also fed as the 15th renderer feature.
+        ``prepare_batch`` runs ``run_l1_live_cells`` with the η feedback
+        callback interleaved into each GABA pass.  By the time we get here,
+        ``cells_flat_dev`` contains ρ/θ/κ that already reflect the evolved
+        η modulation, and ``l0_pix`` contains the matching η-modulated
+        ``h2m_lum``/``h2m_chr`` plus ``mod_pix`` as ``eta_mod_map``.
+        One render pass suffices.
         """
         bmaps = []
         for m in meta_list:
             cf_flat = m["cells_flat_dev"]
             rho_out, branch, _, _, _, _, _ = self.seed(cells_flat=cf_flat)
 
-            # Pass 1: render with precomputed l0_pix to get κ_col and E_col
             bmap = render_boundary_map_torch(
                 rho_out,
                 m["proj_dev"],
@@ -296,70 +419,6 @@ class HarmonicContourE2E(nn.Module):
                 content_h=m["H0"],
                 content_w=m["W0"],
             )
-
-            # Pass 2: η modulation if enabled and data available
-            has_pass2_data = (
-                self.eta_mod_enabled
-                and "d_lum" in m
-                and "d_chr" in m
-                and "border_mask" in m
-            )
-            if has_pass2_data:
-                nH = int(cf_flat["nH"])
-                nW = int(cf_flat["nW"])
-                S = int(cf_flat.get("S", max(1, m["proj_dev"]["W"] // max(nW, 1))))
-                P = int(cf_flat.get("P", S + (S - 1)))
-                device = rho_out.device
-                dtype = rho_out.dtype
-                ib_grid = cf_flat["is_border"].to(device=device).reshape(nH, nW).bool()
-
-                kappa_col = cf_flat["kappa_col_cell"].to(
-                    device=device, dtype=dtype,
-                ).reshape(nH, nW)
-                z0_c = cf_flat["z0"].to(device=device, dtype=dtype).reshape(nH, nW)
-                rho_max_c = cf_flat["rho_max_cell"].to(
-                    device=device, dtype=dtype,
-                ).reshape(nH, nW)
-
-                H, W = m["proj_dev"]["H"], m["proj_dev"]["W"]
-                eta_lum_map, eta_chr_map, mod_pix = compute_eta_modulation_mlp(
-                    self.eta_mlp,
-                    kappa_col, z0_c, rho_max_c, ib_grid,
-                    nH, nW, H, W, S, P,
-                    eta0_lum=L0.ETA_LUM,
-                    eta0_chr=L0.ETA_CHR,
-                    pool_radius=int(L0.ETA_POOL_RADIUS_CELLS),
-                )
-
-                # Fast L0 pass 2: reuse d_lum/d_chr, apply modulated η.
-                # h2m stays in graph (compute_h2m_safe floors sqrt to avoid
-                # ∞ grad at zero-energy pixels) so loss → h2m → NR → η_map
-                # → eta_mlp gradients flow.
-                l0_pix_pass2 = fast_l0_pass2(
-                    m["d_lum"], m["d_chr"],
-                    eta_lum_map, eta_chr_map,
-                    L0.GAMMA, L0.OFFSETS,
-                    m["border_mask"],
-                )
-                # mod_pix ([0,1] factor) as the 15th renderer feature;
-                # h2m_lum / h2m_chr carry grad through the NR path.
-                l0_pix_pass2["eta_mod_map"] = mod_pix
-
-                # Re-render with updated h2m + η_mod feature for thinning MLP
-                bmap = render_boundary_map_torch(
-                    rho_out,
-                    m["proj_dev"],
-                    self.renderer,
-                    cf_flat,
-                    m["Hp"],
-                    m["Wp"],
-                    l0_pix_pass2,
-                    eps=self.render_eps,
-                    training=self.training,
-                    branch_pick=branch.reshape(-1).long(),
-                    content_h=m["H0"],
-                    content_w=m["W0"],
-                )
 
             bmaps.append(bmap)
         return bmaps
@@ -378,7 +437,11 @@ def prepare_batch(items, device, model: nn.Module):
             )
         else:
             bm_d = border_mask.to(device=device).bool()
-        cf_flat = run_l1_live_cells(model, h2m_d, theta_d, bm_d, int(H0), int(W0))
+        cf_flat, eta_state = run_l1_live_cells(
+            model, h2m_d, theta_d, bm_d, int(H0), int(W0),
+            d_lum=d_lum.to(device) if d_lum is not None else None,
+            d_chr=d_chr.to(device) if d_chr is not None else None,
+        )
         cf_dev = {
             k: (v.to(device) if isinstance(v, torch.Tensor) else v)
             for k, v in cf_flat.items()
@@ -386,6 +449,13 @@ def prepare_batch(items, device, model: nn.Module):
         l0_dev = {
             k: v.to(device) for k, v in l0_pix.items()
         }
+        # If η callback ran, override l0_pix with the final η-modulated h2m
+        if eta_state:
+            l0_dev = {
+                "h2m_lum": eta_state["h2m_lum"],
+                "h2m_chr": eta_state["h2m_chr"],
+                "eta_mod_map": eta_state["mod_pix"],
+            }
         p_dev = proj_to_device(gi, device)
         m = {
             "nH": cf_flat["nH"],
