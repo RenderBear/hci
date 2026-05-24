@@ -83,87 +83,6 @@ def _interior_vmin_vmax(arr: np.ndarray, interior: np.ndarray) -> tuple[float, f
     return vmin, vmax
 
 
-def viz_l1_lambdas_three(
-    lam1: np.ndarray,
-    lam2: np.ndarray,
-    lam3: np.ndarray,
-    is_border: np.ndarray,
-    out_path: str,
-    suptitle: str,
-    *,
-    panel_titles: tuple[str, str, str] | None = None,
-) -> None:
-
-    cmap = "coolwarm"
-    a1 = apply_border_zero(lam1, is_border)
-    a2 = apply_border_zero(lam2, is_border)
-    a3 = apply_border_zero(lam3, is_border)
-    interior = ~np.asarray(is_border, dtype=bool)
-
-    t1, t2, t3 = panel_titles or (
-        r"$\lambda_1$ (branch 0)",
-        r"$\lambda_2$ (branch 1)",
-        r"$\lambda_3$ (smallest eigenvalue)",
-    )
-    panels = [
-        (a1, t1),
-        (a2, t2),
-        (a3, t3),
-    ]
-
-    fig, axes = plt.subplots(3, 1, figsize=(5.5, 5.2 * 3), facecolor=VIZ.BG)
-    axes_flat = np.atleast_1d(axes).ravel()
-
-    for ax, (arr, title_base) in zip(axes_flat, panels):
-        ax.set_facecolor(VIZ.PANEL_BG)
-        ax.axis("off")
-        vmin, vmax = _interior_vmin_vmax(arr, interior)
-        im = ax.imshow(
-            arr,
-            cmap=cmap,
-            vmin=vmin,
-            vmax=vmax,
-            interpolation="nearest",
-        )
-        ax.set_title(
-            f"{title_base}\ninterior min={vmin:.4g}  max={vmax:.4g}",
-            fontsize=9,
-            color=VIZ.FG,
-            fontfamily="monospace",
-        )
-        cbar = fig.colorbar(
-            im,
-            ax=ax,
-            fraction=0.035,
-            pad=0.02,
-            shrink=0.82,
-        )
-        cbar.outline.set_edgecolor(VIZ.ACCENT)
-        cbar.ax.tick_params(colors=VIZ.FG, labelsize=7)
-
-    fig.suptitle(
-        f"{suptitle}  (each row: own min→max; red=max, blue=min)",
-        fontsize=10,
-        color=VIZ.FG,
-        fontfamily="monospace",
-        y=0.995,
-    )
-    fig.text(
-        0.5,
-        0.008,
-        "Legend: coolwarm on interior cells — blue = minimum, red = maximum "
-        "(separate scale per λ; border cells masked).",
-        ha="center",
-        va="bottom",
-        fontsize=8,
-        color=VIZ.FG,
-        fontfamily="monospace",
-    )
-    fig.tight_layout(rect=[0, 0.04, 1, 0.96])
-    fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
-    plt.close(fig)
-
-
 def viz_rho_branch_grid(
     grids,
     titles,
@@ -605,14 +524,14 @@ def viz_infer_kappa_pass0_final_dual_maps(
     out_path: str,
     *,
     n_collinear_passes: int,
+    kappa_vmax: float | None = None,
 ) -> None:
-    """Per-cell κ: first vs last GABA pass (diagnostic bin-mass share).
+    """Per-cell ``κ`` = cosine ``(ρ·S)/(‖ρ‖‖S‖)`` (first vs last pass), in ``[0,1]``.
 
-    ``κ`` is ``ρ_k / Σ_j ρ_j`` at each pass after NR (value at the post-recurrence
-    dominant bin is plotted).  Higher values mean a **sharper** orientation
-    profile at that cell (more mass in the winning bin relative to the sum).
-    Both panels use a fixed [0, 1] intensity scale.
+    Same definition as the η-MLP input before pooling.  Color scale defaults to
+    ``[0,1]`` (override ``kappa_vmax`` for a wider display range).
     """
+    kmax = float(kappa_vmax if kappa_vmax is not None else 1.0)
     k0 = apply_border_zero(np.asarray(kappa_pass0, dtype=np.float64), is_border)
     k1 = apply_border_zero(np.asarray(kappa_final, dtype=np.float64), is_border)
 
@@ -628,24 +547,24 @@ def viz_infer_kappa_pass0_final_dual_maps(
         t_final = str(n_p - 1)
         pass_note = f"{n_p} collinear passes"
     titles = (
-        r"$\kappa$ at winner bin — GABA pass $t=0$ (first)",
-        rf"$\kappa$ at winner bin — GABA pass $t={t_final}$ (final)",
+        r"$\kappa$ — $\rho \cdot S / (\|\rho\|\|S\|)$ after first pass",
+        rf"$\kappa$ — same after last pass ($t={t_final}$)",
     )
     ims = []
     for ax, arr, title in zip(axes, (k0, k1), titles):
         ax.set_facecolor(VIZ.PANEL_BG)
         im = ax.imshow(
-            np.clip(arr, 0.0, 1.0),
+            np.clip(arr, 0.0, kmax),
             cmap="magma",
             vmin=0.0,
-            vmax=1.0,
+            vmax=kmax,
             interpolation="nearest",
         )
         ims.append(im)
         ax.set_title(title, fontsize=9, color=VIZ.FG, fontfamily="monospace")
         ax.axis("off")
     fig.suptitle(
-        "cell diagnostic $\\kappa$ (bin mass share at post-recurrence winner bin) — "
+        "cell diagnostic $\\kappa$ (cosine $\\rho$ vs collinear pool $S$; η-MLP input) — "
         f"first vs final pass  ({pass_note})",
         fontsize=10,
         color=VIZ.FG,
@@ -663,7 +582,7 @@ def viz_infer_kappa_pass0_final_dual_maps(
         aspect=36,
     )
     cbar.set_label(
-        r"$\kappa$  (share of mass in winner bin; 0 diffuse $\rightarrow$ 1 peaked)",
+        rf"$\kappa$  (alignment in $[0,1]$; vmax={kmax:g})",
         color=VIZ.FG,
         fontsize=9,
         fontfamily="monospace",
@@ -920,80 +839,66 @@ def viz_infer_l0_pinwheel(
     viz_l0_pinwheel(h_np, img_pinwheel, out_path)
 
 
-def viz_infer_l1_lambdas(
-    lam: np.ndarray,
-    lam3: np.ndarray,
+def viz_infer_gaba_geometry(
+    sk_max: np.ndarray,
+    sbar: np.ndarray,
     is_border: np.ndarray,
     out_path: str,
     *,
-    z0_grid: np.ndarray | None = None,
+    n_collinear_passes: int | None = None,
 ) -> None:
-    r"""L1 cell-grid diagnostics.
+    r"""Single figure: $\max_k \tilde{S}_k$ and LOO $\bar{S}_{k^*}$ (at seed-$\rho$ dominant $k^*$) on pass 0."""
+    ib = np.asarray(is_border, dtype=bool)
+    sk_a = np.asarray(sk_max, dtype=np.float64)
+    sb_a = np.asarray(sbar, dtype=np.float64)
+    if ib.ndim == 1 and sk_a.ndim == 2:
+        ib = ib.reshape(sk_a.shape)
+    ib = np.asarray(ib, dtype=bool)
+    sk = apply_border_zero(sk_a, ib)
+    sb = apply_border_zero(sb_a, ib)
+    interior = ~ib
 
-    Supports legacy ``lam`` shape ``(nH, nW, 2)`` (eigenvalues) and hypercolumn
-    flat layout ``(nH*nW, 2)`` (duplicate dominant ρ per renderer branch).
-    Third row: ``lam3`` (legacy λ₃), or ``z0`` patch total energy when
-    ``z0_grid`` is provided (same length as flattened cell grid).
-    """
-    lam = np.asarray(lam, dtype=np.float64)
-    lam3 = np.asarray(lam3, dtype=np.float64)
-    is_b = np.asarray(is_border, dtype=bool)
-
-    nH, nW = lam3.shape[:2]
-
-    if lam.ndim == 2 and lam.shape[0] == nH * nW and lam.shape[1] >= 2:
-        lam = lam.reshape(nH, nW, lam.shape[1])
-    elif lam.ndim != 3:
-        raise ValueError(
-            f"lam must be (nH, nW, C) or (nH*nW, C); got {lam.shape} with lam3 {lam3.shape}"
-        )
-
-    if is_b.ndim == 1 and is_b.size == nH * nW:
-        is_b = is_b.reshape(nH, nW)
-
-    lam1 = lam[..., 0]
-    lam2 = lam[..., min(1, lam.shape[-1] - 1)]
-
-    if z0_grid is not None:
-        z0 = np.asarray(z0_grid, dtype=np.float64).ravel()
-        lam3_plot = z0.reshape(nH, nW) if z0.size == nH * nW else lam3
-        z0_ok = z0.size == nH * nW
-    else:
-        lam3_plot = lam3
-        z0_ok = False
-
-    hyper = lam.shape[-1] >= 2 and np.allclose(lam[..., 0], lam[..., 1], equal_nan=True)
-    if hyper:
-        third_title = (
-            r"$z_0$ (patch total oriented energy, pre-$\eta_z$)"
-            if z0_ok
-            else r"$\lambda_3$ / placeholder (no $z_0$ for this grid)"
-        )
-        panel_titles = (
-            r"$\rho_{\mathrm{dom}}$ (branch 0, scalar readout)",
-            r"$\rho_{\mathrm{dom}}$ (branch 1, duplicate)",
-            third_title,
-        )
-        suptitle = (
-            r"L1 hypercolumn — dominant $\rho$ on cell grid "
-            r"(renderer API uses two identical branches)"
-        )
-    else:
-        panel_titles = None
-        suptitle = (
-            r"L1 $\lambda$ (not the L2 seed; seed is "
-            r"$\lambda_k/(\lambda_1+\lambda_2+\eta_z)$)"
-        )
-
-    viz_l1_lambdas_three(
-        lam1,
-        lam2,
-        lam3_plot,
-        is_b,
-        out_path,
-        suptitle,
-        panel_titles=panel_titles,
+    pass_note = (
+        f" (first of {int(n_collinear_passes)} collinear passes)"
+        if n_collinear_passes is not None
+        else " (first collinear pass)"
     )
+
+    fig, axes = plt.subplots(
+        1, 2, figsize=(12.4, 5.4), facecolor=VIZ.BG,
+    )
+    panels: list[tuple[np.ndarray, str]] = [
+        (sk, r"$\max_k \tilde{S}_k^{(0)}$ — $G_k * \rho_k$ (unnormalized)"),
+        (sb, r"$\bar{S}_{k^*}^{(0)}$ at seed-$\rho$ dominant $k^*$ — LOO $\frac{1}{K-1}\sum_{j\neq k^*} S_j$"),
+    ]
+    for ax, (arr, title) in zip(axes, panels):
+        ax.set_facecolor(VIZ.PANEL_BG)
+        vmin, vmax = _interior_vmin_vmax(arr, interior)
+        im = ax.imshow(
+            arr,
+            cmap="magma",
+            vmin=vmin,
+            vmax=vmax,
+            interpolation="nearest",
+        )
+        ax.set_title(
+            f"{title}{pass_note}\nmin={vmin:.4g}  max={vmax:.4g}",
+            fontsize=9,
+            color=VIZ.FG,
+            fontfamily="monospace",
+        )
+        ax.axis("off")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+
+    fig.suptitle(
+        "L1 collinear geometry (first pass)" + pass_note,
+        fontsize=10,
+        color=VIZ.FG,
+        fontfamily="monospace",
+    )
+    fig.tight_layout(rect=[0, 0.02, 1, 0.92])
+    fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
+    plt.close(fig)
 
 
 def viz_l2_bimodality_per_iter(

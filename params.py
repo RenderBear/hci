@@ -1,8 +1,8 @@
 r"""Shared pipeline hyperparameters, module inits, and script defaults.
 
-L1 builds cos² hypercolumns → η_z divisive NR on raw bins (pre-GABA) → logit-space
-GABA recurrence (learned β_seed, β_coll, β_cross on collinear pool / cross-orientation).
-Diagnostic ``κ`` after GABA is a peakedness ratio on the final ``ρ_k`` profile.
+L1 builds cos² hypercolumns → **scalar** ``η_z`` **seed NR** on raw ``μ`` → raw β +
+**spatial** ``η=η₀·σ(``MLP``(``pooled κ, \\bar z``))`` from the **first collinear pass** on.
+``κ`` is cosine ``(ρ·S)/(‖ρ‖‖S‖)``; ``\\bar z`` pools ``Σ_k u_k`` (not used for seed ``η``).
 The renderer interpolates ρ, θ, κ and applies ``h2m·ρ̄·gate`` (14-D readout, no η_mod).
 
 Training disk cache: ``TRAIN.CACHE_VERSION`` invalidates stored L0 tensors used
@@ -41,18 +41,22 @@ L1 = SimpleNamespace(
     COL_SIGMA_D=None,       # default: R/2 inside L1
     COL_SIGMA_T=1.0,
     COL_PASSES=5,
+    # Mean-pool radius for GABA η MLP inputs (kernel 2*r+1 = 21 → r=10).
+    GABA_ETA_POOL_RADIUS=10,
 )
 
-# ── SEED: tile geometry + learned η_z (HypercolumnSeed); no separate dynamics ─
+# ── SEED: tile geometry + η_z (seed) + η₀ + GABA η-MLP + β (HypercolumnSeed) ───
 SEED = SimpleNamespace(
     R_POOL=10,
     STRIDE=7,
     EPS=1e-9,
-    # Softplus(·) → η_z for pre-GABA NR; keep O(1) vs typical cos² patch ρ_k (not ≫1).
-    ETA_Z_INIT=5.0,
-    # Logit-space GABA recurrence betas (softplus → positive)
-    BETA_SEED_INIT=1.0,
-    BETA_COLL_INIT=0.3,
+    # Base scale η₀ in η = η₀·σ(MLP) on collinear passes (softplus of raw).
+    # Scalar seed η_z uses the **same** initial positive value unless you pass
+    # ``eta_z_init`` / ``eta_pass_init`` to ``HypercolumnSeed``.
+    ETA0_INIT=5.0,
+    # Raw-space recurrence weights (softplus → positive)
+    BETA_SEED_INIT=0.3,
+    BETA_COLL_INIT=0.5,
     BETA_CROSS_INIT=0.3,
 )
 
@@ -72,7 +76,7 @@ TRAIN = SimpleNamespace(
     NUM_WORKERS=2,
     LAM_DICE=0.0,
     LAM_BCE=1.0,
-    CACHE_VERSION=18,
+    CACHE_VERSION=23,
 )
 
 # ── Inference ────────────────────────────────────────────────────────────────

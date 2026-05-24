@@ -32,7 +32,7 @@ from hci.renderer import (
 )
 from hci.diagnostics_viz import (
     viz_infer_l0_pinwheel,
-    viz_infer_l1_lambdas,
+    viz_infer_gaba_geometry,
     viz_infer_kappa_pass0_final_dual_maps,
     viz_infer_rho_map_hist_cdf,
     viz_infer_rho_post_minus_pre_map_hist_cdf,
@@ -84,7 +84,7 @@ def build_model(ckpt, device):
         r_pool=SEED.R_POOL,
         stride=SEED.STRIDE,
         eps=SEED.EPS,
-        eta_z_init=SEED.ETA_Z_INIT,
+        eta_z_init=None,
         render_cell_hidden=RENDER.CELL_HIDDEN,
         render_pixel_hidden=RENDER.PIXEL_HIDDEN,
     )
@@ -184,9 +184,8 @@ def run_l0_l1(
     N = nH * nW
     cells_flat = build_cells_flat(cells)
 
-    lam_grid = cells["lam"].astype(np.float64, copy=True)
-    lam3_grid = cells["lam3"].astype(np.float64, copy=True)
-    z0_grid = cells["z0"].astype(np.float64, copy=True)
+    sk_max_grid = np.asarray(cells["sk_max_cell"], dtype=np.float64).copy()
+    sbar_grid = np.asarray(cells["sbar_cell"], dtype=np.float64).copy()
     rho_initial_grid = np.asarray(
         cells["rho_initial_cell"], dtype=np.float64,
     ).copy()
@@ -213,9 +212,8 @@ def run_l0_l1(
         "W0": W0,
         "nH": nH,
         "nW": nW,
-        "lam_grid": lam_grid,
-        "lam3_grid": lam3_grid,
-        "z0_grid": z0_grid,
+        "sk_max_grid": sk_max_grid,
+        "sbar_grid": sbar_grid,
         "rho_initial_grid": rho_initial_grid,
         "kappa_pass0_grid": kappa_pass0_grid,
         "kappa_final_grid": kappa_final_grid,
@@ -426,7 +424,8 @@ def main():
         "-d",
         "--diagnostics",
         action="store_true",
-        help="Save additional diagnostics: base, l0_pinwheel, l1_lambdas, "
+        help="Save additional diagnostics: base, l0_pinwheel, "
+        "geometry.png (first-pass $\\max_k \\tilde{S}_k$ and LOO $\\bar{S}_{k^*}$ at seed-$\\rho$ dominant $k^*$), "
         "rho (map+histogram+CDF), L1 pre/post GABA ρ (dual map + hist/CDF), "
         "Δρ map+histogram+CDF (rho_delta.png), "
         "κ first vs final GABA pass at post-dominant bin (kappa.png), "
@@ -516,15 +515,15 @@ def main():
         viz_infer_l0_pinwheel(prep["h_np"], prep["img_pinwheel"], p_pin)
         saved_files.append(p_pin)
 
-        p_lam = os.path.join(od, f"{stem}_l1_lambdas.png")
-        viz_infer_l1_lambdas(
-            prep["lam_grid"],
-            prep["lam3_grid"],
+        p_geom = os.path.join(od, f"{stem}_geometry.png")
+        viz_infer_gaba_geometry(
+            prep["sk_max_grid"],
+            prep["sbar_grid"],
             is_border,
-            p_lam,
-            z0_grid=prep["z0_grid"],
+            p_geom,
+            n_collinear_passes=n_gaba_passes,
         )
-        saved_files.append(p_lam)
+        saved_files.append(p_geom)
 
         p_rho = os.path.join(od, f"{stem}_rho.png")
         viz_infer_rho_map_hist_cdf(rho_post, is_border, p_rho, eta_z=eta_z)

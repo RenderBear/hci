@@ -56,7 +56,7 @@ def build_model(ckpt, device):
         r_pool=SEED.R_POOL,
         stride=SEED.STRIDE,
         eps=SEED.EPS,
-        eta_z_init=SEED.ETA_Z_INIT,
+        eta_z_init=None,
         render_cell_hidden=RENDER.CELL_HIDDEN,
         render_pixel_hidden=RENDER.PIXEL_HIDDEN,
     )

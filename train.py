@@ -1,7 +1,7 @@
 r"""train.py — harmonic-contour-integration: L1 hypercolumns + render.
 
 Pipeline per image: L0 (partially cached) → **L1 live in the training step**
-(cos² hypercolumns, NR vs ``η_z``, logit GABA with learned β, dominant θ/ρ/κ)
+(cos² hypercolumns, spatial ``η=η₀·σ(``MLP``(``κ,z``))`` NR + raw β GABA, dominant θ/ρ/κ)
 → **renderer** (interp + thinning MLP).  The disk cache stores L0 inputs for L1
 (``h2m``, ``theta_h``, ``border_mask``) plus ``l0_pix``, GT, geometry — **not**
 precomputed ``cells_flat``.
@@ -205,7 +205,7 @@ class HarmonicContourE2E(nn.Module):
         r_pool: int,
         stride: int,
         eps: float,
-        eta_z_init: float = SEED.ETA_Z_INIT,
+        eta_z_init: float | None = None,
         render_cell_hidden: int = RENDER.CELL_HIDDEN,
         render_pixel_hidden: int = RENDER.PIXEL_HIDDEN,
     ):
@@ -610,17 +610,19 @@ def bce_loss_with_ignore(
 
 
 def remap_checkpoint_state_dict(sd: dict) -> dict:
-    """Load STRIATE ``dynamics._eta_z`` into ``seed.hc_seed``; drop other dynamics keys.
+    """Remap legacy dynamics/eta keys; warm-start ``_eta0_raw`` / ``_eta_z_raw`` when absent.
 
-    ``seed._eta_rho_raw`` / ``dynamics._eta_rho_raw`` are omitted — NR pool on
-    the seed was removed; those tensors are not loaded.  Legacy ``eta_mod_*``,
-    ``eta_mlp.*``, and removed ``seed.hc_seed._gaba_alpha_raw`` keys are dropped.
+    ``seed._eta_rho_raw`` / ``dynamics._eta_rho_raw`` are omitted.  Legacy ``eta_mod_*``,
+    ``eta_mlp.*``, and ``seed.hc_seed._gaba_alpha_raw`` are dropped.
 
-    Learned η_z lives on ``HypercolumnSeed`` inside ``RhoSeedModule``; legacy
-    checkpoints may use ``dynamics._eta_z_raw`` or flat ``seed._eta_z_raw``.
+    Legacy ``*_eta_z_raw`` seeds **scalar** ``η_z`` (seed NR).  Old ``_eta_pass_raw`` /
+    merged ``_eta0_raw``-only checkpoints also seed ``η₀`` (MLP scale); missing ``_eta_z_raw``
+    is duplicated from ``_eta0_raw`` when needed.
     """
     skip = frozenset({"seed._eta_rho_raw", "dynamics._eta_rho_raw"})
     out: dict = {}
+    legacy_eta_raw: torch.Tensor | None = None
+    legacy_eta_pass_raw: torch.Tensor | None = None
     for k, v in sd.items():
         if k in skip:
             continue
@@ -630,14 +632,25 @@ def remap_checkpoint_state_dict(sd: dict) -> dict:
             continue
         if k == "seed.hc_seed._gaba_alpha_raw":
             continue
-        if k == "dynamics._eta_z_raw":
-            out["seed.hc_seed._eta_z_raw"] = v
-        elif k == "seed._eta_z_raw":
-            out["seed.hc_seed._eta_z_raw"] = v
-        elif k.startswith("dynamics."):
+        if k == "seed.hc_seed._eta_pass_raw":
+            legacy_eta_pass_raw = v
             continue
-        else:
-            out[k] = v
+        if k in ("dynamics._eta_z_raw", "seed._eta_z_raw", "seed.hc_seed._eta_z_raw"):
+            legacy_eta_raw = v
+            continue
+        if k.startswith("dynamics."):
+            continue
+        out[k] = v
+    if "seed.hc_seed._eta0_raw" not in out:
+        if legacy_eta_pass_raw is not None and legacy_eta_pass_raw.numel() >= 1:
+            out["seed.hc_seed._eta0_raw"] = legacy_eta_pass_raw.reshape(-1)[0].clone()
+        elif legacy_eta_raw is not None and legacy_eta_raw.numel() >= 1:
+            out["seed.hc_seed._eta0_raw"] = legacy_eta_raw.reshape(-1)[0].clone()
+    if "seed.hc_seed._eta_z_raw" not in out:
+        if legacy_eta_raw is not None and legacy_eta_raw.numel() >= 1:
+            out["seed.hc_seed._eta_z_raw"] = legacy_eta_raw.reshape(-1)[0].clone()
+        elif "seed.hc_seed._eta0_raw" in out:
+            out["seed.hc_seed._eta_z_raw"] = out["seed.hc_seed._eta0_raw"].clone()
     return out
 
 
@@ -675,14 +688,22 @@ def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
 
     print("\n--- seed + renderer grad debug ---")
     print("\n  learned (value):")
-    print(f"    eta_z={float(s.eta_z.detach()):.4f}")
+    print(
+        f"    η_z={float(s.hc_seed.eta_z.detach()):.4f}  "
+        f"η₀={float(s.hc_seed.eta0.detach()):.4f}",
+    )
     print("\n  |grad| on raw params:")
-    for raw, label in (("_eta_z_raw", "eta_z"),):
-        t = getattr(s, raw, None)
+    for raw, label in (("_eta_z_raw", "η_z"), ("_eta0_raw", "η₀")):
+        t = getattr(s.hc_seed, raw, None)
         if t is None or t.grad is None:
             print(f"    {label}: grad=None")
         else:
             print(f"    {label}: |grad|={t.grad.abs().mean().item():.2e}")
+    for name, t in s.hc_seed.gaba_eta_mlp.named_parameters():
+        if t.grad is None:
+            print(f"    gaba_eta_mlp.{name}: grad=None")
+        else:
+            print(f"    gaba_eta_mlp.{name}: |grad|={t.grad.abs().mean().item():.2e}")
     for name, t in model.renderer.thinning.named_parameters():
         if t.grad is None:
             print(f"    thinning.{name}: grad=None")
@@ -762,12 +783,14 @@ def plot_training_curves(history, out_dir):
 
 
 def format_seed_param_lines(seed: RhoSeedModule, *, indent: str = "  ") -> list[str]:
-    """Learned NR seed scalars (infer / train logging)."""
+    """Learned GABA η-head + β (infer / train logging)."""
     hc = seed.hc_seed
     sig_d, sig_t = hc.collinear_sigmas(float(L1.COL_RADIUS))
+    n_mlp = sum(p.numel() for p in hc.gaba_eta_mlp.parameters())
     return [
         f"{indent}tile geometry:  R={seed.R}  stride={seed.stride}",
-        f"{indent}NR + GABA logits:  η_z={seed.eta_z.item():.3f}  "
+        f"{indent}seed η_z:  {hc.eta_z.item():.3f}  |  GABA:  η₀={hc.eta0.item():.3f}  "
+        f"pool_r={hc.gaba_eta_pool_r}  MLP(2→8→1) params={n_mlp}  "
         f"β_seed={hc.beta_seed.item():.3f}  β_coll={hc.beta_coll.item():.3f}  "
         f"β_cross={hc.beta_cross.item():.3f}",
         f"{indent}collinear σ:  σ_d={sig_d.item():.3f}  σ_t={sig_t.item():.3f}  "
@@ -781,7 +804,7 @@ def format_renderer_param_lines(r: ModulationRenderer, *, indent: str = "  ") ->
     return [
         f"{indent}readout:  tang/norm h2m stencils (s_t, s_n) + 14-D gate",
         f"{indent}thinning head:  14→8→1 MLP  ({n_th} params)  + stencil spacings ({n_st})",
-        f"{indent}κ_col:  diagnostic peakedness from L1 (cells_flat; not a recurrence gate)",
+        f"{indent}κ_col:  cosine ρ vs S from L1 (cells_flat; not a recurrence gate)",
     ]
 
 
@@ -790,7 +813,8 @@ def _format_seed_block(model: HarmonicContourE2E) -> str:
     parts = [
         "\n--- L1 seed (NR) ---\n",
         *[ln + "\n" for ln in format_seed_param_lines(s, indent="")],
-        "\nρ: pre-GABA NR → logit GABA (β weights) → dominant ρ × tile_interior\n",
+        "\nρ: raw → scalar η_z (seed NR) → detached ρ_seed → passes: u + η₀·σ(MLP) NR "
+        "→ dominant ρ × tile_interior\n",
     ]
     return "".join(parts)
 
@@ -890,8 +914,8 @@ def main():
     )
     print(
         f"Seed: R={SEED.R_POOL}  stride={SEED.STRIDE}  "
-        f"ρ = pre-GABA NR(η_z) → logit GABA (β) → dominant λ  × tile_interior  "
-        f"(learned η_z, β_seed/coll/cross)"
+        f"ρ = raw → scalar η_z NR → … → dominant λ  × tile_interior  "
+        f"(η_z seed, η₀·σ(MLP) from pass 1 on, β_seed/coll/cross)"
     )
     print(
         f"Render: harmonic-native h2m·gate  "
@@ -927,7 +951,7 @@ def main():
         r_pool=SEED.R_POOL,
         stride=SEED.STRIDE,
         eps=SEED.EPS,
-        eta_z_init=SEED.ETA_Z_INIT,
+        eta_z_init=None,
         render_cell_hidden=RENDER.CELL_HIDDEN,
         render_pixel_hidden=RENDER.PIXEL_HIDDEN,
     ).to(device)

@@ -1,17 +1,16 @@
 r"""Seed module — thin wrapper providing renderer-compatible interface.
 
-HypercolumnSeed holds learned η_z (divisive NR on raw bins), collinear σ scales,
-and logit-space β weights used in ``run_l1_hypercolumn``.  Stored ``κ`` in
-``cells_flat`` is a **diagnostic** (peakedness or pass-0 pool support), not a
-recurrence gate in the old cosine sense.
+HypercolumnSeed holds learnable **scalar** ``η_z`` (seed NR only), ``η₀`` plus a small
+MLP for **spatial** NR ``η=η₀·σ(``MLP``(``pooled κ,z``))`` from collinear pass 1 onward,
+raw β weights, and collinear σ scales used in ``run_l1_hypercolumn``.  Stored ``κ`` in ``cells_flat`` is **cosine alignment**
+``ρ·S/(‖ρ‖‖S‖)`` (per pass) for the readout MLP, not a multiplicative gate on ``ρ``.
 """
-
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
-from params import SEED
+from params import L1
 
 from .L1 import HypercolumnSeed
 
@@ -20,17 +19,20 @@ class RhoSeedModule(nn.Module):
     """Drop-in replacement using HypercolumnSeed.
 
     The forward() method expects cells_flat from ``run_l1_hypercolumn``
-    (pre-GABA NR, logit GABA recurrence, then dominant-bin readout).  This module
-    reads dominant ρ from ``lam[...,0]`` and passes through with the renderer
+    (scalar ``η_z`` seed NR, raw β + spatial ``η₀``·MLP NR from pass 1 on, dominant-bin readout).
+    It reads dominant ρ from ``lam[...,0]`` and passes through with the renderer
     return signature.  During training, ``train.prepare_batch`` builds that
     dict with ``cells_format="torch"`` so ``hc_seed`` participates in autograd.
     """
 
-    def __init__(self, r_pool=10, stride=7, eps=1e-9, eta_z_init=SEED.ETA_Z_INIT):
+    def __init__(self, r_pool=10, stride=7, eps=1e-9, eta_z_init: float | None = None):
         super().__init__()
         self.hc_seed = HypercolumnSeed(
-            r_pool=r_pool, stride=stride,
-            eps=eps, eta_z_init=eta_z_init,
+            r_pool=r_pool,
+            stride=stride,
+            eps=eps,
+            n_gaba_passes=int(L1.COL_PASSES),
+            eta_z_init=eta_z_init,
         )
         # Expose for compat
         self.R = self.hc_seed.R
@@ -40,10 +42,6 @@ class RhoSeedModule(nn.Module):
     @property
     def eta_z(self):
         return self.hc_seed.eta_z
-
-    @property
-    def _eta_z_raw(self):
-        return self.hc_seed._eta_z_raw
 
     def rho_cell(self, cells_flat):
         """Return pre-computed ρ and branch from cells_flat."""

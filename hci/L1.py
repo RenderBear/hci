@@ -6,27 +6,18 @@ K orientation-tuned units pooling over the same receptive field (patch).
 
 Pipeline:
   1. Extract patches from pixel-level h2m and θ_h fields (from L0).
-  2. Project each patch's oriented energy onto K bins via cos² tuning.
-  3. Per cell: divisive NR vs learned η_z on raw bin energies (pre-GABA).
-  4. ``T`` recurrent **logit-space** collinear passes: depthwise normalized conv
-     ``S_k`` (weighted average of neighbor ρ), cross-orientation mean ``\\bar S``,
-     then ``ρ ← σ(β_s·logit(ρ_seed) + β_c·logit(S_k) − β_x·logit(\\bar S))``.
-     Optional ``eta_update_fn`` at pass start is kept for API compatibility (unused).
-  5. Extract dominant orientation, ρ, and **diagnostic** κ: peakedness ratio
-     ``ρ_{\\max}/(\\mathrm{mean}_k ρ_k + ε)`` on the final profile (per bin, then
-     gathered at the dominant bin for the renderer).
+  2. Project each patch's oriented energy onto K bins via cos² tuning → raw ``ρ_k``.
+  3. **Seed NR (``t=0``):** raw ``μ`` with **learned scalar** ``η_z`` (``softplus`` of raw) —
+     ``ρ ← μ²/(μ²+η_z²+ε)`` — no spatial MLP.  Detach as ``ρ^{\mathrm{seed}}`` for the fixed
+     β_s branch.
+  4. ``T`` recurrent passes (``t \\ge 1`` in the recurrence story): conv ``S^{(t)}`` on
+     current ``ρ^{(t)}``, cosine ``κ`` vs ``S``, ``z=Σ_k u_k``, then **spatial**
+     ``η(c)=η₀·σ(``MLP``(``pooled κ, \\bar z``))`` (21×21 mean pool), NR on ``u``.
+  5. Extract dominant ``ρ``, ``θ``, and diagnostic ``κ`` (cosine sim, in ``[0,1]``) for the
+     renderer / readout — **not** multiplied into ``ρ``.
 
-``rho_k_initial`` / ``rho_initial_cell`` store pre-GABA normalized ``ρ_k``.
-``kappa_pass0_cell`` stores collinear pool ``S_k`` at the dominant bin after pass 0;
-``kappa_col_cell`` stores peakedness κ at the dominant bin after the final pass.
-
-The collinear recurrence uses depthwise conv2d — each bin convolved with
-its own tangent-selective kernel.  Junctions with 3+ arms are naturally
-represented as 3+ active bins.
-
-Learned parameters: η_z (1 scalar), logit β weights (3 scalars), collinear
-Gaussian widths via ``α_d, α_t`` (softplus, scaled by ``R``).  Everything else
-is fixed geometry.
+``rho_k_initial`` stores post–seed-NR ``ρ_k``.  ``kappa_pass0_cell`` / ``kappa_col_cell``
+store cosine ``κ`` after the first / last pass (same definition as the η-MLP, per cell).
 """
 
 from __future__ import annotations
@@ -38,6 +29,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from hci.L0 import regional_mean_pool_cells
 
 from params import L1, SEED
 
@@ -291,8 +284,75 @@ def build_hypercolumns(
 # GABA-budget recurrence on K-channel representation
 # ═══════════════════════════════════════════════════════════════
 
+
+def _inv_softplus(x: float) -> float:
+    return math.log(math.expm1(max(float(x), 1e-8)))
+
+
+def nr_squash_k_bins(u: torch.Tensor, eta: torch.Tensor, nr_eps: float) -> torch.Tensor:
+    """Divisive NR ``u²/(u²+η²+ε)``; ``η`` scalar or ``(nH,nW)`` broadcast to all K."""
+    sq = u * u
+    ep = torch.as_tensor(nr_eps, device=u.device, dtype=u.dtype)
+    if eta.dim() == 0:
+        eta_sq = eta * eta
+    else:
+        eta_sq = (eta * eta).view(1, 1, eta.shape[-2], eta.shape[-1])
+    return sq / (sq + eta_sq + ep)
+
+
+def _cosine_kappa_grid(
+    rho_1knw: torch.Tensor,
+    s_1knw: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Per-cell cosine ``κ = (ρ·S)/(‖ρ‖ ‖S‖ + ε)``; tensors ``(1,K,nH,nW)``."""
+    rf = rho_1knw.squeeze(0)
+    sf = s_1knw.squeeze(0)
+    dot = (rf * sf).sum(dim=0)
+    nr = rf.norm(dim=0)
+    ns = sf.norm(dim=0)
+    ep = torch.as_tensor(eps, device=dot.device, dtype=dot.dtype)
+    return (dot / (nr * ns + ep)).clamp(0.0, 1.0)
+
+
+def _z_sum_grid_from_u(u_1knw: torch.Tensor) -> torch.Tensor:
+    """Per-cell ``z = Σ_k u_k``; ``u`` shape ``(1,K,nH,nW)``."""
+    return u_1knw.squeeze(0).sum(dim=0)
+
+
+def _eta_cell_from_mlp(
+    eta0: torch.Tensor,
+    mlp: nn.Module,
+    kappa_nw: torch.Tensor,
+    z_nw: torch.Tensor,
+    is_border_nw: torch.Tensor,
+    pool_r: int,
+    eps: float,
+) -> torch.Tensor:
+    """``η(c) = η₀ · σ(``MLP``(``\\bar κ, \\bar z``))`` on the cell grid.
+
+    ``kappa_nw`` is pooled cosine ``ρ`` vs ``S``; ``z_nw`` is ``Σ_k u_k`` per cell (passes
+    only), then max-normalized after pooling before stacking into the MLP.
+    """
+    pr = int(pool_r)
+    kp = regional_mean_pool_cells(kappa_nw, is_border_nw, pr)
+    zp = regional_mean_pool_cells(z_nw, is_border_nw, pr)
+    zn = zp / (zp.max().clamp_min(eps))
+    x = torch.stack([kp, zn], dim=-1).reshape(-1, 2)
+    logits = mlp(x).reshape(kappa_nw.shape)
+    mod = torch.sigmoid(logits.clamp(-40.0, 40.0)).clamp(1e-3, 1.0)
+    e0 = torch.as_tensor(eta0, device=kappa_nw.device, dtype=kappa_nw.dtype)
+    return e0 * mod
+
+
+def _kappa_k_from_grid(kappa_nw: torch.Tensor, K: int) -> torch.Tensor:
+    """Broadcast per-cell κ to ``(N, K)`` for ``extract_dominant`` gather API."""
+    nH, nW = kappa_nw.shape
+    return kappa_nw.reshape(-1, 1).expand(-1, int(K)).contiguous()
+
+
 def gaba_recurrence(
-    rho_k: torch.Tensor,
+    rho_k_raw: torch.Tensor,
     nH: int, nW: int,
     is_border: torch.Tensor,
     K: int,
@@ -303,62 +363,74 @@ def gaba_recurrence(
     beta_seed: torch.Tensor,
     beta_coll: torch.Tensor,
     beta_cross: torch.Tensor,
+    eta_z: torch.Tensor,
+    eta0: torch.Tensor,
+    gaba_eta_mlp: nn.Module,
+    gaba_pool_r: int,
+    nr_eps: float,
     eps: float = 1e-6,
     eta_update_fn: Callable | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Logit-space collinear recurrence with learned β weights (bounded ρ in (0,1)).
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Collinear recurrence: **scalar** ``η_z`` on raw seed NR; **spatial** ``η₀·σ(``MLP``)`` from pass 1 on.
 
-    Each pass: normalized depthwise conv ``S_k`` (weighted average of neighbor ρ),
-    cross-orientation mean ``\\bar S``, then logits combine with the fixed NR seed
-    evidence per cell.  ``κ`` after the final pass is a peakedness ratio on ``ρ_k``;
-    pass-0 diagnostic stores ``S_k`` at the dominant bin (via downstream gather).
+    **Seed:** NR with learned **scalar** ``η_z`` only (no MLP, no ``κ``/``z`` for ``η``).
 
-    Args:
-        rho_k: (N, K) per-bin cell energies (post ``normalize_pre_gaba``)
-        nH, nW: cell grid dimensions
-        is_border: (N,) bool
-        K: number of orientation bins
-        R: kernel radius (integer support)
-        sigma_d, sigma_t: 0-dim tensors, Gaussian scales
-        n_passes: number of recurrence iterations
-        beta_seed, beta_coll, beta_cross: 0-dim softplus-positive weights
-        eps: numerical floor for kernels / κ denominator
-        eta_update_fn: optional callback at the **start** of each pass (unused in train)
+    **Passes:** Collinear pools ``S_k = G_k * ρ_k`` use **unnormalized** nonnegative
+    kernels ``G_k`` (weighted **sum** over the patch, same as ``_e_col_dominant_bin``).
+    Cross-orientation baseline is **per-bin leave-one-out**:
+    ``\\bar{S}_k = (\\sum_j S_j - S_k) / (K-1)``.
+    ``κ = (ρ·S)/(‖ρ‖‖S‖+ε)``, ``z=Σ_k u_k``, pool → ``η(c)=η₀·σ(``MLP``(·))``.
+
+    ``kappa_k`` / ``kappa_*_cell`` store cosine ``κ`` from the first / last **collinear**
+    pass (when ``S`` is defined).
 
     Returns:
-        rho_k_out: (N, K) after all passes
-        kappa_k: (N, K) peakedness ratio ρ_max/(mean ρ + eps), clamped to [0,1]
-        kappa_k_pass0: (N, K) ``S_k`` after pass 0 (collinear pool output)
+        rho_k_out, kappa_k, kappa_k_pass0, rho_k_seed_snap, s_k_first, s_bar_first.
+        ``s_k_first`` / ``s_bar_first`` are ``(1,K,nH,nW)`` from the **first** collinear pass
+        (``s_bar`` = leave-one-out mean of other bins per ``k``; zeros if ``n_passes==0``).
     """
-    device = rho_k.device
-    dtype = rho_k.dtype
-    clamp_lo = 1e-4
-    clamp_hi = 1.0 - 1e-4
+    device = rho_k_raw.device
+    dtype = rho_k_raw.dtype
+    k_int = int(K)
 
     kernels = _build_collinear_kernels(R, K, sigma_d, sigma_t, device, dtype)
-
-    # Normalize kernels so conv output is a weighted average ∈ [0,1]
-    kernel_sums = kernels.sum(dim=(2, 3), keepdim=True).clamp_min(eps)
-    kernels_norm = kernels / kernel_sums
 
     ib_grid = is_border.reshape(nH, nW)
     border_mask_4d = ib_grid.unsqueeze(0).unsqueeze(0)  # (1,1,nH,nW)
 
-    rho_grid = rho_k.reshape(nH, nW, K).permute(2, 0, 1).unsqueeze(0)
+    rho_grid = rho_k_raw.reshape(nH, nW, K).permute(2, 0, 1).unsqueeze(0)
     rho_grid = torch.where(
         border_mask_4d.expand_as(rho_grid),
         torch.zeros_like(rho_grid), rho_grid,
     )
 
-    # Seed logit — fixed across passes (the cell's own NR evidence)
-    rho_seed = rho_grid.clamp(clamp_lo, clamp_hi)
-    logit_seed = torch.logit(rho_seed)
+    # Seed NR: μ = raw oriented energy — scalar η_z only (no MLP)
+    eta_z_t = torch.as_tensor(eta_z, device=device, dtype=dtype)
+    rho_grid = nr_squash_k_bins(rho_grid, eta_z_t, nr_eps)
+    rho_grid = torch.where(
+        border_mask_4d.expand_as(rho_grid),
+        torch.zeros_like(rho_grid), rho_grid,
+    )
 
-    # Store pass-0 collinear support for diagnostics
-    kappa_k_pass0 = torch.zeros_like(rho_k)
+    rho_seed = rho_grid.detach()
+
+    rho_k_seed_snap = (
+        rho_grid.squeeze(0).permute(1, 2, 0).reshape(-1, K).detach().clone()
+    )
+
+    kappa_k_pass0 = torch.zeros_like(rho_k_raw)
+    kappa_last_nw = torch.zeros(nH, nW, device=device, dtype=dtype)
+    s_k_first: torch.Tensor | None = None
+    s_bar_first: torch.Tensor | None = None
 
     for t in range(n_passes):
-        # η feedback (if enabled)
         if eta_update_fn is not None:
             rho_flat = rho_grid.squeeze(0).permute(1, 2, 0).reshape(-1, K)
             kappa_flat = torch.zeros_like(rho_flat)
@@ -371,45 +443,42 @@ def gaba_recurrence(
                 torch.zeros_like(rho_grid), rho_grid,
             )
 
-        # Collinear pooling: weighted average of neighbor ρ per bin
-        s_k = F.conv2d(rho_grid, kernels_norm, padding=R, groups=K)
-        s_k = s_k.clamp(clamp_lo, clamp_hi)
+        s_k = F.conv2d(rho_grid, kernels, padding=R, groups=K)
+        kap_t = _cosine_kappa_grid(rho_grid, s_k, eps)
+        den_cross = max(k_int - 1, 1)
+        s_total = s_k.sum(dim=1, keepdim=True)
+        s_bar = (s_total - s_k) / float(den_cross)
+        if t == 0:
+            s_k_first = s_k.detach().clone()
+            s_bar_first = s_bar.detach().clone()
 
-        # Cross-orientation: mean across all K bins
-        s_bar = s_k.mean(dim=1, keepdim=True).expand_as(s_k)
-        s_bar = s_bar.clamp(clamp_lo, clamp_hi)
+        u = beta_seed * rho_seed + beta_coll * s_k - beta_cross * s_bar
+        u = u.clamp_min(0.0)
+        u = torch.where(border_mask_4d.expand_as(u), torch.zeros_like(u), u)
 
-        # Logit-space combination
-        logit_coll = torch.logit(s_k)
-        logit_cross = torch.logit(s_bar)
+        z_t = _z_sum_grid_from_u(u)
+        kappa_last_nw = kap_t
+        if t == 0:
+            kappa_k_pass0 = _kappa_k_from_grid(kap_t, K)
 
-        logit_out = (
-            beta_seed * logit_seed
-            + beta_coll * logit_coll
-            - beta_cross * logit_cross
+        eta_t = _eta_cell_from_mlp(
+            eta0, gaba_eta_mlp, kap_t, z_t, ib_grid, gaba_pool_r, eps,
         )
-
-        rho_grid = torch.sigmoid(logit_out)
-
-        # Zero borders
+        rho_grid = nr_squash_k_bins(u, eta_t, nr_eps)
         rho_grid = torch.where(
             border_mask_4d.expand_as(rho_grid),
             torch.zeros_like(rho_grid), rho_grid,
         )
 
-        if t == 0:
-            kappa_k_pass0 = (
-                s_k.squeeze(0).permute(1, 2, 0).reshape(-1, K).detach().clone()
-            )
-
     rho_k_out = rho_grid.squeeze(0).permute(1, 2, 0).reshape(-1, K)
+    kappa_k_out = _kappa_k_from_grid(kappa_last_nw, K)
 
-    # Derive κ_col post-hoc: peakedness of final profile
-    rho_max = rho_k_out.max(dim=-1, keepdim=True).values
-    rho_mean = rho_k_out.mean(dim=-1, keepdim=True)
-    kappa_k_out = (rho_max / (rho_mean + eps)).expand_as(rho_k_out).clamp(0, 1)
+    if s_k_first is None:
+        zshape = (1, int(K), nH, nW)
+        s_k_first = torch.zeros(zshape, device=device, dtype=dtype)
+        s_bar_first = torch.zeros_like(s_k_first)
 
-    return rho_k_out, kappa_k_out, kappa_k_pass0
+    return rho_k_out, kappa_k_out, kappa_k_pass0, rho_k_seed_snap, s_k_first, s_bar_first
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -432,8 +501,8 @@ def extract_dominant(
 ) -> dict:
     """Extract per-cell scalar ρ, θ, κ from K-bin representation.
 
-    ``kappa_k`` holds per-bin diagnostic peakedness; ``kappa`` is the value at
-    the dominant orientation bin.
+    ``kappa_k`` holds per-cell cosine ``κ`` broadcast to bins; ``kappa`` is the value at
+    the dominant orientation bin (identical across ``k`` here).
     """
     N = rho_k.shape[0]
     device = rho_k.device
@@ -471,38 +540,45 @@ def extract_dominant(
 
 
 # ═══════════════════════════════════════════════════════════════
-# Seed module (simplified: just η_z on K-bin energies)
+# Seed module: η₀ + GABA η-MLP + raw β (see HypercolumnSeed)
 # ═══════════════════════════════════════════════════════════════
 
-def nr_squash_k_bins(u: torch.Tensor, eta_z: torch.Tensor, nr_eps: float) -> torch.Tensor:
-    """Divisive NR ``u²/(u²+η_z²+ε)`` — same map as pre-GABA ``normalize_pre_gaba``."""
-    eta_sq = eta_z * eta_z
-    sq = u * u
-    ep = torch.as_tensor(nr_eps, device=u.device, dtype=u.dtype)
-    return sq / (sq + eta_sq + ep)
 
+class EtaGabaMLP(nn.Module):
+    """2 → hidden → 1 logits; ``σ`` applied in ``_eta_cell_from_mlp``."""
 
-def _inv_softplus(x: float) -> float:
-    return math.log(math.expm1(max(float(x), 1e-8)))
+    def __init__(self, hidden: int = 8):
+        super().__init__()
+        h = int(hidden)
+        self.fc1 = nn.Linear(2, h)
+        self.fc2 = nn.Linear(h, 1)
+        self._init_near_identity()
+
+    def _init_near_identity(self) -> None:
+        with torch.no_grad():
+            nn.init.kaiming_uniform_(self.fc1.weight, nonlinearity="relu")
+            self.fc1.bias.zero_()
+            nn.init.normal_(self.fc2.weight, 0.0, 0.3)
+            self.fc2.bias.fill_(2.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(torch.relu(self.fc1(x)))
 
 
 class HypercolumnSeed(nn.Module):
-    """Learned η_z (NR pre-GABA), collinear σ scales, and logit β weights inside GABA.
-
-    Collinear kernel scales ``σ_d = softplus(α̃_d)·R``,
-    ``σ_t = softplus(α̃_t)·R`` (HCI spec) build depthwise convs in recurrence.
-
-    ``normalize_pre_gaba`` applies ``ρ_k²/(ρ_k²+η_z²+ε)`` on raw hypercolumn
-    bins.  GABA recurrence mixes seed logits, collinear pool logits, and
-    cross-orientation suppression in logit space.
-    """
+    """Learnable ``η_z`` (scalar seed NR), ``η₀`` (MLP NR scale), GABA η-MLP, β, σ_d/σ_t."""
 
     def __init__(
         self,
         r_pool: int = SEED.R_POOL,
         stride: int = SEED.STRIDE,
         eps: float = SEED.EPS,
-        eta_z_init: float = SEED.ETA_Z_INIT,
+        n_gaba_passes: int | None = None,
+        eta_z_init: float | None = None,
+        eta0_init: float | None = None,
+        eta_pass_init: float | None = None,
+        gaba_eta_pool_r: int | None = None,
+        gaba_mlp_hidden: int = 8,
         beta_seed_init: float = SEED.BETA_SEED_INIT,
         beta_coll_init: float = SEED.BETA_COLL_INIT,
         beta_cross_init: float = SEED.BETA_CROSS_INIT,
@@ -511,9 +587,26 @@ class HypercolumnSeed(nn.Module):
         self.R = int(r_pool)
         self.stride = int(stride)
         self.eps = float(eps)
-        self._eta_z_raw = nn.Parameter(
-            torch.tensor(_inv_softplus(max(eta_z_init, 1e-6)), dtype=torch.float32)
+        n_g = int(L1.COL_PASSES if n_gaba_passes is None else n_gaba_passes)
+        self.n_gaba_passes = n_g
+        e0 = float(eta0_init if eta0_init is not None else SEED.ETA0_INIT)
+        if eta_pass_init is not None:
+            ez = float(eta_pass_init)
+        elif eta_z_init is not None:
+            ez = float(eta_z_init)
+        else:
+            # At start, scalar seed scale matches η₀ (separate Parameters thereafter).
+            ez = e0
+        self._eta0_raw = nn.Parameter(
+            torch.tensor(_inv_softplus(max(e0, 1e-6)), dtype=torch.float32)
         )
+        self._eta_z_raw = nn.Parameter(
+            torch.tensor(_inv_softplus(max(ez, 1e-6)), dtype=torch.float32)
+        )
+        self.gaba_eta_pool_r = int(
+            gaba_eta_pool_r if gaba_eta_pool_r is not None else L1.GABA_ETA_POOL_RADIUS
+        )
+        self.gaba_eta_mlp = EtaGabaMLP(hidden=gaba_mlp_hidden)
         self._beta_seed_raw = nn.Parameter(
             torch.tensor(
                 _inv_softplus(max(float(beta_seed_init), 1e-6)),
@@ -552,7 +645,13 @@ class HypercolumnSeed(nn.Module):
         return sigma_d, sigma_t
 
     @property
+    def eta0(self) -> torch.Tensor:
+        """Positive base NR scale (``softplus`` of raw)."""
+        return F.softplus(self._eta0_raw)
+
+    @property
     def eta_z(self) -> torch.Tensor:
+        """Positive scalar NR scale for **seed** step only (``softplus`` of raw)."""
         return F.softplus(self._eta_z_raw)
 
     @property
@@ -568,11 +667,11 @@ class HypercolumnSeed(nn.Module):
         return F.softplus(self._beta_cross_raw)
 
     def normalize_pre_gaba(self, rho_k_raw: torch.Tensor) -> torch.Tensor:
-        """Divisive NR vs η_z on raw bin energies — **input** to GABA recurrence.
-
-        ``ρ̂_k = ρ_k² / (ρ_k² + η_z² + ε)`` (no min-subtract across bins).
-        """
-        return nr_squash_k_bins(rho_k_raw, self.eta_z, float(self.eps))
+        """Scalar ``η_z`` NR on flat ``(N,K)`` bins (matches seed NR, no MLP)."""
+        u = rho_k_raw
+        if u.dim() != 2:
+            raise ValueError("normalize_pre_gaba expects (N, K) flat tensor")
+        return nr_squash_k_bins(u, self.eta_z, float(self.eps))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -598,17 +697,17 @@ def run_l1_hypercolumn(
 ) -> dict:
     """Run the full hypercolumn L1 pipeline.
 
-    L0 output → K-bin hypercolumns → η_z divisive NR on raw bins (pre-GABA)
-    → logit-space GABA recurrence (β weights) → extract dominant orientation
-    for renderer.
+    L0 output → K-bin hypercolumns → **seed NR** (spatial ``η=η₀·σ(``MLP``)`` on pooled
+    ``κ,z`` from raw ``μ``) → detached ``ρ^{\\mathrm{seed}}`` → ``T`` passes of raw ``u``,
+    same η-head, divisive NR → dominant orientation for renderer.
 
     Args:
         h2m: (H, W) from L0
         theta_h: (H, W) from L0
         border_mask: (H, W) bool
-        seed: HypercolumnSeed module (provides learned η_z, βs, σ_d/σ_t)
+        seed: HypercolumnSeed module (``η₀``, GABA η-MLP, βs, σ_d/σ_t)
         P, patch_overlap, border_patch_max_frac: patch geometry
-        K, R, n_passes: recurrence params
+        K, R, n_passes: recurrence params (``n_passes`` must match ``seed.n_gaba_passes``)
         sigma_d, sigma_t: optional **fixed** floats for tests; default uses
             ``seed.collinear_sigmas(R)`` (learned).
         verbose: print diagnostics
@@ -621,6 +720,7 @@ def run_l1_hypercolumn(
     """
     device = h2m.device
     R_int = int(R)
+    k_int = int(K)
     if sigma_d is not None and sigma_t is not None:
         sigma_d_t = torch.as_tensor(float(sigma_d), device=device, dtype=torch.float32)
         sigma_t_t = torch.as_tensor(float(sigma_t), device=device, dtype=torch.float32)
@@ -637,41 +737,58 @@ def run_l1_hypercolumn(
     nH, nW, N = hc["nH"], hc["nW"], hc["N"]
     S = hc["S"]
 
+    if int(n_passes) != int(seed.n_gaba_passes):
+        raise ValueError(
+            f"n_passes={n_passes} must match seed.n_gaba_passes={seed.n_gaba_passes}"
+        )
+
     if verbose:
         print(f"  hypercolumn grid {nH}×{nW} = {N} cells, K={K} bins")
 
-    # Step 2: η_z divisive NR on raw ρ_k (pre-GABA); same tensor cached for ρ_initial
-    rho_k_raw = hc["rho_k"]  # (N, K)
+    rho_k_raw = hc["rho_k"]  # (N, K) raw cos² bin mass
     z0 = hc["z0"]            # (N,)
-    rho_k_pre = seed.normalize_pre_gaba(rho_k_raw)
-    rho_k_initial = rho_k_pre.detach().clone()
 
     if verbose:
         interior = ~hc["is_border"]
         rho_max_raw = rho_k_raw[interior].max(dim=-1).values
-        rho_max_pre = rho_k_pre[interior].max(dim=-1).values
-        print(f"  η_z={seed.eta_z.item():.3f}  "
-              f"β_seed={seed.beta_seed.item():.3f}  β_coll={seed.beta_coll.item():.3f}  "
-              f"β_cross={seed.beta_cross.item():.3f}")
+        ez = float(seed.eta_z.detach().cpu().item())
+        e0 = float(seed.eta0.detach().cpu().item())
+        print(
+            f"  η_z={ez:.3f} (seed scalar)  η₀={e0:.3f}  GABA η-MLP pool r={seed.gaba_eta_pool_r}  "
+            f"β_seed={seed.beta_seed.item():.3f}  β_coll={seed.beta_coll.item():.3f}  "
+            f"β_cross={seed.beta_cross.item():.3f}",
+        )
         print(f"  raw ρ_k max (interior): mean={rho_max_raw.mean():.4f} "
               f"max={rho_max_raw.max():.4f}")
-        print(f"  pre-GABA NR ρ_k max (interior, GABA in): mean={rho_max_pre.mean():.4f} "
-              f"max={rho_max_pre.max():.4f}")
 
-    # Step 3: logit-space GABA recurrence (learned β weights)
-    rho_k_gaba, kappa_k, kappa_k_pass0 = gaba_recurrence(
-        rho_k_pre, nH, nW, hc["is_border"], K,
-        R=R_int, sigma_d=sigma_d_t, sigma_t=sigma_t_t,
-        n_passes=n_passes,
-        beta_seed=seed.beta_seed,
-        beta_coll=seed.beta_coll,
-        beta_cross=seed.beta_cross,
-        eps=eps,
-        eta_update_fn=None,
+    rho_k_gaba, kappa_k, kappa_k_pass0, rho_k_initial, s_k_first, s_bar_first = (
+        gaba_recurrence(
+            rho_k_raw, nH, nW, hc["is_border"], K,
+            R=R_int, sigma_d=sigma_d_t, sigma_t=sigma_t_t,
+            n_passes=n_passes,
+            beta_seed=seed.beta_seed,
+            beta_coll=seed.beta_coll,
+            beta_cross=seed.beta_cross,
+            eta_z=seed.eta_z,
+            eta0=seed.eta0,
+            gaba_eta_mlp=seed.gaba_eta_mlp,
+            gaba_pool_r=seed.gaba_eta_pool_r,
+            nr_eps=float(seed.eps),
+            eps=eps,
+            eta_update_fn=None,
+        )
     )
+    sk_max_hw = s_k_first.squeeze(0).max(dim=0).values
+    rho0_hwk = rho_k_initial.reshape(nH, nW, k_int).permute(2, 0, 1)
+    dom_hw = rho0_hwk.argmax(dim=0)
+    sb_k_hw = s_bar_first.squeeze(0)
+    sbar_hw = torch.gather(sb_k_hw, 0, dom_hw.unsqueeze(0)).squeeze(0)
 
     if verbose:
         interior = ~hc["is_border"]
+        rho_max_seed = rho_k_initial[interior].max(dim=-1).values
+        print(f"  after seed NR: ρ_max mean={rho_max_seed.mean():.4f} "
+              f"max={rho_max_seed.max():.4f}")
         rho_max_gaba = rho_k_gaba[interior].max(dim=-1).values
         print(f"  after {n_passes} GABA passes: "
               f"ρ_max mean={rho_max_gaba.mean():.4f} "
@@ -731,6 +848,8 @@ def run_l1_hypercolumn(
             "e_col_cell": dom["e_col"].reshape(nH, nW),
             "rho_initial_cell": dom["rho_initial"].reshape(nH, nW),
             "rho_max_cell": dom["rho_max"].reshape(nH, nW),
+            "sk_max_cell": sk_max_hw,
+            "sbar_cell": sbar_hw,
         }
         return cells
 
@@ -771,6 +890,8 @@ def run_l1_hypercolumn(
         "e_col_cell": e_cell,
         "rho_initial_cell": rho_initial_cell,
         "rho_max_cell": rho_max_cell,
+        "sk_max_cell": sk_max_hw.detach().cpu().numpy(),
+        "sbar_cell": sbar_hw.detach().cpu().numpy(),
     }
     return cells
 
@@ -800,8 +921,8 @@ def run_l1(
 
     If seed, h2m, theta_h are provided: runs the new hypercolumn pipeline.
     Otherwise: falls back to computing h2m/theta_h from z2 and running
-    the hypercolumn pipeline with a default seed (``HypercolumnSeed``, η_z from
-    ``params.SEED.ETA_Z_INIT``).
+    the hypercolumn pipeline with a default seed (``HypercolumnSeed``;
+    ``eta0_init`` / default ``η_z = η₀`` at init from ``params.SEED``).
 
     ``img`` is accepted for API compatibility and ignored (RGB partition
     photometry was removed).
