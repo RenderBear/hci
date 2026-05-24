@@ -1,7 +1,8 @@
 r"""Shared pipeline hyperparameters, module inits, and script defaults.
 
-L1 builds cos² hypercolumns → min-subtract + η_z NR (pre-GABA) → GABA recurrence
-(κ from ρ–S cosine similarity by default; see ``L1.COL_KAPPA_NORM``).
+L1 builds cos² hypercolumns → η_z divisive NR on raw bins (pre-GABA) → additive
+collinear recurrence (learned ``α`` lateral step, same ``η_z`` NR after each pass).
+Diagnostic ``κ`` in cells is bin mass share, not a recurrence gate.
 The renderer interpolates ρ, θ, κ and applies ``h2m·ρ̄·gate``.
 
 Training disk cache: ``TRAIN.CACHE_VERSION`` invalidates stored L0 tensors used
@@ -44,10 +45,6 @@ L1 = SimpleNamespace(
     COL_SIGMA_D=None,       # default: R/2 inside L1
     COL_SIGMA_T=1.0,
     COL_PASSES=5,
-    # κ after depthwise collinear conv S_k:
-    # "cosine" = scalar cos(ρ, S) per cell, same κ all bins (texture vs edge);
-    # "max" = per-bin S_k/(max_j S_j+ε); "fair_share" = S_k/(E_total/K+ε).
-    COL_KAPPA_NORM="cosine",
 )
 
 # ── SEED: tile geometry + learned η_z (HypercolumnSeed); no separate dynamics ─
@@ -57,6 +54,8 @@ SEED = SimpleNamespace(
     EPS=1e-9,
     # Softplus(·) → η_z for pre-GABA NR; keep O(1) vs typical cos² patch ρ_k (not ≫1).
     ETA_Z_INIT=5.0,
+    # Softplus(·) → α in ρ += α(S−S̄) before each-pass NR squash inside GABA.
+    GABA_ALPHA_INIT=0.5,
 )
 
 # ── Render: θ combing + bilinear interp + minimal gate (κ_col, E_col from L1) ─

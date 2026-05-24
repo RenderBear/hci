@@ -560,7 +560,8 @@ def viz_infer_rho_seed_final_dual_maps(
 
     ``rho_seed`` / ``rho_final`` are the per-cell scalar channels saved in L1 (not renderer
     bookkeeping). The dominant bin index is taken **after** collinear recurrence; the left
-    map is **normalized** pre-GABA energy at that bin (min-subtract + NR vs η_z), the right
+    map is **normalized** pre-GABA energy at that bin (divisive NR vs η_z on raw
+    bin energy), the right
     map is ρ at that bin **after** GABA (no post-GABA squash).
     """
     gs = apply_border_zero(np.asarray(rho_seed, dtype=np.float64), is_border)
@@ -605,15 +606,12 @@ def viz_infer_kappa_pass0_final_dual_maps(
     *,
     n_collinear_passes: int,
 ) -> None:
-    """Per-cell κ: first vs last GABA pass.
+    """Per-cell κ: first vs last GABA pass (diagnostic bin-mass share).
 
-    With ``L1.COL_KAPPA_NORM="cosine"``, κ is one scalar per cell (same for all
-    bins); the "winner bin" index is still taken post-recurrence for API
-    consistency but every bin carries the same value. With per-bin modes
-    (``"max"`` / ``"fair_share"``), maps show κ at the post-dominant bin only.
-
-    Values near 1 mean weak suppression that pass; near 0 mean strong
-    suppression. Both panels use a fixed [0, 1] intensity scale.
+    ``κ`` is ``ρ_k / Σ_j ρ_j`` at each pass after NR (value at the post-recurrence
+    dominant bin is plotted).  Higher values mean a **sharper** orientation
+    profile at that cell (more mass in the winning bin relative to the sum).
+    Both panels use a fixed [0, 1] intensity scale.
     """
     k0 = apply_border_zero(np.asarray(kappa_pass0, dtype=np.float64), is_border)
     k1 = apply_border_zero(np.asarray(kappa_final, dtype=np.float64), is_border)
@@ -647,7 +645,7 @@ def viz_infer_kappa_pass0_final_dual_maps(
         ax.set_title(title, fontsize=9, color=VIZ.FG, fontfamily="monospace")
         ax.axis("off")
     fig.suptitle(
-        "cell $\\kappa$ (GABA gate) at post-recurrence dominant bin — "
+        "cell diagnostic $\\kappa$ (bin mass share at post-recurrence winner bin) — "
         f"first vs final pass  ({pass_note})",
         fontsize=10,
         color=VIZ.FG,
@@ -665,7 +663,7 @@ def viz_infer_kappa_pass0_final_dual_maps(
         aspect=36,
     )
     cbar.set_label(
-        r"$\kappa$  (0 suppressed $\rightarrow$ 1 kept)",
+        r"$\kappa$  (share of mass in winner bin; 0 diffuse $\rightarrow$ 1 peaked)",
         color=VIZ.FG,
         fontsize=9,
         fontfamily="monospace",

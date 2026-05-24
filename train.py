@@ -225,10 +225,10 @@ def _make_eta_update_fn(
 ) -> tuple[Callable, dict]:
     """Build the per-GABA-pass η feedback closure.
 
-    Each call (at the **start** of GABA pass ``t``, before that pass's ``ρ *= κ``):
-    current ``ρ_k`` and **previous** pass's ``κ`` (zeros on ``t == 0``) → MLP →
-    η_lum/η_chr maps → fast L0 pass 2 → new h2m → re-bin hypercolumns →
-    ``normalize_pre_gaba`` → new ``ρ_k`` for that pass's conv and κ gate.
+    Each call (at the **start** of GABA pass ``t``, before conv / additive step):
+    current ``ρ_k`` and **previous** pass's diagnostic ``κ`` shares (zeros on
+    ``t == 0``) → MLP → η maps → fast L0 pass 2 → re-bin → ``normalize_pre_gaba``
+    → new ``ρ_k`` for that pass's lateral update and NR squash.
 
     Returns:
         (eta_update_fn, state_dict) — the state_dict is populated by the last
@@ -881,7 +881,7 @@ def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
         for name, t in model.eta_mlp.named_parameters():
             g = "None" if t.grad is None else f"|grad|={t.grad.abs().mean().item():.2e}"
             print(f"    eta_mlp.{name}: {g}")
-    for raw, label in (("_alpha_d_raw", "α_d"), ("_alpha_t_raw", "α_t")):
+    for raw, label in (("_alpha_d_raw", "α_d"), ("_alpha_t_raw", "α_t"), ("_gaba_alpha_raw", "α_gaba")):
         t = getattr(s.hc_seed, raw, None)
         if t is None or t.grad is None:
             print(f"    seed.hc_seed.{label}: grad=None")
@@ -948,7 +948,7 @@ def format_seed_param_lines(seed: RhoSeedModule, *, indent: str = "  ") -> list[
     sig_d, sig_t = hc.collinear_sigmas(float(L1.COL_RADIUS))
     return [
         f"{indent}tile geometry:  R={seed.R}  stride={seed.stride}",
-        f"{indent}seed ratio:  η_z={seed.eta_z.item():.3f}",
+        f"{indent}seed ratio:  η_z={seed.eta_z.item():.3f}  α_gaba={seed.gaba_alpha.item():.3f}",
         f"{indent}collinear σ:  σ_d={sig_d.item():.3f}  σ_t={sig_t.item():.3f}  "
         f"(R={L1.COL_RADIUS})",
     ]
@@ -960,7 +960,7 @@ def format_renderer_param_lines(r: ModulationRenderer, *, indent: str = "  ") ->
     return [
         f"{indent}readout:  tang/norm h2m stencils (s_t, s_n) + 15-D gate (optional η_mod)",
         f"{indent}thinning head:  15→8→1 MLP  ({n_th} params)  + stencil spacings ({n_st})",
-        f"{indent}κ_col:  supplied from L1 hypercolumn (live in train; cells_flat dict)",
+        f"{indent}κ_col:  diagnostic bin-mass share from L1 (cells_flat; not a recurrence gate)",
     ]
 
 
@@ -969,7 +969,7 @@ def _format_seed_block(model: HarmonicContourE2E) -> str:
     parts = [
         "\n--- L1 seed (NR) ---\n",
         *[ln + "\n" for ln in format_seed_param_lines(s, indent="")],
-        "\nρ: min-subtract + η_z NR (pre-GABA) → GABA → dominant ρ × tile_interior\n",
+        "\nρ: pre-GABA NR → additive GABA (α·(S−S̄)) + per-pass η_z NR → dominant ρ × tile_interior\n",
     ]
     return "".join(parts)
 

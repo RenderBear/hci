@@ -1,7 +1,7 @@
 r"""Renderer — harmonic contour readout (interp → tang/norm stencils → gate).
 
 θ-combing on the cell grid, bilinear interpolation of cached cell fields (ρ, θ,
-κ_col from L1), then a 14-D feature stack
+κ_col from L1 — diagnostic bin-mass share for the readout), then a 14-D feature stack
 ``[h2m_lum, h2m_chr, ρ̄, κ̄_col, tang₅, norm₅, η̂_{\mathrm{mod}}]`` (15-D when
 ``l0_pix`` supplies ``eta_mod_map`` from the regional η MLP; else the last
 channel is zero).  Tangential / normal ``h2m`` samples use learned ``s_t``, ``s_n``.

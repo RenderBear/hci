@@ -7,7 +7,7 @@ This file records the **notation and equations implemented in this repository** 
 ## 1. End-to-end pipeline
 
 1. **L0 pass 1** — fixed base semi-saturation $\eta_0^{\mathrm{lum}}, \eta_0^{\mathrm{chr}}$; directional differences $d_k^{\mathrm{lum}}, d_k^{\mathrm{chr}}$ may be **cached** (η-independent).
-2. **L1** — $\cos^2$ hypercolumns on $h_{2m}$, per-cell min-subtract + Naka–Rushton vs.\ learned $\eta_z$, then **GABA** collinear recurrence on $K$ bins, then **dominant-bin** scalars for the cell grid.
+2. **L1** — $\cos^2$ hypercolumns on $h_{2m}$, per-cell divisive Naka–Rushton vs.\ learned $\eta_z$ on raw bin energies (no min-subtract), then **GABA** collinear recurrence on $K$ bins, then **dominant-bin** scalars for the cell grid.
 3. **Renderer** — θ combing on cells, bilinear interp of $\rho,\theta,\kappa_{\mathrm{col}}$ to pixels, tangential / normal **stencils** on $h_{2m}^{\mathrm{lum}}+h_{2m}^{\mathrm{chr}}$, **15→8→1** gate, $\hat B = (h_{2m}^{\mathrm{lum}}+h_{2m}^{\mathrm{chr}})\,\bar\rho \cdot \mathrm{gate}$.
 4. **L0 pass 2 (optional)** — regional maps $\eta_{\mathrm{lum}}(p), \eta_{\mathrm{chr}}(p)$ from **MLP$_\eta$**; fast re-NR + harmonics from cached $d_k$; **re-render** only (full L1 is not re-run inside `train.forward_batch` — see §6).
 
@@ -60,11 +60,10 @@ $$
 \rho_k^{\mathrm{raw}}(c) = \sum_{p \in \mathrm{patch}(c)} h_{2m}(p)\,\cos^2\!\bigl(\theta_h(p) - \bar\theta_k\bigr).
 $$
 
-**Min subtract** then **NR vs.\ learned $\eta_z$** (single scalar per forward, $\eta_z = \mathrm{softplus}(\tilde\eta_z)$):
+**Divisive NR vs.\ learned $\eta_z$** on raw bin energies (single scalar per forward, $\eta_z = \mathrm{softplus}(\tilde\eta_z)$; small $\varepsilon$ in code):
 
 $$
-\tilde\rho_k(c) = \rho_k^{\mathrm{raw}}(c) - \min_j \rho_j^{\mathrm{raw}}(c), \qquad
-\rho_k^{(0)}(c) = \frac{\tilde\rho_k(c)^2}{\tilde\rho_k(c)^2 + \eta_z^2}.
+\rho_k^{(0)}(c) = \frac{\bigl(\rho_k^{\mathrm{raw}}(c)\bigr)^2}{\bigl(\rho_k^{\mathrm{raw}}(c)\bigr)^2 + \eta_z^2 + \varepsilon}.
 $$
 
 **Cell total oriented energy** (used for η feedback):
@@ -75,28 +74,32 @@ $$
 
 ---
 
-## 4. GABA — depthwise collinear recurrence
+## 4. GABA — additive collinear recurrence + per-pass NR
 
-Learned tangent / normal scales (raw parameters $\tilde\alpha_d, \tilde\alpha_t$):
+Learned tangent / normal scales ($\tilde\alpha_d, \tilde\alpha_t$) and lateral step $\tilde\alpha$:
 
 $$
 \sigma_d = \mathrm{softplus}(\tilde\alpha_d)\,R, \qquad
-\sigma_t = \mathrm{softplus}(\tilde\alpha_t)\,R,
+\sigma_t = \mathrm{softplus}(\tilde\alpha_t)\,R, \qquad
+\alpha = \mathrm{softplus}(\tilde\alpha),
 $$
 
-with collinear radius $R =$ `L1.COL_RADIUS` (pixels). Kernels $W_k$ are Gaussians in tangential / normal coordinates, masked to a $(2R+1)^2$ support, **rebuilt** when $\sigma_d,\sigma_t$ change.
+with collinear radius $R =$ `L1.COL_RADIUS` (pixels). Kernels $W_k$ are Gaussians in tangential / normal coordinates, masked to a $(2R+1)^2$ support.
 
 **One pass** $t = 0,\ldots,T-1$ (`L1.COL_PASSES`):
 
 $$
-S_k^{(t)}(c) = (W_k * \rho_k^{(t)})(c) \quad \text{(depthwise conv, groups } K\text{)}.
+S_k^{(t)}(c) = (W_k * \rho_k^{(t)})(c) \quad \text{(depthwise conv, groups } K\text{)}, \qquad
+\bar S^{(t)}(c) = \frac{1}{K}\sum_{j=0}^{K-1} S_j^{(t)}(c).
 $$
 
-**κ gating** — default **cosine** similarity between cell vector $\boldsymbol\rho^{(t)}(c)$ and neighborhood vector $\mathbf S^{(t)}(c)$ (scalar $\kappa^{(t)}(c) \in [0,1]$); all bins multiply by the same $\kappa$. Other modes (`max`, `fair_share`) are documented in `params.L1.COL_KAPPA_NORM`.
+Let $u_k^{(t)} = \max\bigl(0,\; \rho_k^{(t)}(c) + \alpha\,(S_k^{(t)}(c) - \bar S^{(t)}(c))\bigr)$.  With the same learned $\eta_z$ as §3,
 
 $$
-\rho_k^{(t+1)}(c) = \rho_k^{(t)}(c)\cdot \kappa^{(t)}(c) \quad \text{(cosine mode)}.
+\rho_k^{(t+1)}(c) = \frac{\bigl(u_k^{(t)}(c)\bigr)^2}{\bigl(u_k^{(t)}(c)\bigr)^2 + \eta_z^2 + \varepsilon}.
 $$
+
+**Diagnostic κ (renderer / MLP features, not a gate):** e.g.\ bin mass share $\rho_k^{(t+1)} / (\sum_j \rho_j^{(t+1)} + \varepsilon)$ clamped to $[0,1]$.
 
 ---
 
@@ -177,14 +180,14 @@ $\mathrm{MLP}_{\mathrm{read}}$: **15 → 8 → 1** (ReLU between linear layers).
 ## 8. Training wrap-up (`train.py`)
 
 - **Disk cache** (`precompute_image`): L0 only; stores `h2m`, `theta_h`, `border_mask`, `l0_pix`, $d_k$, GT, geometry — **not** `cells_flat`. Versioned by `TRAIN.CACHE_VERSION`.
-- **Each training step** (`prepare_batch` → `run_l1_live_cells`): L1 runs with the trainable `HypercolumnSeed` inside `model.seed.hc_seed` (`cells_format="torch"`), then `RhoSeedModule` reads dominant $\rho$ from the resulting `cells_flat["lam"][...,0]`. So **loss does update** $\tilde\eta_z$ and $\tilde\alpha_{d,t}$ through the live L1 graph (pass-2 $h_{2m}$ from `fast_l0_pass2` remains detached as before).
+- **Each training step** (`prepare_batch` → `run_l1_live_cells`): L1 runs with the trainable `HypercolumnSeed` inside `model.seed.hc_seed` (`cells_format="torch"`), then `RhoSeedModule` reads dominant $\rho$ from the resulting `cells_flat["lam"][...,0]`. So **loss does update** $\tilde\eta_z$, $\tilde\alpha$ (GABA lateral step), and $\tilde\alpha_{d,t}$ through the live L1 graph (pass-2 $h_{2m}$ from `fast_l0_pass2` remains detached as before).
 - **Does receive gradients**: `ModulationRenderer` (readout MLP + $s_t,s_n$), **`EtaRegionalMLP`** via the $\hat\eta_{\mathrm{mod}}$ feature path when pass-2 tensors are present, and **L1 seed** parameters via live L1.
 
 **Spec vs.\ training reality (read this once):**
 
 | Claim in prose | Training-time truth |
 |----------------|---------------------|
-| $\eta_z$, $\alpha_{d,t}$ are “learned” | **Updated** by the loss: L1 is re-run each batch with `model.seed.hc_seed`. |
+| $\eta_z$, $\tilde\alpha$ (lateral), $\alpha_{d,t}$ are “learned” | **Updated** by the loss: L1 is re-run each batch with `model.seed.hc_seed`. |
 | MLP$_\eta$ drives spatial $\eta(p)$ | **Yes** for the forward image, but pass-2 **$h_{2m}$** is **detached**, so the loss does **not** backprop through L0 NR/harmonics. Gradients to MLP$_\eta$ go only through the **15th readout feature** ($\hat\eta_{\mathrm{mod}}$). That path is weaker than modulating $h_{2m}$ directly. |
 | MLP$_\eta$ init “near identity” | `EtaRegionalMLP` uses **small random** `fc1`/`fc2` weights (not all zeros) so ReLU is not dead at step 0; `fc2.bias` ≈ 2 keeps $\sigma(\text{logit})$ in a sensible band initially. |
 
@@ -197,11 +200,12 @@ Loss (default mix in `params.TRAIN`): soft-Dice and/or BCE on the valid η-band 
 | Block | Params | Notes |
 |------:|-------:|------|
 | $\tilde\alpha_d, \tilde\alpha_t$ | 2 | Collinear kernel scales |
-| $\tilde\eta_z$ | 1 | Pre-GABA NR floor |
+| $\tilde\alpha$ (GABA lateral) | 1 | ``softplus`` → α in additive lateral term |
+| $\tilde\eta_z$ | 1 | NR scale (pre-GABA and each GABA pass) |
 | MLP$_\eta$ (3→8→1) | 41 | Regional η |
 | $s_t, s_n$ | 2 | Stencil spacing |
 | MLP$_{\mathrm{read}}$ (15→8→1) | 137 | Thinning gate |
-| **Total** | **183** | |
+| **Total** | **184** | |
 
 ---
 
@@ -211,7 +215,7 @@ Loss (default mix in `params.TRAIN`): soft-Dice and/or BCE on the valid η-band 
 |----------------|----------------|
 | $d_k$, NR, harmonics, `fast_l0_pass2` | `hci/L0.py` |
 | Binning, GABA, dominant extract | `hci/L1.py` |
-| `HypercolumnSeed`, $\eta_z$, $\alpha_{d,t}$ | `hci/L1.py` (seed), `hci/seed.py` (wrapper) |
+| `HypercolumnSeed`, $\eta_z$, $\alpha$, $\alpha_{d,t}$ | `hci/L1.py` (seed), `hci/seed.py` (wrapper) |
 | Pool + MLP$_\eta$ | `hci/L0.py` (`EtaRegionalMLP`, `compute_eta_modulation_mlp`) |
 | Renderer | `hci/renderer.py` |
 | Cache, batch, loss | `train.py` |
