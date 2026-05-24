@@ -34,6 +34,7 @@ from hci.diagnostics_viz import (
     viz_infer_l0_pinwheel,
     viz_infer_l1_lambdas,
     viz_infer_rho_map_hist_cdf,
+    viz_infer_rho_post_minus_pre_map_hist_cdf,
     viz_infer_rho_seed_final_dual_maps,
     viz_infer_rho_seed_final_hist_cdf,
     save_rho_png,
@@ -178,6 +179,9 @@ def run_l0_l1(img_path, device, hc_seed: HypercolumnSeed | None = None):
     lam_grid = cells["lam"].astype(np.float64, copy=True)
     lam3_grid = cells["lam3"].astype(np.float64, copy=True)
     z0_grid = cells["z0"].astype(np.float64, copy=True)
+    rho_initial_grid = np.asarray(
+        cells["rho_initial_cell"], dtype=np.float64,
+    ).copy()
     is_border_grid = cells["is_border"].copy()
     Hp, Wp = ir_p.shape[:2]
     del cells, ir_p
@@ -198,6 +202,7 @@ def run_l0_l1(img_path, device, hc_seed: HypercolumnSeed | None = None):
         "lam_grid": lam_grid,
         "lam3_grid": lam3_grid,
         "z0_grid": z0_grid,
+        "rho_initial_grid": rho_initial_grid,
         "is_border_grid": is_border_grid,
         "h_np": h_np,
         "img_pinwheel": img_pinwheel,
@@ -458,7 +463,8 @@ def main():
         "--diagnostics",
         action="store_true",
         help="Save additional diagnostics: base, l0_pinwheel, l1_lambdas, "
-        "rho (map+histogram+CDF), rho_seed vs rho_final cell grids (dual map + hist/CDF), "
+        "rho (map+histogram+CDF), L1 pre/post GABA ρ (dual map + hist/CDF), "
+        "Δρ map+histogram+CDF (rho_delta.png), "
         "render_softmap, render_theta_bins, overlay (base RGB with thresholded edges).",
     )
     ap.add_argument("--device", default=None)
@@ -495,15 +501,15 @@ def main():
         diags,
         _,
         fwd_t,
-        rho_seed_cell,
-        rho_final_cell,
+        _rho_seed_cell_unused,
+        _rho_final_cell_unused,
     ) = forward_with_diagnostics(
         model,
         prep,
         device,
         collect_diags=collect_diags,
         apply_ridge_nms=args.ridge_nms,
-        return_rho_cell_grids=args.diagnostics,
+        return_rho_cell_grids=False,
         verbose=args.verbose,
     )
 
@@ -555,9 +561,11 @@ def main():
         saved_files.append(p_rho)
 
         p_rho_sf = os.path.join(od, f"{stem}_rho_maps.png")
+        rho_pre_gaba = prep["rho_initial_grid"]
+        rho_post_gaba = np.asarray(rho_post, dtype=np.float64)
         viz_infer_rho_seed_final_dual_maps(
-            rho_seed_cell,
-            rho_final_cell,
+            rho_pre_gaba,
+            rho_post_gaba,
             is_border,
             p_rho_sf,
             n_collinear_passes=n_gaba_passes,
@@ -565,9 +573,19 @@ def main():
         saved_files.append(p_rho_sf)
         p_rho_stats = os.path.join(od, f"{stem}_rho_hist_cdf.png")
         viz_infer_rho_seed_final_hist_cdf(
-            rho_seed_cell, rho_final_cell, is_border, p_rho_stats
+            rho_pre_gaba, rho_post_gaba, is_border, p_rho_stats
         )
         saved_files.append(p_rho_stats)
+
+        p_rho_delta = os.path.join(od, f"{stem}_rho_delta.png")
+        viz_infer_rho_post_minus_pre_map_hist_cdf(
+            rho_pre_gaba,
+            rho_post_gaba,
+            is_border,
+            p_rho_delta,
+            n_collinear_passes=n_gaba_passes,
+        )
+        saved_files.append(p_rho_delta)
 
     bmap_np = np.asarray(bmap, dtype=np.float64)
     if args.threshold is not None:

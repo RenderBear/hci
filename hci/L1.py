@@ -544,6 +544,7 @@ def run_l1_hypercolumn(
         nH, nW, hc["is_border"], seed.R, seed.stride, device,
     )
     dom["rho"] = dom["rho"] * interior_flat
+    dom["rho_initial"] = dom["rho_initial"] * interior_flat
     dom["kappa_col"] = dom["kappa_col"] * interior_flat
     dom["e_col"] = dom["e_col"] * interior_flat
     dom["rho_max"] = dom["rho_max"] * interior_flat
@@ -553,6 +554,7 @@ def run_l1_hypercolumn(
     is_border_out = hc["is_border"].cpu().numpy()
     kappa_cell = dom["kappa_col"].reshape(nH, nW).detach().cpu().numpy()
     e_cell = dom["e_col"].reshape(nH, nW).detach().cpu().numpy()
+    rho_initial_cell = dom["rho_initial"].reshape(nH, nW).detach().cpu().numpy()
 
     lam3_hw = torch.zeros(nH, nW, device=device, dtype=h2m.dtype).cpu().numpy()
 
@@ -581,6 +583,7 @@ def run_l1_hypercolumn(
         "K": K,
         "kappa_col_cell": kappa_cell,
         "e_col_cell": e_cell,
+        "rho_initial_cell": rho_initial_cell,
     }
     return cells
 

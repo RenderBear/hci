@@ -427,7 +427,7 @@ def viz_hist_cdf_columns(
         ax_c.set_facecolor(VIZ.PANEL_BG)
         n_cells = int(flat.size)
         if n_cells > 0:
-            xs = np.sort(flat.astype(np.float64, copy=False))
+            xs = np.sort(flat.astype(np.float64))
             ys = np.arange(1, n_cells + 1, dtype=np.float64)
             ax_c.plot(xs, ys, color=VIZ.FG, linewidth=1.2)
         ax_c.set_xlim(0.0, 1.0)
@@ -516,7 +516,7 @@ def viz_infer_rho_map_hist_cdf(
     ax_cdf.set_facecolor(VIZ.PANEL_BG)
     n_cells = int(flat.size)
     if n_cells > 0:
-        xs = np.sort(flat.astype(np.float64, copy=False))
+        xs = np.sort(flat.astype(np.float64))
         ys = np.arange(1, n_cells + 1, dtype=np.float64)
         ax_cdf.plot(xs, ys, color=VIZ.FG, linewidth=1.2)
     ax_cdf.set_xlim(0.0, 1.0)
@@ -556,7 +556,12 @@ def viz_infer_rho_seed_final_dual_maps(
     *,
     n_collinear_passes: int,
 ) -> None:
-    """Side-by-side cell ρ: L1 seed input to renderer vs after recurrent collinear passes."""
+    """Side-by-side cell ρ: L1 NR energy at the post-recurrence dominant bin, pre vs post GABA.
+
+    ``rho_seed`` / ``rho_final`` are the per-cell scalar channels saved in L1 (not renderer
+    bookkeeping). The dominant bin index is taken **after** collinear recurrence; the left
+    map is that bin's NR-normalized energy **before** recurrence, the right map **after**.
+    """
     gs = apply_border_zero(np.asarray(rho_seed, dtype=np.float64), is_border)
     gf = apply_border_zero(np.asarray(rho_final, dtype=np.float64), is_border)
 
@@ -570,8 +575,8 @@ def viz_infer_rho_seed_final_dual_maps(
     norm_seed = np.clip(gs / vmax, 0.0, 1.0)
     norm_fin = np.clip(gf / vmax, 0.0, 1.0)
     titles = (
-        r"$\rho_{\mathrm{seed}}$ (cell, pre-collinear)",
-        r"$\rho_{\mathrm{final}}$ (after %d collinear passes)" % int(n_collinear_passes),
+        r"$\rho$ pre-GABA (NR, post-$\theta$ winner bin)",
+        r"$\rho$ post-GABA (after %d collinear passes)" % int(n_collinear_passes),
     )
     for ax, arr, title in zip(axes, (norm_seed, norm_fin), titles):
         ax.set_facecolor(VIZ.PANEL_BG)
@@ -579,8 +584,8 @@ def viz_infer_rho_seed_final_dual_maps(
         ax.set_title(title, fontsize=9, color=VIZ.FG, fontfamily="monospace")
         ax.axis("off")
     fig.suptitle(
-        "cell $\\rho$: seed vs after recurrent collinear modulation "
-        f"(shared color scale, max={vmax:.4g})",
+        "cell $\\rho$: same dominant bin as after recurrence, before vs after "
+        f"GABA/collinear passes (shared color scale, max={vmax:.4g})",
         fontsize=10,
         color=VIZ.FG,
         fontfamily="monospace",
@@ -598,7 +603,7 @@ def viz_infer_rho_seed_final_hist_cdf(
     *,
     n_bins: int = 64,
 ) -> None:
-    """Interior histograms + empirical CDFs for ρ_seed and ρ_final (common ρ range)."""
+    """Interior histograms + empirical CDFs for L1 pre/post GABA ρ (common ρ range)."""
     ib = np.asarray(is_border, dtype=bool)
     gs = apply_border_zero(np.asarray(rho_seed, dtype=np.float64), is_border)
     gf = apply_border_zero(np.asarray(rho_final, dtype=np.float64), is_border)
@@ -610,7 +615,7 @@ def viz_infer_rho_seed_final_hist_cdf(
 
     fig, axes = plt.subplots(2, 2, figsize=(11.5, 8.2), facecolor=VIZ.BG)
     fig.suptitle(
-        r"Interior $\rho_{\mathrm{seed}}$ vs $\rho_{\mathrm{final}}$ — histograms & CDFs "
+        r"Interior $\rho$ pre-GABA vs post-GABA — histograms & CDFs "
         f"(common range [0, {xmax:.4g}])",
         fontsize=10,
         color=VIZ.FG,
@@ -618,8 +623,8 @@ def viz_infer_rho_seed_final_hist_cdf(
     )
 
     rows = (
-        (flat_s, r"$\rho_{\mathrm{seed}}$ (pre-collinear)"),
-        (flat_f, r"$\rho_{\mathrm{final}}$ (post-collinear)"),
+        (flat_s, r"$\rho$ pre-GABA (post-$\theta$ winner bin)"),
+        (flat_f, r"$\rho$ post-GABA (after recurrence)"),
     )
     for row_i, (flat, row_title) in enumerate(rows):
         ax_h = axes[row_i, 0]
@@ -636,7 +641,7 @@ def viz_infer_rho_seed_final_hist_cdf(
                 edgecolor=VIZ.PANEL_BG,
                 linewidth=0.3,
             )
-            xs = np.sort(flat.astype(np.float64, copy=False))
+            xs = np.sort(flat.astype(np.float64))
             ys = np.arange(1, n + 1, dtype=np.float64)
             ax_c.plot(xs, ys, color=VIZ.FG, linewidth=1.2)
         ax_h.set_xlim(0.0, xmax)
@@ -667,6 +672,122 @@ def viz_infer_rho_seed_final_hist_cdf(
             s.set_color(VIZ.ACCENT)
 
     fig.tight_layout(rect=[0, 0, 1, 0.94])
+    fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
+    plt.close(fig)
+
+
+def viz_infer_rho_post_minus_pre_map_hist_cdf(
+    rho_pre: np.ndarray,
+    rho_post: np.ndarray,
+    is_border: np.ndarray,
+    out_path: str,
+    *,
+    n_bins: int = 64,
+    n_collinear_passes: int | None = None,
+) -> None:
+    """Cell-grid Δρ = ρ_post − ρ_pre (post-θ winner bin): map + interior histogram + CDF.
+
+    Uses the same pre/post scalars as ``viz_infer_rho_seed_final_*`` (NR at the bin that
+    dominates after GABA, evaluated before vs after recurrence). Negative Δρ indicates
+    suppression at that bin.
+    """
+    gs = apply_border_zero(np.asarray(rho_pre, dtype=np.float64), is_border)
+    gf = apply_border_zero(np.asarray(rho_post, dtype=np.float64), is_border)
+    delta = gf - gs
+    ib = np.asarray(is_border, dtype=bool)
+    flat = delta.ravel()[~ib.ravel()]
+
+    if flat.size:
+        m = float(np.max(np.abs(flat)))
+        if m < 1e-18:
+            m = 1e-18
+    else:
+        m = 1.0
+
+    pass_note = (
+        f"  ({int(n_collinear_passes)} collinear passes)"
+        if n_collinear_passes is not None
+        else ""
+    )
+    fig = plt.figure(figsize=(11.5, 6.2), facecolor=VIZ.BG)
+    gspec = fig.add_gridspec(
+        2, 2, width_ratios=[1.38, 1.0], height_ratios=[1, 1],
+        wspace=0.30, hspace=0.34,
+    )
+    ax_map = fig.add_subplot(gspec[:, 0])
+    ax_hist = fig.add_subplot(gspec[0, 1])
+    ax_cdf = fig.add_subplot(gspec[1, 1])
+
+    ax_map.set_facecolor(VIZ.PANEL_BG)
+    im = ax_map.imshow(
+        delta,
+        cmap="coolwarm",
+        vmin=-m,
+        vmax=m,
+        interpolation="nearest",
+    )
+    fig.colorbar(im, ax=ax_map, fraction=0.046, pad=0.02)
+    ax_map.set_title(
+        r"cell $\Delta\rho = \rho_{\mathrm{post}} - \rho_{\mathrm{pre}}$",
+        fontsize=9,
+        color=VIZ.FG,
+        fontfamily="monospace",
+    )
+    ax_map.axis("off")
+
+    ax_hist.set_facecolor(VIZ.PANEL_BG)
+    n_cells = int(flat.size)
+    if n_cells > 0:
+        ax_hist.hist(
+            flat,
+            bins=n_bins,
+            range=(-m, m),
+            color=VIZ.ACCENT,
+            edgecolor=VIZ.PANEL_BG,
+            linewidth=0.3,
+        )
+    ax_hist.axvline(0.0, color=VIZ.FG, linewidth=0.8, linestyle="--", alpha=0.6)
+    ax_hist.set_xlim(-m, m)
+    ax_hist.set_title(
+        f"interior Δρ vs count  n={n_cells}  (sym. range ±{m:.4g})",
+        fontsize=8,
+        color=VIZ.FG,
+        fontfamily="monospace",
+    )
+    ax_hist.set_ylabel("count", fontsize=8, color=VIZ.FG)
+    ax_hist.tick_params(colors=VIZ.FG, labelsize=7)
+    for s in ax_hist.spines.values():
+        s.set_color(VIZ.ACCENT)
+
+    ax_cdf.set_facecolor(VIZ.PANEL_BG)
+    if n_cells > 0:
+        xs = np.sort(flat.astype(np.float64, copy=False))
+        ys = np.arange(1, n_cells + 1, dtype=np.float64)
+        ax_cdf.plot(xs, ys, color=VIZ.FG, linewidth=1.2)
+    ax_cdf.axvline(0.0, color=VIZ.ACCENT, linewidth=0.8, linestyle="--", alpha=0.7)
+    ax_cdf.set_xlim(-m, m)
+    ax_cdf.set_ylim(0.0, float(max(n_cells, 1)))
+    ax_cdf.set_xlabel(r"$\Delta\rho$", fontsize=8, color=VIZ.FG)
+    ax_cdf.set_ylabel("cumulative count", fontsize=8, color=VIZ.FG)
+    ax_cdf.set_title(
+        "empirical CDF of interior Δρ (unnormalized y)",
+        fontsize=8,
+        color=VIZ.FG,
+        fontfamily="monospace",
+    )
+    ax_cdf.grid(True, alpha=0.25, color=VIZ.ACCENT)
+    ax_cdf.tick_params(colors=VIZ.FG, labelsize=7)
+    for s in ax_cdf.spines.values():
+        s.set_color(VIZ.ACCENT)
+
+    fig.suptitle(
+        r"L1 recurrence — $\rho_{\mathrm{post}} - \rho_{\mathrm{pre}}$ "
+        r"(post-$\theta$ winner bin; negative ⇒ suppression)" + pass_note,
+        fontsize=10,
+        color=VIZ.FG,
+        fontfamily="monospace",
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.90])
     fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
     plt.close(fig)
 
