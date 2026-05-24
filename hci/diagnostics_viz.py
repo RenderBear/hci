@@ -454,7 +454,7 @@ def viz_infer_rho_map_hist_cdf(
         s.set_color(VIZ.ACCENT)
 
     eta_note = (
-        rf"  $\eta_z$={eta_z:.4g} (fixed)" if eta_z is not None else ""
+        rf"  $\eta_z$={eta_z:.4g}" if eta_z is not None else ""
     )
     fig.suptitle(
         "Cell ρ — map, histogram (interior), empirical CDF" + eta_note,
@@ -546,7 +546,7 @@ def viz_infer_kappa_pass0_final_dual_maps(
         t_final = str(n_p - 1)
         pass_note = f"{n_p} collinear passes"
     titles = (
-        "kappa_pre: first pass (rho = mu)",
+        "kappa_pre: first pass (post-seed rho)",
         f"kappa_post: last pass (t = {t_final})",
     )
     ims = []

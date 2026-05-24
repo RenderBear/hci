@@ -1,9 +1,8 @@
 r"""Seed module — thin wrapper providing renderer-compatible interface.
 
-HypercolumnSeed holds **fixed** ``η_z`` (buffer; diagnostics only), learnable ``η₀`` plus a small
-MLP for **spatial** NR ``η=η₀·σ(``MLP``(``pooled κ,z``))`` on collinear passes,
-raw β weights, and collinear σ scales used in ``run_l1_hypercolumn``.  Stored ``κ`` in ``cells_flat`` is **cosine alignment**
-``ρ·S/(‖ρ‖‖S‖)`` (per pass) for the readout MLP, not a multiplicative gate on ``ρ``.
+``HypercolumnSeed`` holds learned ``η_z`` (seed NR), tanh-gate ``τ``, ``α``,
+``β_coll`` / ``β_cross``, and collinear σ scales for ``run_l1_hypercolumn``.
+Stored ``κ`` in ``cells_flat`` is cosine ``ρ·S/(‖ρ‖‖S‖)`` for the readout MLP.
 """
 from __future__ import annotations
 
@@ -19,7 +18,7 @@ class RhoSeedModule(nn.Module):
     """Drop-in replacement using HypercolumnSeed.
 
     The forward() method expects cells_flat from ``run_l1_hypercolumn``
-    (raw ``μ`` + collinear GABA with spatial ``η``, dominant-bin readout).
+    (seed NR + tanh-gate collinear passes, dominant-bin readout).
     It reads dominant ρ from ``lam[...,0]`` and passes through with the renderer
     return signature.  During training, ``train.prepare_batch`` builds that
     dict with ``cells_format="torch"`` so ``hc_seed`` participates in autograd.

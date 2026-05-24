@@ -482,7 +482,7 @@ def main():
         verbose=args.verbose,
     )
 
-    eta_z = float(model.seed.eta_z.detach().cpu().item())  # fixed buffer; viz / hist caption only
+    eta_z = float(model.seed.eta_z.detach().cpu().item())  # learned; snapshot for viz / hist caption
 
     if args.verbose and diags is not None and "iter_stats" in diags:
         stats = diags["iter_stats"]

@@ -1,10 +1,10 @@
 r"""Shared pipeline hyperparameters, module inits, and script defaults.
 
-L1 builds cos² hypercolumns → raw ``μ`` (no seed NR) → raw β + collinear / surround ``u``,
-then **one** divisive NR per pass with **spatial** ``η=η₀·σ(``MLP``(``pooled κ, \\bar z``))``.
-Fixed scalar ``η_z`` (``SEED.ETA_Z``, not learned) is kept for captions / legacy only. Inhibition uses
+L1 builds cos² hypercolumns → **seed NR** (learned ``η_z=\\mathrm{softplus}(\\tilde\\eta_z)``) → multiplicative **tanh gate**
+passes ``ρ ← ρ^{\\mathrm{seed}} \\odot (1+α\\tanh(u/τ))`` with ``u = β_c S - β_x I`` (no in-loop
+divisive NR). Learned ``η_z``, ``τ``, ``α`` (``HypercolumnSeed``). Inhibition uses
 **isotropic surround** per bin ``k``: LOO mean ``(1/\\max(K-1,1))\\sum_{j\\neq k}ρ_j`` then convolve with the same radial kernel as ``G_k`` (no tangential weight).
-``κ`` is cosine ``(ρ·S)/(‖ρ‖‖S‖)``; ``\\bar z`` pools ``Σ_k u_k`` (not used for seed ``η``).
+``κ`` is cosine alignment ``(ρ·S)/(‖ρ‖‖S‖)`` for diagnostics / readout.
 The renderer interpolates ρ, θ, κ and applies ``h2m·ρ̄·gate`` (14-D readout, no η_mod).
 
 Training disk cache: ``TRAIN.CACHE_VERSION`` invalidates stored L0 tensors used
@@ -47,18 +47,14 @@ L1 = SimpleNamespace(
     GABA_ETA_POOL_RADIUS=10,
 )
 
-# ── SEED: tile geometry + η_z (seed) + η₀ + GABA η-MLP + β (HypercolumnSeed) ───
+# ── SEED: tile geometry + η_z + τ, α gate + β_coll/β_cross (HypercolumnSeed; η_z learned) ───
 SEED = SimpleNamespace(
     R_POOL=10,
     STRIDE=7,
     EPS=1e-9,
-    # Base scale η₀ in η = η₀·σ(MLP) on collinear passes (softplus of raw).
-    # Fixed η_z (register_buffer on ``HypercolumnSeed``; not learned). Initialized from
-    # ``eta_z_init`` / ``eta_pass_init`` if passed, else ``ETA_Z``.
-    ETA0_INIT=5.0,
     ETA_Z=5.0,
-    # Raw-space recurrence weights (softplus → positive)
-    BETA_SEED_INIT=0.3,
+    TAU_INIT=1.0,
+    GAIN_ALPHA_INIT=0.2,
     BETA_COLL_INIT=0.5,
     BETA_CROSS_INIT=0.3,
 )
@@ -79,7 +75,7 @@ TRAIN = SimpleNamespace(
     NUM_WORKERS=2,
     LAM_DICE=0.0,
     LAM_BCE=1.0,
-    CACHE_VERSION=23,
+    CACHE_VERSION=24,
 )
 
 # ── Inference ────────────────────────────────────────────────────────────────

@@ -33,6 +33,7 @@ from hci.L0 import (
     _compute_d_lum_chroma,
 )
 from hci.L1 import (
+    _inv_softplus,
     pad_for_patch_grid,
     run_l1_hypercolumn,
     stride_from_patch_overlap,
@@ -615,13 +616,15 @@ def remap_checkpoint_state_dict(sd: dict) -> dict:
     ``seed._eta_rho_raw`` / ``dynamics._eta_rho_raw`` are omitted.  Legacy ``eta_mod_*``,
     ``eta_mlp.*``, and ``seed.hc_seed._gaba_alpha_raw`` are dropped.
 
-    Legacy ``*_eta_z_raw`` is ignored (``η_z`` is no longer a learned parameter).  Old
-    ``_eta_pass_raw`` / merged ``_eta0_raw``-only checkpoints seed ``η₀`` when missing.
+    ``η_z``: pass through ``seed.hc_seed._eta_z_raw``; map buffer ``_eta_z_fixed`` or
+    orphan ``dynamics._eta_z_raw`` / ``seed._eta_z_raw`` into ``_eta_z_raw`` when needed.
+    Old ``_eta_pass_raw`` seeds ``η₀`` when ``_eta0_raw`` is missing.
     """
     skip = frozenset({"seed._eta_rho_raw", "dynamics._eta_rho_raw"})
     out: dict = {}
-    legacy_eta_raw: torch.Tensor | None = None
     legacy_eta_pass_raw: torch.Tensor | None = None
+    legacy_orphan_eta_z_raw: torch.Tensor | None = None
+    legacy_eta_z_fixed: torch.Tensor | None = None
     for k, v in sd.items():
         if k in skip:
             continue
@@ -634,17 +637,26 @@ def remap_checkpoint_state_dict(sd: dict) -> dict:
         if k == "seed.hc_seed._eta_pass_raw":
             legacy_eta_pass_raw = v
             continue
-        if k in ("dynamics._eta_z_raw", "seed._eta_z_raw", "seed.hc_seed._eta_z_raw"):
-            legacy_eta_raw = v
+        if k == "seed.hc_seed._eta_z_fixed":
+            legacy_eta_z_fixed = v
+            continue
+        if k in ("dynamics._eta_z_raw", "seed._eta_z_raw"):
+            legacy_orphan_eta_z_raw = v
             continue
         if k.startswith("dynamics."):
             continue
         out[k] = v
+    if "seed.hc_seed._eta_z_raw" not in out:
+        if legacy_eta_z_fixed is not None and legacy_eta_z_fixed.numel() >= 1:
+            ez = float(legacy_eta_z_fixed.reshape(-1)[0].detach().cpu())
+            out["seed.hc_seed._eta_z_raw"] = torch.tensor(
+                [_inv_softplus(max(ez, 1e-6))], dtype=torch.float32
+            )
+        elif legacy_orphan_eta_z_raw is not None and legacy_orphan_eta_z_raw.numel() >= 1:
+            out["seed.hc_seed._eta_z_raw"] = legacy_orphan_eta_z_raw.reshape(-1)[0].clone().float()
     if "seed.hc_seed._eta0_raw" not in out:
         if legacy_eta_pass_raw is not None and legacy_eta_pass_raw.numel() >= 1:
             out["seed.hc_seed._eta0_raw"] = legacy_eta_pass_raw.reshape(-1)[0].clone()
-        elif legacy_eta_raw is not None and legacy_eta_raw.numel() >= 1:
-            out["seed.hc_seed._eta0_raw"] = legacy_eta_raw.reshape(-1)[0].clone()
     return out
 
 
@@ -683,21 +695,17 @@ def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
     print("\n--- seed + renderer grad debug ---")
     print("\n  learned (value):")
     print(
-        f"    η_z={float(s.hc_seed.eta_z.detach()):.4f} (fixed)  "
-        f"η₀={float(s.hc_seed.eta0.detach()):.4f}",
+        f"    η_z={float(s.hc_seed.eta_z.detach()):.4f}  "
+        f"τ={float(s.hc_seed.tau.detach()):.4f}  "
+        f"α={float(s.hc_seed.gain_alpha.detach()):.4f}",
     )
     print("\n  |grad| on raw params:")
-    for raw, label in (("_eta0_raw", "η₀"),):
+    for raw, label in (("_eta_z_raw", "η_z"), ("_tau_raw", "τ"), ("_gain_alpha_raw", "α_gain")):
         t = getattr(s.hc_seed, raw, None)
         if t is None or t.grad is None:
             print(f"    {label}: grad=None")
         else:
             print(f"    {label}: |grad|={t.grad.abs().mean().item():.2e}")
-    for name, t in s.hc_seed.gaba_eta_mlp.named_parameters():
-        if t.grad is None:
-            print(f"    gaba_eta_mlp.{name}: grad=None")
-        else:
-            print(f"    gaba_eta_mlp.{name}: |grad|={t.grad.abs().mean().item():.2e}")
     for name, t in model.renderer.thinning.named_parameters():
         if t.grad is None:
             print(f"    thinning.{name}: grad=None")
@@ -712,7 +720,6 @@ def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
     for raw, label in (
         ("_alpha_d_raw", "α_d"),
         ("_alpha_t_raw", "α_t"),
-        ("_beta_seed_raw", "β_seed"),
         ("_beta_coll_raw", "β_coll"),
         ("_beta_cross_raw", "β_cross"),
     ):
@@ -777,16 +784,14 @@ def plot_training_curves(history, out_dir):
 
 
 def format_seed_param_lines(seed: RhoSeedModule, *, indent: str = "  ") -> list[str]:
-    """Learned GABA η-head + β (infer / train logging)."""
+    """Learned GABA gate + β (infer / train logging)."""
     hc = seed.hc_seed
     sig_d, sig_t = hc.collinear_sigmas(float(L1.COL_RADIUS))
-    n_mlp = sum(p.numel() for p in hc.gaba_eta_mlp.parameters())
     return [
         f"{indent}tile geometry:  R={seed.R}  stride={seed.stride}",
-        f"{indent}seed η_z:  {hc.eta_z.item():.3f} (fixed)  |  GABA:  η₀={hc.eta0.item():.3f}  "
-        f"pool_r={hc.gaba_eta_pool_r}  MLP(2→8→1) params={n_mlp}  "
-        f"β_seed={hc.beta_seed.item():.3f}  β_coll={hc.beta_coll.item():.3f}  "
-        f"β_cross={hc.beta_cross.item():.3f}",
+        f"{indent}seed η_z:  {hc.eta_z.item():.3f}  |  gate:  τ={hc.tau.item():.4f}  "
+        f"α={hc.gain_alpha.item():.4f}",
+        f"{indent}β_coll={hc.beta_coll.item():.3f}  β_cross={hc.beta_cross.item():.3f}",
         f"{indent}collinear σ:  σ_d={sig_d.item():.3f}  σ_t={sig_t.item():.3f}  "
         f"(R={L1.COL_RADIUS})",
     ]
@@ -807,8 +812,8 @@ def _format_seed_block(model: HarmonicContourE2E) -> str:
     parts = [
         "\n--- L1 seed (NR) ---\n",
         *[ln + "\n" for ln in format_seed_param_lines(s, indent="")],
-        "\nρ: raw → scalar η_z (seed NR) → detached ρ_seed → passes: u + η₀·σ(MLP) NR "
-        "→ dominant ρ × tile_interior\n",
+        "\nρ: raw → η_z seed NR → detached ρ_seed → passes: "
+        "ρ ← ρ_seed ⊙ (1 + α·tanh(u/τ)), u = β_coll·S − β_cross·I → dominant ρ × tile_interior\n",
     ]
     return "".join(parts)
 

@@ -75,7 +75,7 @@ Take $\mu_k(c) = \rho_k^{\mathrm{raw}}(c)$ as the nonnegative **drive** for the 
 
 ## 4. GABA — raw-space collinear recurrence + spatial $\eta$ (single NR per pass)
 
-**No seed NR:** $\boldsymbol{\rho}^{(0)}(c)=\boldsymbol{\mu}(c)$ (raw bin vector after border masking). A **fixed** positive $\eta_z$ (`SEED.ETA_Z`, `register_buffer` on `HypercolumnSeed`) is **not** applied in the recurrence; it is kept for histogram captions / legacy only.
+**Seed NR (code):** $\boldsymbol{\rho}^{\mathrm{seed}}(c)$ applies divisive normalization $\mu_k^2/(\mu_k^2+\eta_z^2+\varepsilon)$ with **learned** $\eta_z=\mathrm{softplus}(\tilde\eta_z)$ (`HypercolumnSeed._eta_z_raw`), then detached as the envelope for multiplicative tanh-gate passes (§4 narrative below may still describe older MLP-$\eta$ experiments — trust `hci/L1.py` + `params.py` for the live pipeline).
 
 Learned $\eta_0 = \mathrm{softplus}(\tilde\eta_0)$ scales a **per-cell** modulation from a **2→8→1** MLP (`EtaGabaMLP`; sigmoid output clamped to $(10^{-3},1]$ in code).
 
