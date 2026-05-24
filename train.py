@@ -234,9 +234,10 @@ class HarmonicContourE2E(nn.Module):
         """Render boundary maps from cached L1 cells.
 
         Cached ``cells_flat`` fixes ρ/κ at precompute time, so **loss does not
-        reach** ``seed.hc_seed`` (``η_z``, collinear ``α``). Only ``renderer``
-        (and, when pass-2 data exist, ``eta_mlp``) receive gradients unless you
-        change the pipeline to re-run L1 inside the training step.
+        reach** ``seed.hc_seed`` (``η_z``, collinear ``α``). Pass-2 ``h2m_*``
+        from ``fast_l0_pass2`` are **detached** (no grad through L0 NR/harmonics);
+        ``eta_mlp`` gradients flow through ``eta_mod_map`` in the renderer
+        thinning feature vector instead.
         """
         bmaps = []
         for m in meta_list:
@@ -300,10 +301,12 @@ class HarmonicContourE2E(nn.Module):
                     L0.GAMMA, L0.OFFSETS,
                     m["border_mask"],
                 )
-                # Keep ``h2m_*`` on the autograd graph so the loss can reach ``eta_mlp``
-                # (``fast_l0_pass2`` is written to avoid numpy round-trips for this reason).
+                # Detach h2m — do not backprop through L0 pass 2 (NR/harmonics unstable).
+                # Gradients reach ``eta_mlp`` via ``eta_mod_map`` in the renderer gate features.
+                l0_pix_pass2 = {k: v.detach() for k, v in l0_pix_pass2.items()}
+                l0_pix_pass2["eta_mod_map"] = eta_lum_map
 
-                # Re-render with updated h2m
+                # Re-render with updated h2m + η_mod feature for thinning MLP
                 bmap = render_boundary_map_torch(
                     rho_out,
                     m["proj_dev"],
@@ -876,8 +879,8 @@ def format_renderer_param_lines(r: ModulationRenderer, *, indent: str = "  ") ->
     n_th = sum(p.numel() for p in r.thinning.parameters())
     n_st = 2  # _s_t_raw, _s_n_raw
     return [
-        f"{indent}readout:  tang/norm h2m stencils (s_t, s_n) + 14-D gate",
-        f"{indent}thinning head:  14→8→1 MLP  ({n_th} params)  + stencil spacings ({n_st})",
+        f"{indent}readout:  tang/norm h2m stencils (s_t, s_n) + 15-D gate (optional η_mod)",
+        f"{indent}thinning head:  15→8→1 MLP  ({n_th} params)  + stencil spacings ({n_st})",
         f"{indent}κ_col:  supplied from L1 hypercolumn (cached in cells_flat)",
     ]
 
@@ -911,7 +914,7 @@ def _format_render_params(model: HarmonicContourE2E):
     if getattr(model, "eta_mlp", None) is not None:
         n_e = sum(p.numel() for p in model.eta_mlp.parameters())
         eta_str = f" + η-regional MLP ({n_e} params)"
-    return (f"renderer={n_r} params  (stencils + thinning 14→8→1{eta_str})")
+    return (f"renderer={n_r} params  (stencils + thinning 15→8→1{eta_str})")
 
 
 def save_checkpoint(model, path):

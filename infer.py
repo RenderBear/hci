@@ -323,7 +323,8 @@ def _infer_seed_and_render(
                 L0.GAMMA, L0.OFFSETS,
                 border_mask,
             )
-            l0_pix_pass2 = {k: v.to(device) for k, v in l0_pix_pass2.items()}
+            l0_pix_pass2 = {k: v.detach() for k, v in l0_pix_pass2.items()}
+            l0_pix_pass2["eta_mod_map"] = eta_lum_map
             l0_for_render = l0_pix_pass2
 
         render_out = render_boundary_map_torch(

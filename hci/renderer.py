@@ -2,8 +2,9 @@ r"""Renderer — harmonic contour readout (interp → tang/norm stencils → gat
 
 θ-combing on the cell grid, bilinear interpolation of cached cell fields (ρ, θ,
 κ_col from L1), then a 14-D feature stack
-``[h2m_lum, h2m_chr, ρ̄, κ̄_col, tang₅, norm₅]`` with tangential / normal
-``h2m`` samples at learned pixel spacings ``s_t``, ``s_n``, and
+``[h2m_lum, h2m_chr, ρ̄, κ̄_col, tang₅, norm₅, η̂_{\mathrm{mod}}]`` (15-D when
+``l0_pix`` supplies ``eta_mod_map`` from the regional η MLP; else the last
+channel is zero).  Tangential / normal ``h2m`` samples use learned ``s_t``, ``s_n``.
 ``B̂ = (h2m_lum+h2m_chr)·ρ̄·σ(MLP(F))``.  GABA recurrence lives in ``hci.L1``.
 """
 
@@ -109,17 +110,19 @@ def _interp_cell_to_pixel(
 
 
 # ═══════════════════════════════════════════════════════════════
-# Thinning head: MLP on 14-D stencil + contrast features (HCI readout)
+# Thinning head: MLP on 15-D stencil + contrast + η_mod features (HCI readout)
 # ═══════════════════════════════════════════════════════════════
 
 class ThinningHead(nn.Module):
-    """14 → hidden → 1 gate: σ(W₂ ReLU(W₁ F + b₁) + b₂).
+    """15 → hidden → 1 gate: σ(W₂ ReLU(W₁ F + b₁) + b₂).
 
-    ``F = [h2m_lum, h2m_chr, ρ̄, κ̄_col, tang₋₂…tang₂, norm₋₂…norm₂]``.
+    ``F = [h2m_lum, h2m_chr, ρ̄, κ̄_col, tang₋₂…tang₂, norm₋₂…norm₂, η̂_mod]``.
+    The last channel carries a detached pass-2 ``η_lum`` map (or zeros) so
+    ``MLP_η`` gradients route through the gate without backprop through L0 NR.
     Init near-identity gate (``b₂=2`` on last layer, mild first-row coupling).
     """
 
-    def __init__(self, in_dim: int = 14, hidden: int = 8):
+    def __init__(self, in_dim: int = 15, hidden: int = 8):
         super().__init__()
         self.in_dim = in_dim
         self.hidden = hidden
@@ -149,7 +152,7 @@ class ThinningHead(nn.Module):
 # ═══════════════════════════════════════════════════════════════
 
 class ModulationRenderer(nn.Module):
-    """Contour renderer: ``(h2m_lum+h2m_chr)·ρ̄·gate`` with 14→8→1 ThinningHead.
+    """Contour renderer: ``(h2m_lum+h2m_chr)·ρ̄·gate`` with 15→8→1 ThinningHead.
 
     Learned tangential / normal stencil spacings ``s_t``, ``s_n`` (softplus).
     Cell-grid κ_col comes from L1 (``cells_flat``).
@@ -158,7 +161,7 @@ class ModulationRenderer(nn.Module):
     def __init__(self, hidden: int | None = None, **kwargs):
         super().__init__()
         h = int(hidden if hidden is not None else RENDER.PIXEL_HIDDEN)
-        self.thinning = ThinningHead(in_dim=14, hidden=max(h, 8))
+        self.thinning = ThinningHead(in_dim=15, hidden=max(h, 8))
         self._s_t_raw = nn.Parameter(torch.tensor(_inv_softplus(1.0), dtype=torch.float32))
         self._s_n_raw = nn.Parameter(torch.tensor(_inv_softplus(1.0), dtype=torch.float32))
 
@@ -202,13 +205,13 @@ class ModulationRenderer(nn.Module):
 def upgrade_renderer_state_dict(state_dict: dict, prefix: str = "") -> dict:
     """Best-effort upgrade from old splat- or stencil-based state dicts.
 
-    Drops ``thinning.*`` tensors whose shapes do not match the current 14→8→1
-    head (legacy 4→4 checkpoints then re-init the gate from ``ThinningHead``
+    Drops ``thinning.*`` tensors whose shapes do not match the current 15→8→1
+    head (legacy 4→4 / 14-D checkpoints then re-init the gate from ``ThinningHead``
     defaults).
     """
     state_dict = dict(state_dict)
     wkey = f"{prefix}thinning.fc1.weight"
-    if wkey in state_dict and tuple(state_dict[wkey].shape) != (8, 14):
+    if wkey in state_dict and tuple(state_dict[wkey].shape) != (8, 15):
         for k in list(state_dict):
             if f"{prefix}thinning." in k:
                 del state_dict[k]
@@ -244,9 +247,9 @@ def upgrade_renderer_state_dict(state_dict: dict, prefix: str = "") -> dict:
 
 
 def _expected_shape(key: str):
-    """Expected shapes for the 14→8→1 thinning head."""
+    """Expected shapes for the 15→8→1 thinning head."""
     shapes = {
-        "thinning.fc1.weight": (8, 14),
+        "thinning.fc1.weight": (8, 15),
         "thinning.fc1.bias": (8,),
         "thinning.fc2.weight": (1, 8),
         "thinning.fc2.bias": (1,),
@@ -286,7 +289,7 @@ def _theta_on_branch(theta, branch_pick, n_cells, device):
 
 
 # ═══════════════════════════════════════════════════════════════
-# render_boundary_map_torch — tang/norm stencils + 14-D gate
+# render_boundary_map_torch — tang/norm stencils + 15-D gate (optional η_mod)
 # ═══════════════════════════════════════════════════════════════
 
 def render_boundary_map_torch(
@@ -406,7 +409,7 @@ def render_boundary_map_torch(
     # Combined h2m as the base edge signal (pixel-native, smooth)
     h2m_combined = h2m_lum + h2m_chr
 
-    # ── Step 5: Tangential / normal h2m stencils → 14-D gate ──
+    # ── Step 5: Tangential / normal h2m stencils → 15-D gate ──
     theta_geom = theta_pix.detach()
     h4 = h2m_combined.unsqueeze(0).unsqueeze(0)
     st = renderer.s_t.to(device=device, dtype=dtype)
@@ -447,6 +450,13 @@ def render_boundary_map_torch(
 
     theta_pix = theta_geom  # geometric; grad through ρ̄, h2m, gate, stencils
 
+    if l0_pix is not None and "eta_mod_map" in l0_pix:
+        eta_mod_pix = l0_pix["eta_mod_map"].to(device=device, dtype=dtype)
+        if eta_mod_pix.shape != (H, W):
+            eta_mod_pix = eta_mod_pix[:H, :W]
+    else:
+        eta_mod_pix = torch.zeros(H, W, device=device, dtype=dtype)
+
     fdim = int(renderer.thinning.in_dim)
     features = torch.cat([
         h2m_lum.unsqueeze(-1),
@@ -455,6 +465,7 @@ def render_boundary_map_torch(
         kappa_col_pix.unsqueeze(-1),
         tang_stack,
         norm_stack,
+        eta_mod_pix.unsqueeze(-1),
     ], dim=-1)
 
     if features.shape[-1] != fdim:

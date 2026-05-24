@@ -1,315 +1,216 @@
-# HCI — hypercolumn architecture
+# HCI — equations (code-aligned)
 
-## Motivation
-
-Replace the per-patch eigendecomposition (L1) with a K-channel oriented
-energy histogram at each cell position.  Each cell becomes a hypercolumn:
-K orientation-tuned units pooling over the same receptive field.  The
-collinear recurrence operates natively on the K-channel representation.
-No eigensolver, no branch selection, no 2-orientation limitation.
+This file records the **notation and equations implemented in this repository** (`hci/L0.py`, `hci/L1.py`, `hci/renderer.py`, `hci/seed.py`, `train.py`). For a longer system narrative and design rationale, see `HCI_SYSTEM_EQUATIONS.md`. Geometry and defaults live in `params.py`.
 
 ---
 
-## L0 — unchanged
+## 1. End-to-end pipeline
 
-Per-pixel harmonic projection produces, at every pixel $p$:
+1. **L0 pass 1** — fixed base semi-saturation $\eta_0^{\mathrm{lum}}, \eta_0^{\mathrm{chr}}$; directional differences $d_k^{\mathrm{lum}}, d_k^{\mathrm{chr}}$ may be **cached** (η-independent).
+2. **L1** — $\cos^2$ hypercolumns on $h_{2m}$, per-cell min-subtract + Naka–Rushton vs.\ learned $\eta_z$, then **GABA** collinear recurrence on $K$ bins, then **dominant-bin** scalars for the cell grid.
+3. **Renderer** — θ combing on cells, bilinear interp of $\rho,\theta,\kappa_{\mathrm{col}}$ to pixels, tangential / normal **stencils** on $h_{2m}^{\mathrm{lum}}+h_{2m}^{\mathrm{chr}}$, **15→8→1** gate, $\hat B = (h_{2m}^{\mathrm{lum}}+h_{2m}^{\mathrm{chr}})\,\bar\rho \cdot \mathrm{gate}$.
+4. **L0 pass 2 (optional)** — regional maps $\eta_{\mathrm{lum}}(p), \eta_{\mathrm{chr}}(p)$ from **MLP$_\eta$**; fast re-NR + harmonics from cached $d_k$; **re-render** only (full L1 is not re-run inside `train.forward_batch` — see §6).
+
+---
+
+## 2. L0 — split luminance / chrominance harmonics
+
+Eight offsets $\delta_k \in \mathbb{Z}^2$ (`L0.OFFSETS`). RGB → orthonormal $L$ and chroma $C$.
+
+**Directional differences** (magnitude / $\ell_2$ on $C$):
 
 $$
-z_2(p) = \sum_k h_k(p)\, e^{2i\varphi_k}
+d_k^{\mathrm{lum}}(p) = \bigl|L(p) - L(p+\delta_k)\bigr|, \qquad
+d_k^{\mathrm{chr}}(p) = \bigl\|C(p) - C(p+\delta_k)\bigr\|_2 .
 $$
 
+**Per-pixel min across directions** (subscript $k$ is direction index):
+
 $$
+\tilde d_k^{\mathrm{lum}} = d_k^{\mathrm{lum}} - \min_j d_j^{\mathrm{lum}}, \qquad
+\tilde d_k^{\mathrm{chr}} = d_k^{\mathrm{chr}} - \min_j d_j^{\mathrm{chr}} .
+$$
+
+**Naka–Rushton** with scalar or spatial $\eta$ (pass 1: constants $\eta_0^{\mathrm{lum}}, \eta_0^{\mathrm{chr}}$; pass 2: maps). Implementation uses a small denominator floor so $\eta\to 0$ with flat $\tilde d$ does not produce $0/0$.
+
+$$
+h_k^{\mathrm{lum}} = \gamma\,\frac{(\tilde d_k^{\mathrm{lum}})^2}{\eta_{\mathrm{lum}}(p)^2 + (\tilde d_k^{\mathrm{lum}})^2}, \qquad
+h_k^{\mathrm{chr}} = \gamma\,\frac{(\tilde d_k^{\mathrm{chr}})^2}{\eta_{\mathrm{chr}}(p)^2 + (\tilde d_k^{\mathrm{chr}})^2}.
+$$
+
+**Second harmonic** (complex $z_2$, magnitude $h_{2m}$, split lum/chr for the renderer):
+
+$$
+z_2(p) = \sum_k \bigl(h_k^{\mathrm{lum}} + h_k^{\mathrm{chr}}\bigr)\, e^{2i\varphi_k}, \qquad
 h_{2m}(p) = |z_2(p)|, \qquad
-\theta_h(p) = \tfrac{1}{2}\,\text{atan2}\!\bigl(\text{Im}\,z_2,\;\text{Re}\,z_2\bigr)
+\theta_h(p) = \tfrac12 \arg z_2(p).
 $$
 
-These are pixel-native: orientation $\theta_h$ and magnitude $h_{2m}$ at
-full resolution.
+Pixel fields $h_{2m}^{\mathrm{lum}}, h_{2m}^{\mathrm{chr}}$ are the magnitudes of the lum-only and chr-only harmonic sums (see `compute_l0_rgb`).
 
 ---
 
-## Hypercolumn construction (replaces L1 eigendecomposition)
+## 3. L1 — hypercolumn binning and pre-GABA NR
 
-### Oriented energy binning
+Patch size $P$, stride $S$ → cell grid $(n_H, n_W)$, $K$ bins (`L1.COL_K_BINS`), bin centres $\bar\theta_k = k\pi/K$.
 
-Patches of size $P \times P$ at stride $S$ (with overlap) tile the image,
-producing a cell grid of size $n_H \times n_W$.  At each cell position $c$,
-project the patch's pixel-level oriented energy onto $K$ bins
-(default $K = 24$, spacing $\pi/K = 7.5°$):
+**Oriented energy** into bin $k$ at cell $c$:
 
 $$
-\rho_k^{\text{raw}}(c) = \sum_{p \in \text{patch}(c)} h_{2m}(p) \;\cdot\;
-\cos^2\!\bigl(\theta_h(p) - \bar{\theta}_k\bigr)
+\rho_k^{\mathrm{raw}}(c) = \sum_{p \in \mathrm{patch}(c)} h_{2m}(p)\,\cos^2\!\bigl(\theta_h(p) - \bar\theta_k\bigr).
 $$
 
-where $\bar{\theta}_k = k\pi/K$ is the centre angle of bin $k$.
-
-The $\cos^2$ weighting is the orientation tuning curve — a pixel whose
-orientation matches the bin contributes fully; a pixel $90°$ away
-contributes zero.  This is the standard model of V1 simple cell
-orientation selectivity.
-
-### Local energy and normalization
-
-Total energy at cell $c$ (sum over all bins; used elsewhere, not in the seed NR):
+**Min subtract** then **NR vs.\ learned $\eta_z$** (single scalar per forward, $\eta_z = \mathrm{softplus}(\tilde\eta_z)$):
 
 $$
-z_0(c) = \sum_{k=0}^{K-1} \rho_k^{\text{raw}}(c)
+\tilde\rho_k(c) = \rho_k^{\mathrm{raw}}(c) - \min_j \rho_j^{\mathrm{raw}}(c), \qquad
+\rho_k^{(0)}(c) = \frac{\tilde\rho_k(c)^2}{\tilde\rho_k(c)^2 + \eta_z^2}.
 $$
 
-**Baseline removal** per cell: subtract the weakest bin so all channels are
-non-negative *excess* orientation energy relative to the patch minimum:
+**Cell total oriented energy** (used for η feedback):
 
 $$
-\tilde{\rho}_k^{\text{raw}}(c) = \rho_k^{\text{raw}}(c) - \min_{j} \rho_j^{\text{raw}}(c)
+z_0(c) = \sum_{k=0}^{K-1} \rho_k^{\mathrm{raw}}(c).
 $$
-
-**Naka–Rushton vs.\ the learned floor only** (no $z_0$ in the denominator —
-L0 NR and GABA κ gating already handle contrast and competition):
-
-$$
-\rho_k^{(0)}(c) = \frac{\bigl(\tilde{\rho}_k^{\text{raw}}(c)\bigr)^2}{\bigl(\tilde{\rho}_k^{\text{raw}}(c)\bigr)^2 + \eta_z^2}
-$$
-
-$\eta_z$ sets how much excess counts as a “real” oriented response; values lie in $[0, 1)$.
-
-This is a K-vector at each cell position: the hypercolumn's orientation
-response profile.  Edges produce a sharply peaked profile (one dominant
-bin).  Junctions produce 2–3 peaks.  Texture produces a flat profile.
-
-### What's eliminated
-
-- **Eigendecomposition**: no 3×3 moment matrix, no eigensolver, no
-  eigenvalue sorting.
-- **Branch selection**: no $\theta_0, \theta_1$, no branch index, no
-  `_theta_on_branch`.
-- **2-orientation limit**: junctions with 3+ arms are naturally represented
-  as 3+ active bins.
-
-### What's preserved
-
-- **Patch geometry**: same $P, S$, overlap as before.
-- **Cell grid**: same $n_H \times n_W$ spatial layout.
-- **Divisive normalization**: per-cell min subtraction + NR vs.\ $\eta_z$
-  only (`params.SEED.ETA_Z_INIT`); GABA handles cross-bin competition.
 
 ---
 
-## Collinear recurrence on K-channel representation
+## 4. GABA — depthwise collinear recurrence
 
-The collinear recurrence now operates on a $(K, n_H, n_W)$ tensor
-instead of $(1, n_H, n_W)$ with separate double-angle convolutions.
-
-### Kernels (same as before)
-
-$K$ tangent-selective kernels $W_k$ of size $(2R+1)^2$, precomputed
-from Gaussian distance × tangent selectivity at each bin's angle.
-
-### Per-pass dynamics
-
-Initialize $\rho_k^{(0)}$ from the hypercolumn construction above.
-
-**For** $t = 0, \dots, T-1$:
-
-**Stage A — per-bin convolution.**
-Each bin $k$ convolves its own channel with its own tangent-selective kernel:
+Learned tangent / normal scales (raw parameters $\tilde\alpha_d, \tilde\alpha_t$):
 
 $$
-S_k^{(t)}(c) = \bigl(W_k * \rho_k^{(t)}\bigr)(c)
+\sigma_d = \mathrm{softplus}(\tilde\alpha_d)\,R, \qquad
+\sigma_t = \mathrm{softplus}(\tilde\alpha_t)\,R,
 $$
 
-This is a single `F.conv2d` on a $(1, K, n_H, n_W)$ tensor with $K$
-**depthwise** kernels — each channel convolved with its matched kernel.
-Cost: one depthwise conv2d per pass.
+with collinear radius $R =$ `L1.COL_RADIUS` (pixels). Kernels $W_k$ are Gaussians in tangential / normal coordinates, masked to a $(2R+1)^2$ support, **rebuilt** when $\sigma_d,\sigma_t$ change.
 
-**Stage B — GABA gate (κ).**
-
-Default (`L1.COL_KAPPA_NORM="cosine"`): one **scalar** $\kappa^{(t)}(c)$ per cell
-(cosine similarity between the cell's $K$-vector $\rho_k^{(t)}(c)$ and the
-collinear neighborhood response $S_k^{(t)}(c) = (W_k * \rho_k^{(t)})(c)$):
+**One pass** $t = 0,\ldots,T-1$ (`L1.COL_PASSES`):
 
 $$
-\kappa^{(t)}(c) = \frac{\sum_k \rho_k^{(t)}(c)\, S_k^{(t)}(c)}{
-\sqrt{\sum_k \rho_k^{(t)}(c)^2}\;\sqrt{\sum_k S_k^{(t)}(c)^2} + \epsilon}
+S_k^{(t)}(c) = (W_k * \rho_k^{(t)})(c) \quad \text{(depthwise conv, groups } K\text{)}.
 $$
 
-Clamped to $[0,1]$. High when the cell's orientation profile matches the
-neighborhood's pooled collinear support (coherent contour); lower when
-neighbors disagree (texture / orientation boundaries). The same $\kappa$
-multiplies **every** bin — recovering "do neighbors agree with *my* profile?"
-rather than only "am I as strong as the local max bin?"
-
-**Alternative modes** (`L1.COL_KAPPA_NORM`): **max** — per-bin
-$\kappa_k^{(t)}(c) = S_k^{(t)}(c) / (\max_{j} S_j^{(t)}(c) + \epsilon)$;
-**fair-share** —
-$\kappa_k^{(t)}(c) = S_k^{(t)}(c) / (E_{\text{total}}(c)/K + \epsilon)$ with
-$E_{\text{total}}=\sum_k S_k$. Fair-share is degenerate with cos² + large $K$
-(active bins $\ll K$ ⇒ often $\kappa_k\approx 1$).
-
-**Stage C — modulate.**
-
-Cosine mode (scalar $\kappa$):
+**κ gating** — default **cosine** similarity between cell vector $\boldsymbol\rho^{(t)}(c)$ and neighborhood vector $\mathbf S^{(t)}(c)$ (scalar $\kappa^{(t)}(c) \in [0,1]$); all bins multiply by the same $\kappa$. Other modes (`max`, `fair_share`) are documented in `params.L1.COL_KAPPA_NORM`.
 
 $$
-\rho_k^{(t+1)}(c) = \rho_k^{(t)}(c) \cdot \kappa^{(t)}(c)
+\rho_k^{(t+1)}(c) = \rho_k^{(t)}(c)\cdot \kappa^{(t)}(c) \quad \text{(cosine mode)}.
 $$
-
-Per-bin modes (max / fair-share): $\rho_k^{(t+1)}(c) = \rho_k^{(t)}(c) \cdot \kappa_k^{(t)}(c)$.
-
-### Compact per-pass update (cosine default)
-
-$$
-\boxed{
-\rho_k^{(t+1)}(c) = \rho_k^{(t)}(c) \;\cdot\;
-\frac{\sum_j \rho_j^{(t)}(c)\,(W_j * \rho_j^{(t)})(c)}{
-\sqrt{\sum_j \rho_j^{(t)}(c)^2}\;
-\sqrt{\sum_j \bigl((W_j * \rho_j^{(t)})(c)\bigr)^2} + \epsilon}
-}
-$$
-
-(Per-bin $\kappa_k$ variants use the same $S_k^{(t)}$ with different normalizations.)
-
-### Key difference from current architecture
-
-Currently: scalar $\rho$ per cell, collinear energy computed by projecting
-double-angle fields onto the cell's own orientation.  The projection acts
-as an implicit orientation filter.
-
-Hypercolumn version: K-channel $\rho$ per cell, each channel explicitly
-filtered by its own tangent-selective kernel.  With **cosine** κ, a single
-scalar compares the full cell profile to the neighborhood's pooled $S_k$,
-restoring projection-like "agreement with me" semantics across bins.
-
-### What this enables
-
-- **Depthwise conv2d**: one call per pass instead of $2K$ separate
-  convolutions (cos2θ and sin2θ channels per bin).  Faster on GPU.
-- **Per-bin collinear facilitation**: each orientation channel is
-  facilitated independently along its own tangent.  A junction cell
-  with bins at 0° and 90° both active gets facilitation along *both*
-  tangent directions simultaneously.  The current architecture picks
-  one branch and ignores the other.
-- **Natural junction representation**: 3-way junctions have 3 active
-  bins, each facilitated by its own collinear neighbors.  No branch
-  selection heuristic.
 
 ---
 
-## Readout (replaces renderer)
+## 5. Post-recurrence dominant channel (cached to disk)
 
-The output at each cell is a K-vector $\rho_k^{(T)}(c)$.  To produce
-a scalar edge map at pixel resolution:
-
-### Option A — max projection + interpolation
+Dominant bin $b^*(c) = \arg\max_k \rho_k^{(T)}(c)$. Cached scalars per cell include e.g.
 
 $$
-\rho_{\max}(c) = \max_k \rho_k^{(T)}(c)
+\rho_{\mathrm{dom}}(c) = \rho_{b^*}^{(T)}(c), \quad
+\theta(c) = \bar\theta_{b^*}, \quad
+\kappa_{\mathrm{col}}(c), \quad
+\rho_{\max}(c) = \max_k \rho_k^{(T)}(c),
 $$
 
-Interpolate $\rho_{\max}$ to pixel resolution, multiply by $h_{2m}$:
-
-$$
-\hat{B}(p) = h_{2m}(p) \cdot \bar{\rho}_{\max}(p)
-$$
-
-Simple, no learned parameters.  The collinear recurrence and GABA budget
-do all the work; the readout just picks the strongest surviving orientation.
-
-### Option B — orientation-matched readout
-
-At each pixel, the orientation $\theta_h(p)$ from L0 selects the
-matching bin.  Interpolate that bin's $\rho$ to pixel resolution:
-
-$$
-\hat{B}(p) = h_{2m}(p) \cdot \bar{\rho}_{b(p)}^{(T)}(p)
-$$
-
-where $b(p) = \lfloor \theta_h(p) \cdot K / \pi \rfloor$.
-
-This is tighter — a pixel's edge strength is gated only by the
-survival of its orientation's channel, not the max across all
-orientations.
-
-### Option C — minimal MLP (current approach, adapted)
-
-Keep the small MLP but feed it per-bin features:
-
-$$
-F_p = \bigl[\;h_{2m}^{\text{lum}},\; h_{2m}^{\text{chr}},\;
-\bar{\rho}_{b(p)}^{(T)},\; \bar{\rho}_{\max}^{(T)},\;
-\bar{\kappa}_{b(p)},\; r_{\text{pres}},\;
-\text{tang}_5,\; \text{norm}_5\;\bigr]
-$$
-
-Same MLP structure, similar feature count, but the features come
-from the K-channel representation instead of eigendecomposition.
+and intermediate diagnostics (`e_{\mathrm{col}}`, etc.) as produced by `run_l1_hypercolumn` / `build_cells_flat`.
 
 ---
 
-## η modulation (unchanged in principle)
+## 6. Regional η — MLP$_\eta$ (training / inference pass 2)
 
-The collinear energy $E_{\text{col}}$ becomes the per-bin sum:
-
-$$
-E_{\text{col}}(c) = S_{b_{\max}(c)}^{(T)}(c)
-$$
-
-where $b_{\max}(c) = \arg\max_k \rho_k^{(T)}(c)$ is the dominant bin.
-
-The κ is already computed per-bin from the GABA budget.  Use the
-dominant bin's κ:
+On the **cell** grid, mean-pool with radius $R_\eta$ in cell indices (`L0.ETA_POOL_RADIUS_CELLS`), borders zeroed before pool:
 
 $$
-\eta(p) = \eta_0 \cdot \sigma\!\bigl(a - b\cdot\bar{\kappa}_{b_{\max}} + c\cdot\bar{E}_{\text{col}}\bigr)
+\bar\kappa_c = \mathrm{pool}_{R_\eta}(\kappa_{\mathrm{col}}), \quad
+\bar z_{0,c} = \mathrm{pool}_{R_\eta}(z_0), \quad
+\bar\rho_{\max,c} = \mathrm{pool}_{R_\eta}(\rho_{\max}).
 $$
 
-Same 3 learned scalars, same sigmoid, same two-pass pipeline.
+**Max-normalize** pooled $\bar z_0$ and $\bar\rho_{\max}$ on the grid (per forward, for stable MLP inputs); concatenate with $\bar\kappa_c$ → **MLP$_\eta$**: $3 \to 8 \to 1$, $\sigma$ on the logit, then **bilinear interp** to pixels:
+
+$$
+\eta_{\mathrm{lum}}(p) = \eta_0^{\mathrm{lum}}\cdot m(p), \qquad
+\eta_{\mathrm{chr}}(p) = \eta_0^{\mathrm{chr}}\cdot m(p), \qquad
+m = \sigma(\mathrm{MLP}_\eta(\cdot)) \in [m_{\min},1]
+$$
+
+(modulation $m$ is clamped after sigmoid / interp in code so NR stays stable).
+
+**Training gradient path** (`train.HarmonicContourE2E.forward_batch`): pass-2 $h_{2m}^{\mathrm{lum}}, h_{2m}^{\mathrm{chr}}$ from `fast_l0_pass2` are **detached** (no grad through L0 NR/harmonics). The map $\eta_{\mathrm{lum}}(p)$ is copied into `l0_pix["eta_mod_map"]` **without** detaching from MLP$_\eta$. The renderer appends $\hat\eta_{\mathrm{mod}} = \eta_{\mathrm{lum}}$ as the **15th** input to the readout MLP so gradients reach MLP$_\eta$ through the gate only.
 
 ---
 
-## Computational comparison
+## 7. Renderer — interp, stencils, readout MLP
 
-| Operation | Current (eigendecomp) | Hypercolumn (K-bin) |
-|---|---|---|
-| Binning / eigendecomp | 3×3 eigensolver per patch | $K$ dot products per patch |
-| Collinear per pass | $2K$ conv2d on $(1,1,n_H,n_W)$ | 1 depthwise conv2d on $(1,K,n_H,n_W)$ |
-| Representation per cell | $(\lambda_1, \theta_0, \lambda_2, \theta_1)$ | K-vector $\rho_k$ |
-| Branch selection | pick 1 of 2 | not needed |
-| Junction handling | limited to 2 orientations | natural, K orientations |
+**θ combing** on the cell grid (double-angle, ρ-weighted smooth), then **bilinear** sampling of stacked fields to pixels → $\bar\rho(p), \bar\theta(p), \bar\kappa_{\mathrm{col}}(p)$.
+
+**Stencils** on $h_{2m}^{\Sigma} = h_{2m}^{\mathrm{lum}} + h_{2m}^{\mathrm{chr}}$ with unit tangent $\hat t = (\cos\bar\theta,\sin\bar\theta)$ and normal $\hat n = (-\sin\bar\theta,\cos\bar\theta)$, learned spacings $s_t, s_n = \mathrm{softplus}(\cdot)$:
+
+$$
+\mathrm{tang}_j(p) = h_{2m}^{\Sigma}\bigl(p + j\, s_t\, \hat t(p)\bigr), \quad
+\mathrm{norm}_j(p) = h_{2m}^{\Sigma}\bigl(p + j\, s_n\, \hat n(p)\bigr), \quad j \in \{-2,-1,0,1,2\}.
+$$
+
+**Feature vector** $F_p \in \mathbb{R}^{15}$:
+
+$$
+F_p = \bigl[
+h_{2m}^{\mathrm{lum}},\, h_{2m}^{\mathrm{chr}},\, \bar\rho,\, \bar\kappa_{\mathrm{col}},\,
+\mathrm{tang}_{-2},\ldots,\mathrm{tang}_{2},\,
+\mathrm{norm}_{-2},\ldots,\mathrm{norm}_{2},\,
+\hat\eta_{\mathrm{mod}}
+\bigr].
+$$
+
+If `eta_mod_map` is absent (pass 1 only), $\hat\eta_{\mathrm{mod}} \equiv 0$.
+
+**Boundary map**:
+
+$$
+\mathrm{gate}(p) = \sigma\bigl(\mathrm{MLP}_{\mathrm{read}}(F_p)\bigr), \qquad
+\hat B(p) = h_{2m}^{\Sigma}(p)\,\bar\rho(p)\,\mathrm{gate}(p).
+$$
+
+$\mathrm{MLP}_{\mathrm{read}}$: **15 → 8 → 1** (ReLU between linear layers). Interp of $\bar\theta$ for geometry is **stopped** for autograd where noted in code.
 
 ---
 
-## Parameter budget
+## 8. Training wrap-up (`train.py`)
 
-### Without MLP (Options A or B)
+- **Disk cache** (`precompute_image`): L0 → L1 with a **standalone** `HypercolumnSeed` init; stores `cells_flat`, `l0_pix`, $d_k$, masks, etc. Versioned by `TRAIN.CACHE_VERSION`.
+- **`RhoSeedModule`** in the trainable model **does not re-run L1**; it forwards **cached** $\rho$ from `cells_flat["lam"][...,0]` (dominant $\lambda$ / precomputed channel). So **loss does not update** $\tilde\eta_z$ or $\tilde\alpha_{d,t}$ unless the pipeline is changed to run L1 inside the step.
+- **Does receive gradients**: `ModulationRenderer` (readout MLP + $s_t,s_n$), and **`EtaRegionalMLP`** via the $\hat\eta_{\mathrm{mod}}$ feature path above when pass-2 tensors are present.
 
-| Component | Params |
-|---|---:|
-| $\tilde{\eta}_z$ | 1 |
-| $a, b, c$ (η mod) | 3 |
-| **Total** | **4** |
-
-### With minimal MLP (Option C)
-
-| Component | Params |
-|---|---:|
-| $\tilde{\eta}_z$ | 1 |
-| $a, b, c$ (η mod) | 3 |
-| Thinning MLP (4→4→1) | 25 |
-| **Total** | **~29** |
+Loss (default mix in `params.TRAIN`): soft-Dice and/or BCE on the valid η-band vs.\ ground-truth edges.
 
 ---
 
-## Summary
+## 9. Learned parameter count (current spec)
 
-The hypercolumn architecture replaces the eigendecomposition with direct
-orientation binning.  Each cell position becomes a K-channel unit
-(hypercolumn) whose channels compete via the GABA budget and facilitate
-along their respective tangent directions.  The collinear recurrence
-is simpler (depthwise conv instead of double-angle projection), more
-expressive (K orientations instead of 2), and naturally handles junctions.
+| Block | Params | Notes |
+|------:|-------:|------|
+| $\tilde\alpha_d, \tilde\alpha_t$ | 2 | Collinear kernel scales |
+| $\tilde\eta_z$ | 1 | Pre-GABA NR floor |
+| MLP$_\eta$ (3→8→1) | 41 | Regional η |
+| $s_t, s_n$ | 2 | Stencil spacing |
+| MLP$_{\mathrm{read}}$ (15→8→1) | 137 | Thinning gate |
+| **Total** | **183** | |
 
-The eigensolver was an analytical shortcut for finding dominant orientations
-in a patch.  The K-bin + GABA recurrence achieves the same result
-empirically — dominant orientations survive the competition — while
-preserving the full orientation spectrum for junction and texture analysis.
+---
+
+## 10. Module map
+
+| Symbol / stage | Primary code |
+|----------------|----------------|
+| $d_k$, NR, harmonics, `fast_l0_pass2` | `hci/L0.py` |
+| Binning, GABA, dominant extract | `hci/L1.py` |
+| `HypercolumnSeed`, $\eta_z$, $\alpha_{d,t}$ | `hci/L1.py` (seed), `hci/seed.py` (wrapper) |
+| Pool + MLP$_\eta$ | `hci/L0.py` (`EtaRegionalMLP`, `compute_eta_modulation_mlp`) |
+| Renderer | `hci/renderer.py` |
+| Cache, batch, loss | `train.py` |
+| Single-image tooling | `infer.py`, `test.py` |
+
+---
+
+## Revision note
+
+Earlier drafts of this file described a **hypothetical** K-channel readout replacing the renderer; the **running code** uses the pipeline above (dominant-bin cache + 15-D renderer + detached pass-2 h2m with $\eta_{\mathrm{lum}}$ in $F_p$). This document tracks the implementation.

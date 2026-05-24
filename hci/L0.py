@@ -189,12 +189,15 @@ def _naka_per_direction(
     d_t = d - torch.amin(d, dim=-1, keepdim=True)
     d_sq = d_t * d_t
     g = torch.tensor(float(gamma), dtype=torch.float32, device=device)
+    # Avoid 0/0 when η→0 and all directional d̃ are 0 (flat region).
+    _den_floor = 1e-8
     if isinstance(eta, torch.Tensor):
         # eta is (H, W) → expand to (H, W, 1) for broadcasting with (H, W, N)
-        eta_sq = (eta * eta).unsqueeze(-1)
+        eta_sq = (eta * eta).unsqueeze(-1).clamp_min(_den_floor)
     else:
-        eta_sq = float(eta) * float(eta)
-    return g * d_sq / (eta_sq + d_sq)
+        eta_sq = max(float(eta) * float(eta), _den_floor)
+    den = eta_sq + d_sq
+    return g * d_sq / den.clamp_min(_den_floor)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -501,12 +504,12 @@ def compute_eta_modulation(
 
     a_t, b_t, c_t = _t(a), _t(b), _t(c)
 
-    # σ(a - b·κ + c·E_col_norm) on cell grid
+    # σ(a - b·κ + c·E_col_norm) on cell grid; floor mod so η stays > 0 for Naka stability
     logit = a_t - b_t * kappa + c_t * e_col_norm
-    mod_grid = torch.sigmoid(logit)
+    mod_grid = torch.sigmoid(logit.clamp(-40.0, 40.0)).clamp(1e-3, 1.0)
 
     # Interpolate to pixel resolution
-    mod_pix = _interp_cell_to_pixel(mod_grid, nH, nW, H, W, S, P)
+    mod_pix = _interp_cell_to_pixel(mod_grid, nH, nW, H, W, S, P).clamp(1e-3, 1.0)
 
     eta_lum_map = eta0_lum * mod_pix
     eta_chr_map = eta0_chr * mod_pix
@@ -587,9 +590,10 @@ def compute_eta_modulation_mlp(
 
     feats = torch.stack([kappa_p, z0_n, rho_n], dim=-1).reshape(-1, 3)
     logits = mlp(feats).reshape(nH, nW)
-    mod_grid = torch.sigmoid(logits)
+    # Cap logits so σ and interp stay finite; floor mod so η never hits 0 (Naka 0/0).
+    mod_grid = torch.sigmoid(logits.clamp(-40.0, 40.0)).clamp(1e-3, 1.0)
 
-    mod_pix = _interp_cell_to_pixel(mod_grid, nH, nW, H, W, S, P)
+    mod_pix = _interp_cell_to_pixel(mod_grid, nH, nW, H, W, S, P).clamp(1e-3, 1.0)
     eta_lum_map = torch.as_tensor(eta0_lum, device=device, dtype=dtype) * mod_pix
     eta_chr_map = torch.as_tensor(eta0_chr, device=device, dtype=dtype) * mod_pix
     return eta_lum_map, eta_chr_map
