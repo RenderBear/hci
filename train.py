@@ -610,14 +610,13 @@ def bce_loss_with_ignore(
 
 
 def remap_checkpoint_state_dict(sd: dict) -> dict:
-    """Remap legacy dynamics/eta keys; warm-start ``_eta0_raw`` / ``_eta_z_raw`` when absent.
+    """Remap legacy dynamics/eta keys; warm-start ``_eta0_raw`` when absent.
 
     ``seed._eta_rho_raw`` / ``dynamics._eta_rho_raw`` are omitted.  Legacy ``eta_mod_*``,
     ``eta_mlp.*``, and ``seed.hc_seed._gaba_alpha_raw`` are dropped.
 
-    Legacy ``*_eta_z_raw`` seeds **scalar** ``η_z`` (seed NR).  Old ``_eta_pass_raw`` /
-    merged ``_eta0_raw``-only checkpoints also seed ``η₀`` (MLP scale); missing ``_eta_z_raw``
-    is duplicated from ``_eta0_raw`` when needed.
+    Legacy ``*_eta_z_raw`` is ignored (``η_z`` is no longer a learned parameter).  Old
+    ``_eta_pass_raw`` / merged ``_eta0_raw``-only checkpoints seed ``η₀`` when missing.
     """
     skip = frozenset({"seed._eta_rho_raw", "dynamics._eta_rho_raw"})
     out: dict = {}
@@ -646,11 +645,6 @@ def remap_checkpoint_state_dict(sd: dict) -> dict:
             out["seed.hc_seed._eta0_raw"] = legacy_eta_pass_raw.reshape(-1)[0].clone()
         elif legacy_eta_raw is not None and legacy_eta_raw.numel() >= 1:
             out["seed.hc_seed._eta0_raw"] = legacy_eta_raw.reshape(-1)[0].clone()
-    if "seed.hc_seed._eta_z_raw" not in out:
-        if legacy_eta_raw is not None and legacy_eta_raw.numel() >= 1:
-            out["seed.hc_seed._eta_z_raw"] = legacy_eta_raw.reshape(-1)[0].clone()
-        elif "seed.hc_seed._eta0_raw" in out:
-            out["seed.hc_seed._eta_z_raw"] = out["seed.hc_seed._eta0_raw"].clone()
     return out
 
 
@@ -689,11 +683,11 @@ def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
     print("\n--- seed + renderer grad debug ---")
     print("\n  learned (value):")
     print(
-        f"    η_z={float(s.hc_seed.eta_z.detach()):.4f}  "
+        f"    η_z={float(s.hc_seed.eta_z.detach()):.4f} (fixed)  "
         f"η₀={float(s.hc_seed.eta0.detach()):.4f}",
     )
     print("\n  |grad| on raw params:")
-    for raw, label in (("_eta_z_raw", "η_z"), ("_eta0_raw", "η₀")):
+    for raw, label in (("_eta0_raw", "η₀"),):
         t = getattr(s.hc_seed, raw, None)
         if t is None or t.grad is None:
             print(f"    {label}: grad=None")
@@ -789,7 +783,7 @@ def format_seed_param_lines(seed: RhoSeedModule, *, indent: str = "  ") -> list[
     n_mlp = sum(p.numel() for p in hc.gaba_eta_mlp.parameters())
     return [
         f"{indent}tile geometry:  R={seed.R}  stride={seed.stride}",
-        f"{indent}seed η_z:  {hc.eta_z.item():.3f}  |  GABA:  η₀={hc.eta0.item():.3f}  "
+        f"{indent}seed η_z:  {hc.eta_z.item():.3f} (fixed)  |  GABA:  η₀={hc.eta0.item():.3f}  "
         f"pool_r={hc.gaba_eta_pool_r}  MLP(2→8→1) params={n_mlp}  "
         f"β_seed={hc.beta_seed.item():.3f}  β_coll={hc.beta_coll.item():.3f}  "
         f"β_cross={hc.beta_cross.item():.3f}",

@@ -1,7 +1,8 @@
 r"""Shared pipeline hyperparameters, module inits, and script defaults.
 
-L1 builds cos² hypercolumns → **scalar** ``η_z`` **seed NR** on raw ``μ`` → raw β +
-**spatial** ``η=η₀·σ(``MLP``(``pooled κ, \\bar z``))`` from collinear passes; inhibition uses
+L1 builds cos² hypercolumns → raw ``μ`` (no seed NR) → raw β + collinear / surround ``u``,
+then **one** divisive NR per pass with **spatial** ``η=η₀·σ(``MLP``(``pooled κ, \\bar z``))``.
+Fixed scalar ``η_z`` (``SEED.ETA_Z``, not learned) is kept for captions / legacy only. Inhibition uses
 **isotropic surround** per bin ``k``: LOO mean ``(1/\\max(K-1,1))\\sum_{j\\neq k}ρ_j`` then convolve with the same radial kernel as ``G_k`` (no tangential weight).
 ``κ`` is cosine ``(ρ·S)/(‖ρ‖‖S‖)``; ``\\bar z`` pools ``Σ_k u_k`` (not used for seed ``η``).
 The renderer interpolates ρ, θ, κ and applies ``h2m·ρ̄·gate`` (14-D readout, no η_mod).
@@ -52,9 +53,10 @@ SEED = SimpleNamespace(
     STRIDE=7,
     EPS=1e-9,
     # Base scale η₀ in η = η₀·σ(MLP) on collinear passes (softplus of raw).
-    # Scalar seed η_z uses the **same** initial positive value unless you pass
-    # ``eta_z_init`` / ``eta_pass_init`` to ``HypercolumnSeed``.
+    # Fixed η_z (register_buffer on ``HypercolumnSeed``; not learned). Initialized from
+    # ``eta_z_init`` / ``eta_pass_init`` if passed, else ``ETA_Z``.
     ETA0_INIT=5.0,
+    ETA_Z=5.0,
     # Raw-space recurrence weights (softplus → positive)
     BETA_SEED_INIT=0.3,
     BETA_COLL_INIT=0.5,

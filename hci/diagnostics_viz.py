@@ -403,7 +403,7 @@ def viz_infer_rho_map_hist_cdf(
         interpolation="nearest",
     )
     ax_map.set_title(
-        rf"cell $\rho$  (NR seed; raw max={m_i:.4g})",
+        rf"cell $\rho$  (post-GABA; raw max={m_i:.4g})",
         fontsize=9,
         color=VIZ.FG,
         fontfamily="monospace",
@@ -454,7 +454,7 @@ def viz_infer_rho_map_hist_cdf(
         s.set_color(VIZ.ACCENT)
 
     eta_note = (
-        rf"  $\eta_z$={eta_z:.4g}" if eta_z is not None else ""
+        rf"  $\eta_z$={eta_z:.4g} (fixed)" if eta_z is not None else ""
     )
     fig.suptitle(
         "Cell ρ — map, histogram (interior), empirical CDF" + eta_note,
@@ -475,13 +475,12 @@ def viz_infer_rho_seed_final_dual_maps(
     *,
     n_collinear_passes: int,
 ) -> None:
-    """Side-by-side cell ρ: same dominant bin after recurrence, pre-GABA NR vs post-GABA.
+    """Side-by-side cell ρ: same dominant bin after recurrence, raw ``μ`` vs post-GABA.
 
     ``rho_seed`` / ``rho_final`` are the per-cell scalar channels saved in L1 (not renderer
     bookkeeping). The dominant bin index is taken **after** collinear recurrence; the left
-    map is **normalized** pre-GABA energy at that bin (divisive NR vs η_z on raw
-    bin energy), the right
-    map is ρ at that bin **after** GABA (no post-GABA squash).
+    map is **normalized** raw oriented energy ``μ`` at that bin, the right map is ρ at that bin
+    **after** GABA.
     """
     gs = apply_border_zero(np.asarray(rho_seed, dtype=np.float64), is_border)
     gf = apply_border_zero(np.asarray(rho_final, dtype=np.float64), is_border)
@@ -496,7 +495,7 @@ def viz_infer_rho_seed_final_dual_maps(
     norm_seed = np.clip(gs / vmax, 0.0, 1.0)
     norm_fin = np.clip(gf / vmax, 0.0, 1.0)
     titles = (
-        r"$\rho$ pre-GABA (NR at post-recurrence winner bin)",
+        r"$\rho$ raw $\mu$ at post-recurrence winner bin",
         r"$\rho$ post-GABA (winner bin, no extra squash)",
     )
     for ax, arr, title in zip(axes, (norm_seed, norm_fin), titles):
@@ -506,7 +505,7 @@ def viz_infer_rho_seed_final_dual_maps(
         ax.axis("off")
     fig.suptitle(
         "cell $\\rho$: same dominant bin after recurrence, "
-        "pre-GABA NR vs post-GABA "
+        "raw $\\mu$ vs post-GABA "
         f"(shared color scale, max={vmax:.4g})",
         fontsize=10,
         color=VIZ.FG,
@@ -526,7 +525,7 @@ def viz_infer_kappa_pass0_final_dual_maps(
     n_collinear_passes: int,
     kappa_vmax: float | None = None,
 ) -> None:
-    """Per-cell ``κ`` = cosine ``(ρ·S)/(‖ρ‖‖S‖)`` (first vs last pass), in ``[0,1]``.
+    """Per-cell ``κ`` = cosine ``(ρ·S)/(‖ρ‖‖S‖)``: **pre** = first pass with ``ρ=μ``; **post** = last pass.
 
     Same definition as the η-MLP input before pooling.  Color scale defaults to
     ``[0,1]`` (override ``kappa_vmax`` for a wider display range).
@@ -538,8 +537,8 @@ def viz_infer_kappa_pass0_final_dual_maps(
     fig, axes = plt.subplots(1, 2, figsize=(13.6, 6.15), facecolor=VIZ.BG)
     n_p = int(n_collinear_passes)
     if n_p <= 0:
-        t_final = "—"
-        pass_note = "0 collinear passes (κ maps are zeros)"
+        t_final = "-"
+        pass_note = "0 collinear passes (kappa maps are zeros)"
     elif n_p == 1:
         t_final = "0"
         pass_note = "1 collinear pass (first = final)"
@@ -547,8 +546,8 @@ def viz_infer_kappa_pass0_final_dual_maps(
         t_final = str(n_p - 1)
         pass_note = f"{n_p} collinear passes"
     titles = (
-        r"$\kappa$ — $\rho \cdot S / (\|\rho\|\|S\|)$ after first pass",
-        rf"$\kappa$ — same after last pass ($t={t_final}$)",
+        "kappa_pre: first pass (rho = mu)",
+        f"kappa_post: last pass (t = {t_final})",
     )
     ims = []
     for ax, arr, title in zip(axes, (k0, k1), titles):
@@ -564,8 +563,8 @@ def viz_infer_kappa_pass0_final_dual_maps(
         ax.set_title(title, fontsize=9, color=VIZ.FG, fontfamily="monospace")
         ax.axis("off")
     fig.suptitle(
-        "cell diagnostic $\\kappa$ (cosine $\\rho$ vs collinear pool $S$; η-MLP input) — "
-        f"first vs final pass  ({pass_note})",
+        "kappa = (rho . S) / (||rho|| * ||S||), pre- vs post-divisive NR. "
+        + pass_note,
         fontsize=10,
         color=VIZ.FG,
         fontfamily="monospace",
@@ -582,7 +581,7 @@ def viz_infer_kappa_pass0_final_dual_maps(
         aspect=36,
     )
     cbar.set_label(
-        rf"$\kappa$  (alignment in $[0,1]$; vmax={kmax:g})",
+        f"kappa clipped to [0, {kmax:g}]",
         color=VIZ.FG,
         fontsize=9,
         fontfamily="monospace",
@@ -603,7 +602,7 @@ def viz_infer_rho_seed_final_hist_cdf(
     *,
     n_bins: int = 64,
 ) -> None:
-    """Interior histograms + empirical CDFs for L1 pre/post GABA ρ (common ρ range)."""
+    """Interior histograms + empirical CDFs for L1 raw ``μ`` vs post-GABA ρ (common ρ range)."""
     ib = np.asarray(is_border, dtype=bool)
     gs = apply_border_zero(np.asarray(rho_seed, dtype=np.float64), is_border)
     gf = apply_border_zero(np.asarray(rho_final, dtype=np.float64), is_border)
@@ -615,7 +614,7 @@ def viz_infer_rho_seed_final_hist_cdf(
 
     fig, axes = plt.subplots(2, 2, figsize=(11.5, 8.2), facecolor=VIZ.BG)
     fig.suptitle(
-        r"Interior $\rho$ pre-GABA vs post-GABA — histograms & CDFs "
+        r"Interior raw $\mu$ vs post-GABA $\rho$ — histograms & CDFs "
         f"(common range [0, {xmax:.4g}])",
         fontsize=10,
         color=VIZ.FG,
@@ -623,7 +622,7 @@ def viz_infer_rho_seed_final_hist_cdf(
     )
 
     rows = (
-        (flat_s, r"$\rho$ pre-GABA (post-$\theta$ winner bin)"),
+        (flat_s, r"raw $\mu$ (post-$\theta$ winner bin)"),
         (flat_f, r"$\rho$ post-GABA (after recurrence)"),
     )
     for row_i, (flat, row_title) in enumerate(rows):
@@ -685,9 +684,9 @@ def viz_infer_rho_post_minus_pre_map_hist_cdf(
     n_bins: int = 64,
     n_collinear_passes: int | None = None,
 ) -> None:
-    """Cell-grid Δρ = ρ_post − ρ_pre (post-θ winner bin): map + interior histogram + CDF.
+    """Cell-grid Δρ = ρ_post − μ (post-θ winner bin): map + interior histogram + CDF.
 
-    Uses the same pre/post scalars as ``viz_infer_rho_seed_final_*`` (NR at the bin that
+    Uses the same pre/post scalars as ``viz_infer_rho_seed_final_*`` (raw ``μ`` at the bin that
     dominates after GABA, evaluated before vs after recurrence). Negative Δρ indicates
     suppression at that bin.
     """
