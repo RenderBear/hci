@@ -1,10 +1,9 @@
 r"""Seed module — thin wrapper providing renderer-compatible interface.
 
-HypercolumnSeed holds learned η_z (divisive NR) and α (additive lateral step)
-used in ``run_l1_hypercolumn``: pre-GABA NR on raw bins, then recurrent
-``relu(ρ + α(S - mean_k S_k))`` with the **same** η_z NR after each pass.  Stored
-``κ`` in ``cells_flat`` is a **diagnostic** bin-mass share for the renderer, not
-a recurrence gate.
+HypercolumnSeed holds learned η_z (divisive NR on raw bins), collinear σ scales,
+and logit-space β weights used in ``run_l1_hypercolumn``.  Stored ``κ`` in
+``cells_flat`` is a **diagnostic** (peakedness or pass-0 pool support), not a
+recurrence gate in the old cosine sense.
 """
 
 from __future__ import annotations
@@ -21,7 +20,7 @@ class RhoSeedModule(nn.Module):
     """Drop-in replacement using HypercolumnSeed.
 
     The forward() method expects cells_flat from ``run_l1_hypercolumn``
-    (pre-GABA NR, additive GABA + per-pass NR, then dominant-bin readout).  This module
+    (pre-GABA NR, logit GABA recurrence, then dominant-bin readout).  This module
     reads dominant ρ from ``lam[...,0]`` and passes through with the renderer
     return signature.  During training, ``train.prepare_batch`` builds that
     dict with ``cells_format="torch"`` so ``hc_seed`` participates in autograd.
@@ -32,7 +31,6 @@ class RhoSeedModule(nn.Module):
         self.hc_seed = HypercolumnSeed(
             r_pool=r_pool, stride=stride,
             eps=eps, eta_z_init=eta_z_init,
-            gaba_alpha_init=SEED.GABA_ALPHA_INIT,
         )
         # Expose for compat
         self.R = self.hc_seed.R
@@ -42,10 +40,6 @@ class RhoSeedModule(nn.Module):
     @property
     def eta_z(self):
         return self.hc_seed.eta_z
-
-    @property
-    def gaba_alpha(self):
-        return self.hc_seed.gaba_alpha
 
     @property
     def _eta_z_raw(self):

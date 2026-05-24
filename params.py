@@ -1,9 +1,9 @@
 r"""Shared pipeline hyperparameters, module inits, and script defaults.
 
-L1 builds cos² hypercolumns → η_z divisive NR on raw bins (pre-GABA) → additive
-collinear recurrence (learned ``α`` lateral step, same ``η_z`` NR after each pass).
-Diagnostic ``κ`` in cells is bin mass share, not a recurrence gate.
-The renderer interpolates ρ, θ, κ and applies ``h2m·ρ̄·gate``.
+L1 builds cos² hypercolumns → η_z divisive NR on raw bins (pre-GABA) → logit-space
+GABA recurrence (learned β_seed, β_coll, β_cross on collinear pool / cross-orientation).
+Diagnostic ``κ`` after GABA is a peakedness ratio on the final ``ρ_k`` profile.
+The renderer interpolates ρ, θ, κ and applies ``h2m·ρ̄·gate`` (14-D readout, no η_mod).
 
 Training disk cache: ``TRAIN.CACHE_VERSION`` invalidates stored L0 tensors used
 for **live** L1 each step (``h2m``, ``theta_h``, masks, etc.); it does not cache
@@ -24,14 +24,10 @@ L0 = SimpleNamespace(
     ],
     ETA_LUM=0.05,
     ETA_CHR=0.05,
-    ETA0=0.05,
     GAMMA=1.0,
     # Bump when ``_compute_d_lum_chroma`` / ``L0.OFFSETS`` semantics change.
     # Train cache can reuse stored ``d_lum``/``d_chr`` across ``TRAIN.CACHE_VERSION`` bumps.
     L0_DIST_CACHE_VERSION=1,
-    # Regional η MLP: mean-pool cell stats over (2R_η+1)², R_η in cell units.
-    ETA_POOL_RADIUS_CELLS=10,
-    ETA_MLP_HIDDEN=8,
 )
 
 # ── L1: hypercolumn cell grid + collinear recurrence (depthwise GABA) ───────
@@ -54,8 +50,10 @@ SEED = SimpleNamespace(
     EPS=1e-9,
     # Softplus(·) → η_z for pre-GABA NR; keep O(1) vs typical cos² patch ρ_k (not ≫1).
     ETA_Z_INIT=5.0,
-    # Softplus(·) → α in ρ += α(S−S̄) before each-pass NR squash inside GABA.
-    GABA_ALPHA_INIT=0.5,
+    # Logit-space GABA recurrence betas (softplus → positive)
+    BETA_SEED_INIT=1.0,
+    BETA_COLL_INIT=0.3,
+    BETA_CROSS_INIT=0.3,
 )
 
 # ── Render: θ combing + bilinear interp + minimal gate (κ_col, E_col from L1) ─
@@ -74,7 +72,7 @@ TRAIN = SimpleNamespace(
     NUM_WORKERS=2,
     LAM_DICE=0.0,
     LAM_BCE=1.0,
-    CACHE_VERSION=17,
+    CACHE_VERSION=18,
 )
 
 # ── Inference ────────────────────────────────────────────────────────────────

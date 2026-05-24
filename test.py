@@ -29,7 +29,6 @@ from scipy.ndimage import binary_dilation
 from params import L0, L1, RENDER, SEED, TEST
 from hci.L0 import compute_l0_rgb, compute_interior, _compute_d_lum_chroma
 from hci.L1 import (
-    HypercolumnSeed,
     pad_for_patch_grid,
     run_l1_hypercolumn,
     z_from_l0_harmonics,
@@ -45,7 +44,6 @@ from train import (
     HarmonicContourE2E,
     build_cells_flat,
     build_l0_pix,
-    fast_l0_pass2,
     remap_checkpoint_state_dict,
     report_checkpoint_compatibility,
 )
@@ -200,8 +198,6 @@ def run_image_inference(model, img_path, device, *, verbose: bool = False):
     gc.collect()
 
     Hp, Wp = ir_p.shape[:2]
-    S = cells.get("S", 2)
-    P = cells.get("P", L1.PATCH_SIZE)
     cells_flat = build_cells_flat(cells)
     del cells, ir_p
     gc.collect()
@@ -216,7 +212,6 @@ def run_image_inference(model, img_path, device, *, verbose: bool = False):
     with torch.no_grad():
         rho_out, branch, _, _, _, _, _ = model.seed(cells_flat=cf_dev)
 
-        # Pass 1: render with fixed-η l0_pix
         bmap_t, theta_t = render_boundary_map_torch(
             rho_out,
             proj_dev,
@@ -232,73 +227,6 @@ def run_image_inference(model, img_path, device, *, verbose: bool = False):
             content_w=W0,
             return_dominant_theta=True,
         )
-
-        # Pass 2: η modulation if model has learned params
-        if getattr(model, "eta_mlp", None) is not None and model.eta_mod_enabled:
-            from hci.L0 import compute_eta_modulation_mlp
-
-            H, W = proj_dev["H"], proj_dev["W"]
-            dtype = rho_out.dtype
-            S = int(cf_dev.get("S", max(1, W // max(nW, 1))))
-            P = int(cf_dev.get("P", S + (S - 1)))
-
-            ib_grid = cf_dev["is_border"].to(device=device).reshape(nH, nW).bool()
-
-            kappa_col = cf_dev["kappa_col_cell"].to(
-                device=device, dtype=dtype,
-            ).reshape(nH, nW)
-            z0_c = cf_dev["z0"].to(device=device, dtype=dtype).reshape(nH, nW)
-            rho_max_c = cf_dev["rho_max_cell"].to(
-                device=device, dtype=dtype,
-            ).reshape(nH, nW)
-
-            eta_lum_map, eta_chr_map, _mod_pix = compute_eta_modulation_mlp(
-                model.eta_mlp,
-                kappa_col, z0_c, rho_max_c, ib_grid,
-                nH, nW, H, W, S, P,
-                eta0_lum=L0.ETA_LUM,
-                eta0_chr=L0.ETA_CHR,
-                pool_radius=int(L0.ETA_POOL_RADIUS_CELLS),
-            )
-
-            if verbose:
-                n_eta_p = sum(p.numel() for p in model.eta_mlp.parameters())
-                print(f"  η-mod: regional MLP ({n_eta_p} params)")
-                print(
-                    f"  η_lum map: [{eta_lum_map.min():.4f}, {eta_lum_map.max():.4f}]  "
-                    f"(base {L0.ETA_LUM:.4f})"
-                )
-                print(
-                    f"  η_chr map: [{eta_chr_map.min():.4f}, {eta_chr_map.max():.4f}]  "
-                    f"(base {L0.ETA_CHR:.4f})"
-                )
-
-            border_mask = (~compute_interior(H, W, device)).to(device)
-            l0_pix_pass2 = fast_l0_pass2(
-                d_lum.to(device), d_chr.to(device),
-                eta_lum_map, eta_chr_map,
-                L0.GAMMA, L0.OFFSETS,
-                border_mask,
-            )
-            l0_pix_pass2 = {k: v.detach() for k, v in l0_pix_pass2.items()}
-            l0_pix_pass2["eta_mod_map"] = eta_lum_map
-            l0_dev2 = l0_pix_pass2
-
-            bmap_t, theta_t = render_boundary_map_torch(
-                rho_out,
-                proj_dev,
-                model.renderer,
-                cf_dev,
-                Hp,
-                Wp,
-                l0_dev2,
-                eps=model.render_eps,
-                training=False,
-                branch_pick=branch.reshape(-1).long(),
-                content_h=H0,
-                content_w=W0,
-                return_dominant_theta=True,
-            )
 
     bmap = bmap_t.cpu().numpy()[:H0, :W0]
     theta = theta_t.cpu().numpy()[:H0, :W0]

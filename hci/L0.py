@@ -556,9 +556,7 @@ class EtaRegionalMLP(nn.Module):
 
     def __init__(self, hidden: int | None = None):
         super().__init__()
-        from params import L0 as L0p
-
-        h = int(hidden if hidden is not None else L0p.ETA_MLP_HIDDEN)
+        h = int(hidden if hidden is not None else 8)
         self.fc1 = nn.Linear(3, h)
         self.fc2 = nn.Linear(h, 1)
         self._init_near_identity()
