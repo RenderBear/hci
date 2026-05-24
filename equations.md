@@ -79,7 +79,7 @@ Learned **scalar** $\eta_z = \mathrm{softplus}(\tilde\eta_z)$ (`HypercolumnSeed.
 
 From the **first collinear pass onward**, a learned $\eta_0 = \mathrm{softplus}(\tilde\eta_0)$ scales a **per-cell** modulation from a **2→8→1** MLP (`EtaGabaMLP`; sigmoid output clamped to $(10^{-3},1]$ in code).
 
-Let $\boldsymbol{\rho}^{(t)}(c)\in\mathbb{R}_+^K$ be the bin vector at the **start** of recurrence pass $t$ (the post–seed-NR grid for $t{=}0,1,\ldots$ inside the loop). Let $\mathbf{S}^{(t)}(c)\in\mathbb{R}_+^K$ stack the collinear pool outputs $\tilde S_k^{(t)}(c)$ **before** the $\beta$-mixture that forms $u$ (depthwise conv with **unnormalized** nonnegative kernels — a weighted **sum** over neighbors, not divided by $\sum G_k$). **Surround inhibition** uses **mean** bin energy $\bar Z^{(t)}(c)=\frac{1}{K}\sum_j \rho_j^{(t)}(c)$ convolved with the **same radial** Gaussian × disk as $G_k$ (center omitted), **without** tangential selectivity — an isotropic neighbor pool on the same scale as a single $\rho_k$ channel, then applied equally to every bin (center–surround normalization, not leave-one-out across other bins’ collinear chains). Define
+Let $\boldsymbol{\rho}^{(t)}(c)\in\mathbb{R}_+^K$ be the bin vector at the **start** of recurrence pass $t$ (the post–seed-NR grid for $t{=}0,1,\ldots$ inside the loop). Let $\mathbf{S}^{(t)}(c)\in\mathbb{R}_+^K$ stack the collinear pool outputs $\tilde S_k^{(t)}(c)$ **before** the $\beta$-mixture that forms $u$ (depthwise conv with **unnormalized** nonnegative kernels — a weighted **sum** over neighbors, not divided by $\sum G_k$). **Surround inhibition** is **per bin** $k$: at each cell, form the leave-one-out mean of the *other* orientations $\bar Z_k^{(t)}(c)=\frac{1}{\max(K-1,1)}\sum_{j\neq k}\rho_j^{(t)}(c)$, then apply the **same radial** Gaussian × disk as $G_k$ (center omitted), **without** tangential selectivity — i.e.\ $\mathcal{I}_k^{(t)}(c)=(H*\bar Z_k^{(t)})(c)$ with isotropic neighbor pooling on the competing-orientation field (bin $k$ does not feed its own surround). Define
 
 $$
 \kappa^{(t)}(c) = \frac{\boldsymbol{\rho}^{(t)}(c)\cdot \mathbf{S}^{(t)}(c)}{\bigl\|\boldsymbol{\rho}^{(t)}(c)\bigr\|\,\bigl\|\mathbf{S}^{(t)}(c)\bigr\| + \varepsilon}.
@@ -115,11 +115,11 @@ For each bin $k$, a nonnegative kernel $G_k$ is built on the $(2R+1)^2$ patch (G
 
 $$
 \tilde S_k^{(t)}(c) = (G_k * \rho_k^{(t)})(c), \qquad
-\bar Z^{(t)}(c) = \frac{1}{K}\sum_{j=0}^{K-1} \rho_j^{(t)}(c), \qquad
-\mathcal{I}^{(t)}(c) = (H * \bar Z^{(t)})(c).
+\bar Z_k^{(t)}(c) = \frac{1}{\max(K-1,1)}\sum_{j\neq k} \rho_j^{(t)}(c), \qquad
+\mathcal{I}_k^{(t)}(c) = (H * \bar Z_k^{(t)})(c).
 $$
 
-The inhibitory drive $\mathcal{I}^{(t)}(c)$ is **scalar per cell** (broadcast to all $k$ in code).
+The inhibitory drive $\mathcal{I}_k^{(t)}$ is **per orientation channel** (depthwise isotropic conv on the LOO mean map $\bar Z_k^{(t)}$).
 
 **Raw-space β** (softplus of raw parameters):
 
@@ -143,7 +143,7 @@ $$
 u_k^{(t)}(c) = \max\Bigl(0,\;
 \beta_{\mathrm{seed}}\,\rho_k^{\mathrm{seed}}(c)
 + \beta_{\mathrm{coll}}\,\tilde S_k^{(t)}(c)
-- \beta_{\mathrm{cross}}\,\mathcal{I}^{(t)}(c)
+- \beta_{\mathrm{cross}}\,\mathcal{I}_k^{(t)}(c)
 \Bigr),
 $$
 

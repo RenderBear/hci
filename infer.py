@@ -425,7 +425,7 @@ def main():
         "--diagnostics",
         action="store_true",
         help="Save additional diagnostics: base, l0_pinwheel, "
-        "geometry.png (first-pass $\\max_k \\tilde{S}_k$ and surround $\\mathcal{I}=H*\\bar{Z}$, $\\bar{Z}=\\frac{1}{K}\\sum_j\\rho_j$), "
+        "geometry.png (first-pass $\\max_k \\tilde{S}_k$ and LOO surround $\\mathcal{I}_{k^*}=H*\\bar{Z}_{k^*}$), "
         "rho (map+histogram+CDF), L1 pre/post GABA ρ (dual map + hist/CDF), "
         "Δρ map+histogram+CDF (rho_delta.png), "
         "κ first vs final GABA pass at post-dominant bin (kappa.png), "

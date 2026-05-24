@@ -11,8 +11,9 @@ Pipeline:
      ``ρ ← μ²/(μ²+η_z²+ε)`` — no spatial MLP.  Detach as ``ρ^{\mathrm{seed}}`` for the fixed
      β_s branch.
   4. ``T`` recurrent passes (``t \\ge 1`` in the recurrence story): depthwise collinear
-     ``S_k^{(t)}``, isotropic surround ``I^{(t)} = H * ((1/K)\\sum_j \\rho_j)`` (same radial
-     kernel as ``G_k``, no tangential weight), cosine ``κ`` vs ``S``, ``z=Σ_k u_k``, then
+     ``S_k^{(t)}``, per-bin isotropic surround ``I_k^{(t)} = H * \\bar{Z}_k^{(t)}`` where
+     ``\\bar{Z}_k`` is the spatial map of **leave-one-out** mean ``(1/(K-1))\\sum_{j\\neq k}\\rho_j``
+     (same radial kernel as ``G_k``, no tangential weight), cosine ``κ`` vs ``S``, ``z=Σ_k u_k``, then
      **spatial** ``η(c)=η₀·σ(``MLP``(``pooled κ, \\bar z``))`` (21×21 mean pool), NR on ``u``.
   5. Extract dominant ``ρ``, ``θ``, and diagnostic ``κ`` (cosine sim, in ``[0,1]``) for the
      renderer / readout — **not** multiplied into ``ρ``.
@@ -144,8 +145,8 @@ def _build_isotropic_surround_kernel(
     """Single-channel kernel ``(1,1,2R+1,2R+1)``: radial Gaussian × disk, center omitted.
 
     Matches the **radial** factor ``w_d`` of ``_build_collinear_kernels`` (no tangential
-    selectivity). Used on **mean** bin energy ``(1/K)\\sum_k ρ_k`` so surround drive matches
-    per-bin collinear scale (not ``K``× larger than ``S_k``).
+    selectivity). Applied **per bin** to the leave-one-out mean map
+    ``(1/\\max(K-1,1))\\sum_{j\\neq k} ρ_j`` so inhibition excludes bin ``k`` from its own surround.
     """
     sigma_d = sigma_d.to(device=device, dtype=dtype).clamp_min(torch.tensor(1e-4, device=device, dtype=dtype))
     offsets = torch.arange(-R, R + 1, device=device, dtype=dtype)
@@ -406,10 +407,10 @@ def gaba_recurrence(
     **Seed:** NR with learned **scalar** ``η_z`` only (no MLP, no ``κ``/``z`` for ``η``).
 
     **Passes:** Collinear pools ``S_k = G_k * ρ_k`` use **unnormalized** nonnegative
-    kernels ``G_k``. Inhibition uses an **isotropic surround** on
-    ``\\bar{Z} = (1/K)\\sum_j ρ_j`` (mean bin energy — same scale as one ``ρ_k`` channel), then
-    ``I = H * \\bar{Z}`` with the same radial Gaussian × disk as ``G_k`` (no tangential weight),
-    broadcast to all bins — comparable magnitude to ``S_k``, not ``K``× inflated.
+    kernels ``G_k``. Inhibition uses **per-bin** isotropic surround ``I_k = H * \\bar{Z}_k`` where
+    ``\\bar{Z}_k`` is the spatial map ``(1/\\max(K-1,1))\\sum_{j\\neq k} ρ_j`` (leave-one-out mean
+    at each cell), then depthwise conv with the same radial Gaussian × disk as ``G_k`` (no tangential
+    weight) — bin ``k`` is not counted in its own inhibitory pool (avoids canceling ``β_coll S_k``).
     ``κ = (ρ·S)/(‖ρ‖‖S‖+ε)``, ``z=Σ_k u_k``, pool → ``η(c)=η₀·σ(``MLP``(·))``.
 
     ``kappa_k`` / ``kappa_*_cell`` store cosine ``κ`` from the first / last **collinear**
@@ -418,8 +419,7 @@ def gaba_recurrence(
     Returns:
         rho_k_out, kappa_k, kappa_k_pass0, rho_k_seed_snap, s_k_first, s_bar_first.
         ``s_k_first`` / ``s_bar_first`` are ``(1,K,nH,nW)`` from the **first** collinear pass
-        (``s_bar_first`` repeats isotropic surround ``I`` on every ``k`` for shape parity;
-        zeros if ``n_passes==0``).
+        (``s_bar_first`` holds per-bin surround ``I_k`` at pass 0; zeros if ``n_passes==0``).
     """
     device = rho_k_raw.device
     dtype = rho_k_raw.dtype
@@ -469,10 +469,13 @@ def gaba_recurrence(
 
         s_k = F.conv2d(rho_grid, kernels, padding=R, groups=K)
         kap_t = _cosine_kappa_grid(rho_grid, s_k, eps)
+        k_i = int(K)
+        den_other = float(max(k_i - 1, 1))
         rho_total = rho_grid.sum(dim=1, keepdim=True)
-        rho_mean = rho_total / float(max(int(K), 1))  # same scale as one ρ_k conv input
-        s_surround = F.conv2d(rho_mean, iso_kernel, padding=R)
-        s_inhib = s_surround.expand_as(s_k)
+        rho_other_mean = (rho_total - rho_grid) / den_other
+        w_iso = iso_kernel.expand(k_i, 1, iso_kernel.shape[2], iso_kernel.shape[3])
+        s_surround = F.conv2d(rho_other_mean, w_iso, padding=R, groups=k_i)
+        s_inhib = s_surround
         if t == 0:
             s_k_first = s_k.detach().clone()
             s_bar_first = s_inhib.detach().clone()
@@ -723,8 +726,8 @@ def run_l1_hypercolumn(
     """Run the full hypercolumn L1 pipeline.
 
     L0 output → K-bin hypercolumns → **seed NR** (scalar ``η_z`` on raw ``μ``) → detached
-    ``ρ^{\\mathrm{seed}}`` → ``T`` passes: collinear ``S_k``, isotropic surround on
-    ``(1/K)\\sum_j ρ_j`` (mean bin energy, same scale as ``ρ_k``), spatial ``η=η₀·σ(``MLP``(``pooled κ,z``))``, divisive NR → dominant readout.
+    ``ρ^{\\mathrm{seed}}`` → ``T`` passes: collinear ``S_k``, per-bin isotropic surround on
+    leave-one-out mean ``(1/(K-1))\\sum_{j\\neq k}ρ_j`` (then ``H*``), spatial ``η=η₀·σ(``MLP``(``pooled κ,z``))``, divisive NR → dominant readout.
 
     Args:
         h2m: (H, W) from L0
