@@ -22,7 +22,7 @@ STRIATE/
     └── test/results.json
 ```
 
-**Equation and notation reference:** `docs/docs.html` (open in a browser).
+**Equation and notation reference:** `HCI_SYSTEM_EQUATIONS.md` (HCI system spec; see disclaimer there vs this repo), `equations.md` (code-aligned K-bin notes), and `docs/docs.html` (open in a browser).
 
 ## Requirements
 
@@ -239,7 +239,7 @@ uv run test.py --model output/checkpoints/best.pt
 | `--device` | CUDA if available | `cpu`, `cuda`, or `mps` |
 | `--tol` | `0.0075` | Precision-match radius factor (`max_dist = tol * image_diagonal`) |
 
-Checkpoints produced **before** per-pixel η modulation was added do not contain `eta_mod_a`, `eta_mod_b`, or `eta_mod_c`. `infer.py` / `test.py` load with `strict=False`, so missing keys keep their **initial** values (a=2, b=0, c=0) until you **retrain** with the current `train.py`; a short **WARNING** is printed when any of those keys are absent from the file.
+Checkpoints produced **before** the regional η MLP (`eta_mlp.*` in the state dict) do not contain those weights. `infer.py` / `test.py` load with `strict=False`, so missing keys keep their **PyTorch init** values until you **retrain** with the current `train.py`; a short **WARNING** is printed when `eta_mlp.*` keys are absent from the file. Older checkpoints may still list `eta_mod_a` / `eta_mod_b` / `eta_mod_c`; those are ignored on load.
 
 ### Infer
 

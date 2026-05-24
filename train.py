@@ -35,6 +35,8 @@ from hci.L0 import (
     _naka_per_direction,
     compute_harmonics,
     compute_seed,
+    compute_eta_modulation_mlp,
+    EtaRegionalMLP,
 )
 from hci.L1 import (
     HypercolumnSeed,
@@ -56,7 +58,7 @@ def _l0_dist_signature(ir_p: np.ndarray, H0: int, W0: int) -> tuple:
     """Identity for L0 directional-distance tensors (η-independent leg)."""
     Hp, Wp = int(ir_p.shape[0]), int(ir_p.shape[1])
     return (
-        tuple(tuple(int(a), int(b)) for a, b in L0.OFFSETS),
+        tuple((int(a), int(b)) for a, b in L0.OFFSETS),
         Hp,
         Wp,
         int(H0),
@@ -195,6 +197,9 @@ def build_cells_flat(cells: dict) -> dict:
     result["e_col_cell"] = torch.from_numpy(
         np.asarray(cells["e_col_cell"], dtype=np.float32)
     )
+    result["rho_max_cell"] = torch.from_numpy(
+        np.asarray(cells["rho_max_cell"], dtype=np.float32)
+    )
     return result
 
 
@@ -221,17 +226,11 @@ class HarmonicContourE2E(nn.Module):
         self.eps = eps
         self.render_eps = max(float(eps), 1e-6)
 
-        # Learned η modulation: η₀·σ(a - b·κ + c·Ē_col)
-        # Init: a=2, b=c=0 → σ(2) ≈ 0.88 → near-identity
         self.eta_mod_enabled = eta_mod_enabled
         if eta_mod_enabled:
-            self.eta_mod_a = nn.Parameter(torch.tensor(2.0, dtype=torch.float32))
-            self.eta_mod_b = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
-            self.eta_mod_c = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+            self.eta_mlp = EtaRegionalMLP()
 
     def forward_batch(self, meta_list):
-        from hci.L0 import compute_eta_modulation
-
         bmaps = []
         for m in meta_list:
             cf_flat = m["cells_flat_dev"]
@@ -272,20 +271,19 @@ class HarmonicContourE2E(nn.Module):
                 kappa_col = cf_flat["kappa_col_cell"].to(
                     device=device, dtype=dtype,
                 ).reshape(nH, nW)
-                e_col = cf_flat["e_col_cell"].to(
+                z0_c = cf_flat["z0"].to(device=device, dtype=dtype).reshape(nH, nW)
+                rho_max_c = cf_flat["rho_max_cell"].to(
                     device=device, dtype=dtype,
                 ).reshape(nH, nW)
 
-                # Compute per-pixel η maps
                 H, W = m["proj_dev"]["H"], m["proj_dev"]["W"]
-                eta_lum_map, eta_chr_map = compute_eta_modulation(
-                    kappa_col, e_col, ib_grid,
+                eta_lum_map, eta_chr_map = compute_eta_modulation_mlp(
+                    self.eta_mlp,
+                    kappa_col, z0_c, rho_max_c, ib_grid,
                     nH, nW, H, W, S, P,
                     eta0_lum=L0.ETA_LUM,
                     eta0_chr=L0.ETA_CHR,
-                    a=self.eta_mod_a,
-                    b=self.eta_mod_b,
-                    c=self.eta_mod_c,
+                    pool_radius=int(L0.ETA_POOL_RADIUS_CELLS),
                 )
 
                 # Fast L0 pass 2: reuse d_lum/d_chr, apply modulated η
@@ -295,16 +293,12 @@ class HarmonicContourE2E(nn.Module):
                     L0.GAMMA, L0.OFFSETS,
                     m["border_mask"],
                 )
-                # Detach NR/harmonics path (avoids fragile grad through atan2/NR);
-                # keep η map in-graph for thinning MLP feature 17 → η_mod a,b,c.
+                # Detach NR/harmonics path (avoids fragile grad through atan2/NR).
                 l0_pix_pass2 = {
                     k: v.to(device).detach() for k, v in l0_pix_pass2.items()
                 }
-                l0_pix_pass2["eta_mod_map"] = eta_lum_map.to(
-                    device=device, dtype=rho_out.dtype,
-                )
 
-                # Re-render with updated h2m + η feature
+                # Re-render with updated h2m
                 bmap = render_boundary_map_torch(
                     rho_out,
                     m["proj_dev"],
@@ -529,6 +523,7 @@ def _cache_entry_valid(data: dict) -> bool:
         "kappa",
         "kappa_col_cell",
         "e_col_cell",
+        "rho_max_cell",
     ):
         if key not in cf:
             return False
@@ -717,8 +712,9 @@ def remap_checkpoint_state_dict(sd: dict) -> dict:
     """Load STRIATE ``dynamics._eta_z`` into ``seed.hc_seed``; drop other dynamics keys.
 
     ``seed._eta_rho_raw`` / ``dynamics._eta_rho_raw`` are omitted — NR pool on
-    the seed was removed; those tensors are not loaded.  ``eta_mod_d`` is
-    dropped if present (removed from the model).
+    the seed was removed; those tensors are not loaded.  ``eta_mod_d`` and
+    legacy ``eta_mod_a`` / ``eta_mod_b`` / ``eta_mod_c`` are dropped (replaced
+    by ``eta_mlp``).
 
     Learned η_z lives on ``HypercolumnSeed`` inside ``RhoSeedModule``; legacy
     checkpoints may use ``dynamics._eta_z_raw`` or flat ``seed._eta_z_raw``.
@@ -728,7 +724,7 @@ def remap_checkpoint_state_dict(sd: dict) -> dict:
     for k, v in sd.items():
         if k in skip:
             continue
-        if k == "eta_mod_d":
+        if k in ("eta_mod_d", "eta_mod_a", "eta_mod_b", "eta_mod_c"):
             continue
         if k == "dynamics._eta_z_raw":
             out["seed.hc_seed._eta_z_raw"] = v
@@ -788,13 +784,22 @@ def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
             print(f"    thinning.{name}: grad=None")
         else:
             print(f"    thinning.{name}: |grad|={t.grad.abs().mean().item():.2e}")
-    if hasattr(model, "eta_mod_a"):
-        for label in ("eta_mod_a", "eta_mod_b", "eta_mod_c"):
-            t = getattr(model, label, None)
-            if t is None:
-                continue
+    for raw, label in (("_s_t_raw", "s_t"), ("_s_n_raw", "s_n")):
+        t = getattr(model.renderer, raw, None)
+        if t is None or t.grad is None:
+            print(f"    renderer.{label}: grad=None")
+        else:
+            print(f"    renderer.{label}: |grad|={t.grad.abs().mean().item():.2e}")
+    if getattr(model, "eta_mlp", None) is not None:
+        for name, t in model.eta_mlp.named_parameters():
             g = "None" if t.grad is None else f"|grad|={t.grad.abs().mean().item():.2e}"
-            print(f"    {label}={t.item():.3f}  {g}")
+            print(f"    eta_mlp.{name}: {g}")
+    for raw, label in (("_alpha_d_raw", "α_d"), ("_alpha_t_raw", "α_t")):
+        t = getattr(s.hc_seed, raw, None)
+        if t is None or t.grad is None:
+            print(f"    seed.hc_seed.{label}: grad=None")
+        else:
+            print(f"    seed.hc_seed.{label}: |grad|={t.grad.abs().mean().item():.2e}")
     print(f"\n  loss={loss.item():.4f}  requires_grad={loss.requires_grad}\n")
 
 
@@ -852,18 +857,23 @@ def plot_training_curves(history, out_dir):
 
 def format_seed_param_lines(seed: RhoSeedModule, *, indent: str = "  ") -> list[str]:
     """Learned NR seed scalars (infer / train logging)."""
+    hc = seed.hc_seed
+    sig_d, sig_t = hc.collinear_sigmas(float(L1.COL_RADIUS))
     return [
         f"{indent}tile geometry:  R={seed.R}  stride={seed.stride}",
         f"{indent}seed ratio:  η_z={seed.eta_z.item():.3f}",
+        f"{indent}collinear σ:  σ_d={sig_d.item():.3f}  σ_t={sig_t.item():.3f}  "
+        f"(R={L1.COL_RADIUS})",
     ]
 
 
 def format_renderer_param_lines(r: ModulationRenderer, *, indent: str = "  ") -> list[str]:
     n_th = sum(p.numel() for p in r.thinning.parameters())
+    n_st = 2  # _s_t_raw, _s_n_raw
     return [
-        f"{indent}harmonic-native:  h2m · ρ̄ · gate(MLP), no stencils",
-        f"{indent}thinning head:  4→4→1 MLP  ({n_th} params)",
-        f"{indent}κ_col / E_col:  supplied from L1 hypercolumn (cached in cells_flat)",
+        f"{indent}readout:  tang/norm h2m stencils (s_t, s_n) + 14-D gate",
+        f"{indent}thinning head:  14→8→1 MLP  ({n_th} params)  + stencil spacings ({n_st})",
+        f"{indent}κ_col:  supplied from L1 hypercolumn (cached in cells_flat)",
     ]
 
 
@@ -880,27 +890,30 @@ def _format_seed_block(model: HarmonicContourE2E) -> str:
 def format_model_param_counts(model: HarmonicContourE2E):
     n_seed = sum(p.numel() for p in model.seed.parameters())
     n_renderer = sum(p.numel() for p in model.renderer.parameters())
+    n_eta = (
+        sum(p.numel() for p in model.eta_mlp.parameters())
+        if getattr(model, "eta_mlp", None) is not None
+        else 0
+    )
     n_total = sum(p.numel() for p in model.parameters())
-    return n_total, n_seed, n_renderer
+    return n_total, n_seed, n_renderer, n_eta
 
 
 def _format_render_params(model: HarmonicContourE2E):
     r = model.renderer
     n_r = sum(p.numel() for p in r.parameters())
     eta_str = ""
-    if hasattr(model, "eta_mod_a"):
-        eta_str = (f" + η-mod σ(a={model.eta_mod_a.item():.1f},"
-                   f"b={model.eta_mod_b.item():.1f},"
-                   f"c={model.eta_mod_c.item():.1f})")
-    return (f"renderer={n_r} params  (harmonic-native, "
-            f"thinning 4→4→1{eta_str})")
+    if getattr(model, "eta_mlp", None) is not None:
+        n_e = sum(p.numel() for p in model.eta_mlp.parameters())
+        eta_str = f" + η-regional MLP ({n_e} params)"
+    return (f"renderer={n_r} params  (stencils + thinning 14→8→1{eta_str})")
 
 
 def save_checkpoint(model, path):
     torch.save({"model_state": model.state_dict()}, path)
 
 
-_ETA_MOD_STATE_KEYS = frozenset({"eta_mod_a", "eta_mod_b", "eta_mod_c"})
+_ETA_MLP_STATE_PREFIX = "eta_mlp."
 
 
 def report_checkpoint_compatibility(incompatible, context="checkpoint load"):
@@ -913,14 +926,14 @@ def report_checkpoint_compatibility(incompatible, context="checkpoint load"):
         print(f"  missing_keys ({len(missing)}): {missing}")
     if unexpected:
         print(f"  unexpected_keys ({len(unexpected)}): {unexpected}")
-    miss_eta = sorted(_ETA_MOD_STATE_KEYS.intersection(missing))
+    miss_eta = sorted(k for k in missing if k.startswith(_ETA_MLP_STATE_PREFIX))
     if miss_eta:
         print(
-            f"[{context}] WARNING: checkpoint is missing η-mod weights {miss_eta}. "
-            "Those parameters were not loaded and still use PyTorch init values "
-            "(a=2.0, b=0.0, c=0.0). Pass-2 η maps then reflect only that default σ, "
-            "not a trained modulation. Retrain with the current train.py to learn "
-            "eta_mod_a/b/c and write them into the checkpoint."
+            f"[{context}] WARNING: checkpoint is missing η-regional MLP weights "
+            f"({len(miss_eta)} keys under eta_mlp.*). Those parameters were not "
+            "loaded and still use PyTorch init values. Pass-2 η maps then reflect "
+            "only that default MLP, not a trained modulation. Retrain with the "
+            "current train.py to learn eta_mlp and write it into the checkpoint."
         )
 
 
@@ -1037,10 +1050,10 @@ def main():
         optimizer, T_max=args.epochs, eta_min=args.lr * 0.1
     )
 
-    n_tot, n_seed, n_r = format_model_param_counts(model)
+    n_tot, n_seed, n_r, n_eta = format_model_param_counts(model)
     print(
         f"\nmodel: {n_tot} params total  Adam: {n_tot} "
-        f"(seed {n_seed} + renderer {n_r})"
+        f"(seed {n_seed} + renderer {n_r} + η-MLP {n_eta})"
     )
 
     train_ds = StriateDataset(train_cache, fit_stems)

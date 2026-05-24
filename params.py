@@ -27,6 +27,9 @@ L0 = SimpleNamespace(
     # Bump when ``_compute_d_lum_chroma`` / ``L0.OFFSETS`` semantics change.
     # Train cache can reuse stored ``d_lum``/``d_chr`` across ``TRAIN.CACHE_VERSION`` bumps.
     L0_DIST_CACHE_VERSION=1,
+    # Regional η MLP: mean-pool cell stats over (2R_η+1)², R_η in cell units.
+    ETA_POOL_RADIUS_CELLS=10,
+    ETA_MLP_HIDDEN=8,
 )
 
 # ── L1: hypercolumn cell grid + collinear recurrence (depthwise GABA) ───────
@@ -70,7 +73,7 @@ TRAIN = SimpleNamespace(
     NUM_WORKERS=2,
     LAM_DICE=0.0,
     LAM_BCE=1.0,
-    CACHE_VERSION=14,
+    CACHE_VERSION=15,
 )
 
 # ── Inference ────────────────────────────────────────────────────────────────

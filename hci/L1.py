@@ -23,7 +23,8 @@ The collinear recurrence uses depthwise conv2d — each bin convolved with
 its own tangent-selective kernel.  Junctions with 3+ arms are naturally
 represented as 3+ active bins.
 
-Learned parameters: η_z (1 scalar).  Everything else is fixed geometry.
+Learned parameters: η_z (1 scalar), collinear Gaussian widths via
+``α_d, α_t`` (softplus, scaled by ``R``).  Everything else is fixed geometry.
 """
 
 from __future__ import annotations
@@ -107,14 +108,18 @@ def z_from_l0_harmonics(
 
 def _build_collinear_kernels(
     R: int, K: int,
-    sigma_d: float | None,
-    sigma_t: float,
+    sigma_d: torch.Tensor,
+    sigma_t: torch.Tensor,
     device: torch.device,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Precompute K depthwise kernels of shape (K, 1, 2R+1, 2R+1)."""
-    if sigma_d is None:
-        sigma_d = max(R / 2.0, 0.5)
+    """Precompute K depthwise kernels of shape (K, 1, 2R+1, 2R+1).
+
+    ``sigma_d`` and ``sigma_t`` are 0-dim tensors (differentiable w.r.t. learned
+    α in ``HypercolumnSeed``).
+    """
+    sigma_d = sigma_d.to(device=device, dtype=dtype).clamp_min(torch.tensor(1e-4, device=device, dtype=dtype))
+    sigma_t = sigma_t.to(device=device, dtype=dtype).clamp_min(torch.tensor(1e-4, device=device, dtype=dtype))
     offsets = torch.arange(-R, R + 1, device=device, dtype=dtype)
     di, dj = torch.meshgrid(offsets, offsets, indexing="ij")
     dist_sq = di * di + dj * dj
@@ -128,7 +133,6 @@ def _build_collinear_kernels(
         d_perp = dj * math.cos(theta_k) - di * math.sin(theta_k)
         w_t = torch.exp(-d_perp * d_perp / (2.0 * sigma_t * sigma_t))
         kernels[k] = w_d * w_t
-    # Depthwise: (K, 1, 2R+1, 2R+1) — each channel gets its own kernel
     return kernels.unsqueeze(1)
 
 
@@ -176,8 +180,8 @@ def _e_col_dominant_bin(
     nW: int,
     K: int,
     R: int,
-    sigma_d: float | None,
-    sigma_t: float,
+    sigma_d: torch.Tensor,
+    sigma_t: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
     """One depthwise conv on final ρ; return S at dominant bin per cell (N,)."""
@@ -288,8 +292,8 @@ def gaba_recurrence(
     is_border: torch.Tensor,
     K: int,
     R: int,
-    sigma_d: float | None,
-    sigma_t: float,
+    sigma_d: torch.Tensor,
+    sigma_t: torch.Tensor,
     n_passes: int,
     eps: float = 1e-6,
     kappa_norm: str = "cosine",
@@ -301,7 +305,8 @@ def gaba_recurrence(
         nH, nW: cell grid dimensions
         is_border: (N,) bool
         K: number of orientation bins
-        R, sigma_d, sigma_t: collinear kernel parameters
+        R: kernel radius (integer support)
+        sigma_d, sigma_t: 0-dim tensors, Gaussian scales for isotropic / tangent factors
         n_passes: number of recurrence iterations
         kappa_norm:
             ``"cosine"`` — scalar :math:`\\kappa(c)` = cosine sim between
@@ -393,8 +398,8 @@ def extract_dominant(
     nH: int,
     nW: int,
     R: int,
-    sigma_d: float | None,
-    sigma_t: float,
+    sigma_d: torch.Tensor,
+    sigma_t: torch.Tensor,
     eps: float = 1e-15,
 ) -> dict:
     """Extract per-cell scalar ρ, θ, κ from K-bin representation."""
@@ -444,6 +449,9 @@ def _inv_softplus(x: float) -> float:
 class HypercolumnSeed(nn.Module):
     """Learned η_z: per-bin NR **before** GABA only (min-subtract + squash).
 
+    Also learns collinear kernel scales ``σ_d = softplus(α̃_d)·R``,
+    ``σ_t = softplus(α̃_t)·R`` (HCI spec), used in GABA depthwise convs.
+
     ``normalize_pre_gaba`` applies min across bins then
     ``ρ̃²/(ρ̃²+η_z²+ε)``.  That tensor feeds ``gaba_recurrence`` and is
     cached as ``rho_k_initial`` for diagnostics.  No squashing after
@@ -464,6 +472,24 @@ class HypercolumnSeed(nn.Module):
         self._eta_z_raw = nn.Parameter(
             torch.tensor(_inv_softplus(max(eta_z_init, 1e-6)), dtype=torch.float32)
         )
+        R_geom = float(L1.COL_RADIUS)
+        sd0 = float(L1.COL_SIGMA_D) if L1.COL_SIGMA_D is not None else R_geom / 2.0
+        st0 = float(L1.COL_SIGMA_T)
+        ratio_d = max(sd0 / R_geom, 1e-4)
+        ratio_t = max(st0 / R_geom, 1e-4)
+        self._alpha_d_raw = nn.Parameter(
+            torch.tensor(_inv_softplus(ratio_d), dtype=torch.float32)
+        )
+        self._alpha_t_raw = nn.Parameter(
+            torch.tensor(_inv_softplus(ratio_t), dtype=torch.float32)
+        )
+
+    def collinear_sigmas(self, R_col: int | float) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(σ_d, σ_t)`` as 0-dim tensors = softplus(α) · R_col."""
+        Rt = torch.as_tensor(float(R_col), device=self._alpha_d_raw.device, dtype=self._alpha_d_raw.dtype)
+        sigma_d = F.softplus(self._alpha_d_raw) * Rt
+        sigma_t = F.softplus(self._alpha_t_raw) * Rt
+        return sigma_d, sigma_t
 
     @property
     def eta_z(self) -> torch.Tensor:
@@ -496,8 +522,8 @@ def run_l1_hypercolumn(
     border_patch_max_frac: float = L1.BORDER_PATCH_MAX_FRAC,
     K: int = L1.COL_K_BINS,
     R: int = L1.COL_RADIUS,
-    sigma_d: float | None = L1.COL_SIGMA_D,
-    sigma_t: float = L1.COL_SIGMA_T,
+    sigma_d: float | None = None,
+    sigma_t: float | None = None,
     n_passes: int = L1.COL_PASSES,
     eps: float = 1e-6,
     kappa_norm: str | None = None,
@@ -514,7 +540,9 @@ def run_l1_hypercolumn(
         border_mask: (H, W) bool
         seed: HypercolumnSeed module (provides learned η_z)
         P, patch_overlap, border_patch_max_frac: patch geometry
-        K, R, sigma_d, sigma_t, n_passes: recurrence params
+        K, R, n_passes: recurrence params
+        sigma_d, sigma_t: optional **fixed** floats for tests; default uses
+            ``seed.collinear_sigmas(R)`` (learned).
         kappa_norm: ``"cosine"``, ``"max"``, or ``"fair_share"``; default
             ``L1.COL_KAPPA_NORM``.
         verbose: print diagnostics
@@ -524,6 +552,12 @@ def run_l1_hypercolumn(
     """
     device = h2m.device
     kn = str(L1.COL_KAPPA_NORM) if kappa_norm is None else str(kappa_norm)
+    R_int = int(R)
+    if sigma_d is not None and sigma_t is not None:
+        sigma_d_t = torch.as_tensor(float(sigma_d), device=device, dtype=torch.float32)
+        sigma_t_t = torch.as_tensor(float(sigma_t), device=device, dtype=torch.float32)
+    else:
+        sigma_d_t, sigma_t_t = seed.collinear_sigmas(float(R_int))
 
     # Step 1: Build hypercolumns
     hc = build_hypercolumns(
@@ -557,7 +591,7 @@ def run_l1_hypercolumn(
     # Step 3: GABA-budget recurrence (no squashing inside or after)
     rho_k_gaba, kappa_k, kappa_k_pass0 = gaba_recurrence(
         rho_k_pre, nH, nW, hc["is_border"], K,
-        R=R, sigma_d=sigma_d, sigma_t=sigma_t,
+        R=R_int, sigma_d=sigma_d_t, sigma_t=sigma_t_t,
         n_passes=n_passes, eps=eps, kappa_norm=kn,
     )
 
@@ -572,7 +606,7 @@ def run_l1_hypercolumn(
     dom = extract_dominant(
         rho_k_gaba, kappa_k, rho_k_initial,
         hc["bin_centers"], hc["is_border"], K,
-        nH, nW, R, sigma_d, sigma_t, eps=eps,
+        nH, nW, R_int, sigma_d_t, sigma_t_t, eps=eps,
     )
 
     interior_flat = tile_interior_flat(
@@ -598,6 +632,7 @@ def run_l1_hypercolumn(
     kappa_pass0_cell = kappa_pass0_dom.reshape(nH, nW).detach().cpu().numpy()
     e_cell = dom["e_col"].reshape(nH, nW).detach().cpu().numpy()
     rho_initial_cell = dom["rho_initial"].reshape(nH, nW).detach().cpu().numpy()
+    rho_max_cell = dom["rho_max"].reshape(nH, nW).detach().cpu().numpy()
 
     lam3_hw = torch.zeros(nH, nW, device=device, dtype=h2m.dtype).cpu().numpy()
 
@@ -628,6 +663,7 @@ def run_l1_hypercolumn(
         "kappa_pass0_cell": kappa_pass0_cell,
         "e_col_cell": e_cell,
         "rho_initial_cell": rho_initial_cell,
+        "rho_max_cell": rho_max_cell,
     }
     return cells
 

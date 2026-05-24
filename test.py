@@ -234,37 +234,36 @@ def run_image_inference(model, img_path, device, *, verbose: bool = False):
         )
 
         # Pass 2: η modulation if model has learned params
-        if hasattr(model, "eta_mod_a") and model.eta_mod_enabled:
-            from hci.L0 import compute_eta_modulation
+        if getattr(model, "eta_mlp", None) is not None and model.eta_mod_enabled:
+            from hci.L0 import compute_eta_modulation_mlp
 
             H, W = proj_dev["H"], proj_dev["W"]
             dtype = rho_out.dtype
+            S = int(cf_dev.get("S", max(1, W // max(nW, 1))))
+            P = int(cf_dev.get("P", S + (S - 1)))
 
             ib_grid = cf_dev["is_border"].to(device=device).reshape(nH, nW).bool()
 
             kappa_col = cf_dev["kappa_col_cell"].to(
                 device=device, dtype=dtype,
             ).reshape(nH, nW)
-            e_col = cf_dev["e_col_cell"].to(
+            z0_c = cf_dev["z0"].to(device=device, dtype=dtype).reshape(nH, nW)
+            rho_max_c = cf_dev["rho_max_cell"].to(
                 device=device, dtype=dtype,
             ).reshape(nH, nW)
 
-            eta_lum_map, eta_chr_map = compute_eta_modulation(
-                kappa_col, e_col, ib_grid,
+            eta_lum_map, eta_chr_map = compute_eta_modulation_mlp(
+                model.eta_mlp,
+                kappa_col, z0_c, rho_max_c, ib_grid,
                 nH, nW, H, W, S, P,
                 eta0_lum=L0.ETA_LUM,
                 eta0_chr=L0.ETA_CHR,
-                a=model.eta_mod_a,
-                b=model.eta_mod_b,
-                c=model.eta_mod_c,
+                pool_radius=int(L0.ETA_POOL_RADIUS_CELLS),
             )
 
             if verbose:
-                print(
-                    f"  η-mod: a={model.eta_mod_a.item():.3f}  "
-                    f"b={model.eta_mod_b.item():.3f}  "
-                    f"c={model.eta_mod_c.item():.3f}"
-                )
+                n_eta_p = sum(p.numel() for p in model.eta_mlp.parameters())
+                print(f"  η-mod: regional MLP ({n_eta_p} params)")
                 print(
                     f"  η_lum map: [{eta_lum_map.min():.4f}, {eta_lum_map.max():.4f}]  "
                     f"(base {L0.ETA_LUM:.4f})"
@@ -282,7 +281,6 @@ def run_image_inference(model, img_path, device, *, verbose: bool = False):
                 border_mask,
             )
             l0_pix_pass2 = {k: v.to(device) for k, v in l0_pix_pass2.items()}
-            l0_pix_pass2["eta_mod_map"] = eta_lum_map
             l0_dev2 = l0_pix_pass2
 
             bmap_t, theta_t = render_boundary_map_torch(

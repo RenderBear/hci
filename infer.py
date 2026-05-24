@@ -272,8 +272,13 @@ def _infer_seed_and_render(
         # Determine which l0_pix to use (pass 1 or pass 2 with η modulation)
         l0_for_render = l0_dev
 
-        if hasattr(model, "eta_mod_a") and model.eta_mod_enabled and "d_lum" in prep:
-            from hci.L0 import compute_eta_modulation
+        if (
+            getattr(model, "eta_mlp", None) is not None
+            and model.eta_mod_enabled
+            and "d_lum" in prep
+            and "border_mask" in prep
+        ):
+            from hci.L0 import compute_eta_modulation_mlp
 
             H, W = proj_dev["H"], proj_dev["W"]
             dtype = rho_out.dtype
@@ -285,26 +290,23 @@ def _infer_seed_and_render(
             kappa_col = cf_dev["kappa_col_cell"].to(
                 device=device, dtype=dtype,
             ).reshape(nH, nW)
-            e_col = cf_dev["e_col_cell"].to(
+            z0_c = cf_dev["z0"].to(device=device, dtype=dtype).reshape(nH, nW)
+            rho_max_c = cf_dev["rho_max_cell"].to(
                 device=device, dtype=dtype,
             ).reshape(nH, nW)
 
-            eta_lum_map, eta_chr_map = compute_eta_modulation(
-                kappa_col, e_col, ib_grid,
+            eta_lum_map, eta_chr_map = compute_eta_modulation_mlp(
+                model.eta_mlp,
+                kappa_col, z0_c, rho_max_c, ib_grid,
                 nH, nW, H, W, S, P,
                 eta0_lum=L0.ETA_LUM,
                 eta0_chr=L0.ETA_CHR,
-                a=model.eta_mod_a,
-                b=model.eta_mod_b,
-                c=model.eta_mod_c,
+                pool_radius=int(L0.ETA_POOL_RADIUS_CELLS),
             )
 
             if verbose:
-                print(
-                    f"  η-mod: a={model.eta_mod_a.item():.3f}  "
-                    f"b={model.eta_mod_b.item():.3f}  "
-                    f"c={model.eta_mod_c.item():.3f}"
-                )
+                n_eta_p = sum(p.numel() for p in model.eta_mlp.parameters())
+                print(f"  η-mod: regional MLP ({n_eta_p} params)")
                 print(
                     f"  η_lum map: [{eta_lum_map.min():.4f}, {eta_lum_map.max():.4f}]  "
                     f"(base {L0.ETA_LUM:.4f})"
@@ -322,7 +324,6 @@ def _infer_seed_and_render(
                 border_mask,
             )
             l0_pix_pass2 = {k: v.to(device) for k, v in l0_pix_pass2.items()}
-            l0_pix_pass2["eta_mod_map"] = eta_lum_map
             l0_for_render = l0_pix_pass2
 
         render_out = render_boundary_map_torch(
@@ -420,13 +421,13 @@ def forward_with_diagnostics(
 
 
 def _format_model_summary(
-    model, n_tot, n_seed, n_r, device, diagnostics,
+    model, n_tot, n_seed, n_r, n_eta, device, diagnostics,
 ):
     s = model.seed
     r = model.renderer
     lines = [
         "Model",
-        f"  params:      {n_tot} ({n_seed} seed NR, {n_r} renderer)",
+        f"  params:      {n_tot} ({n_seed} seed NR, {n_r} renderer, {n_eta} η-MLP)",
         f"  device:      {device}",
         f"  diagnostics: {diagnostics}",
         "",
@@ -489,11 +490,11 @@ def main():
 
     ckpt = torch.load(args.model, map_location="cpu", weights_only=False)
     model = build_model(ckpt, device)
-    n_tot, n_seed, n_r = format_model_param_counts(model)
+    n_tot, n_seed, n_r, n_eta = format_model_param_counts(model)
 
     if args.verbose:
         for line in _format_model_summary(
-            model, n_tot, n_seed, n_r, device, args.diagnostics,
+            model, n_tot, n_seed, n_r, n_eta, device, args.diagnostics,
         ):
             print(line)
         print()

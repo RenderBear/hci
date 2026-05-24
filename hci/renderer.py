@@ -1,9 +1,10 @@
-r"""Renderer — harmonic-native readout (interp → minimal gate).
+r"""Renderer — harmonic contour readout (interp → tang/norm stencils → gate).
 
 θ-combing on the cell grid, bilinear interpolation of cached cell fields (ρ, θ,
-κ_col from L1), then ``B̂(p) ≈ h2m(p)·ρ̄(p)`` with a tiny learned gate on
-``[h2m, ρ̄, κ̄_col, η_mod]`` (no oriented stencils — spatial sharpening lives in
-L1 recurrence).  GABA collinear recurrence lives only in ``hci.L1``.
+κ_col from L1), then a 14-D feature stack
+``[h2m_lum, h2m_chr, ρ̄, κ̄_col, tang₅, norm₅]`` with tangential / normal
+``h2m`` samples at learned pixel spacings ``s_t``, ``s_n``, and
+``B̂ = (h2m_lum+h2m_chr)·ρ̄·σ(MLP(F))``.  GABA recurrence lives in ``hci.L1``.
 """
 
 from __future__ import annotations
@@ -108,17 +109,17 @@ def _interp_cell_to_pixel(
 
 
 # ═══════════════════════════════════════════════════════════════
-# Thinning head: minimal MLP on [h2m, ρ̄, κ̄_col, η_mod] (no stencils)
+# Thinning head: MLP on 14-D stencil + contrast features (HCI readout)
 # ═══════════════════════════════════════════════════════════════
 
 class ThinningHead(nn.Module):
-    """4→4→1 gate: σ(W₂ ReLU(W₁ F + b₁) + b₂).
+    """14 → hidden → 1 gate: σ(W₂ ReLU(W₁ F + b₁) + b₂).
 
-    ``F = [h2m_lum+h2m_chr, ρ̄, κ̄_col, η_mod]`` (η_mod column zero when absent).
-    Init biases the gate toward ~1 so readout starts near ``h2m·ρ̄``.
+    ``F = [h2m_lum, h2m_chr, ρ̄, κ̄_col, tang₋₂…tang₂, norm₋₂…norm₂]``.
+    Init near-identity gate (``b₂=2`` on last layer, mild first-row coupling).
     """
 
-    def __init__(self, in_dim: int = 4, hidden: int = 4):
+    def __init__(self, in_dim: int = 14, hidden: int = 8):
         super().__init__()
         self.in_dim = in_dim
         self.hidden = hidden
@@ -131,12 +132,11 @@ class ThinningHead(nn.Module):
             self.fc1.weight.zero_()
             self.fc1.bias.zero_()
             self.fc2.weight.zero_()
-            # Mild coupling so gradients flow; gate still ~flat high.
-            self.fc1.weight[0, 0] = 0.05   # h2m
-            self.fc1.weight[0, 1] = 0.05   # ρ̄
+            self.fc2.bias.fill_(2.0)
+            for j in range(4):
+                self.fc1.weight[0, j] = 0.05
+            self.fc1.weight[:, 4:].normal_(0.0, 0.02)
             self.fc2.weight[0, 0] = 0.1
-            self.fc2.bias.fill_(4.0)  # σ(4) ≈ 0.98
-            self.fc1.weight[:, 3].normal_(0.0, 0.02)  # η_mod column
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         """features: (N, in_dim). Returns: (N,) gate in (0, 1)."""
@@ -149,15 +149,26 @@ class ThinningHead(nn.Module):
 # ═══════════════════════════════════════════════════════════════
 
 class ModulationRenderer(nn.Module):
-    """Harmonic-native renderer: ``h2m·ρ̄·gate`` with ThinningHead 4→4→1.
+    """Contour renderer: ``(h2m_lum+h2m_chr)·ρ̄·gate`` with 14→8→1 ThinningHead.
 
-    Cell-grid κ_col and E_col come from L1 (``cells_flat``), not from this module.
+    Learned tangential / normal stencil spacings ``s_t``, ``s_n`` (softplus).
+    Cell-grid κ_col comes from L1 (``cells_flat``).
     """
 
     def __init__(self, hidden: int | None = None, **kwargs):
         super().__init__()
-        _ = (hidden, kwargs)
-        self.thinning = ThinningHead(in_dim=4, hidden=4)
+        h = int(hidden if hidden is not None else RENDER.PIXEL_HIDDEN)
+        self.thinning = ThinningHead(in_dim=14, hidden=max(h, 8))
+        self._s_t_raw = nn.Parameter(torch.tensor(_inv_softplus(1.0), dtype=torch.float32))
+        self._s_n_raw = nn.Parameter(torch.tensor(_inv_softplus(1.0), dtype=torch.float32))
+
+    @property
+    def s_t(self) -> torch.Tensor:
+        return F.softplus(self._s_t_raw)
+
+    @property
+    def s_n(self) -> torch.Tensor:
+        return F.softplus(self._s_n_raw)
 
     # Legacy compat — code that reads sigma_perp for diagnostics
     @property
@@ -191,13 +202,13 @@ class ModulationRenderer(nn.Module):
 def upgrade_renderer_state_dict(state_dict: dict, prefix: str = "") -> dict:
     """Best-effort upgrade from old splat- or stencil-based state dicts.
 
-    Drops ``thinning.*`` tensors whose shapes do not match the current 4→4→1
-    head (legacy 18-dim feature MLP checkpoints then re-init the gate from
-    ``ThinningHead`` defaults).
+    Drops ``thinning.*`` tensors whose shapes do not match the current 14→8→1
+    head (legacy 4→4 checkpoints then re-init the gate from ``ThinningHead``
+    defaults).
     """
     state_dict = dict(state_dict)
     wkey = f"{prefix}thinning.fc1.weight"
-    if wkey in state_dict and tuple(state_dict[wkey].shape) != (4, 4):
+    if wkey in state_dict and tuple(state_dict[wkey].shape) != (8, 14):
         for k in list(state_dict):
             if f"{prefix}thinning." in k:
                 del state_dict[k]
@@ -233,11 +244,11 @@ def upgrade_renderer_state_dict(state_dict: dict, prefix: str = "") -> dict:
 
 
 def _expected_shape(key: str):
-    """Expected shapes for the 4→4→1 thinning head."""
+    """Expected shapes for the 14→8→1 thinning head."""
     shapes = {
-        "thinning.fc1.weight": (4, 4),
-        "thinning.fc1.bias": (4,),
-        "thinning.fc2.weight": (1, 4),
+        "thinning.fc1.weight": (8, 14),
+        "thinning.fc1.bias": (8,),
+        "thinning.fc2.weight": (1, 8),
         "thinning.fc2.bias": (1,),
     }
     for k, s in shapes.items():
@@ -275,7 +286,7 @@ def _theta_on_branch(theta, branch_pick, n_cells, device):
 
 
 # ═══════════════════════════════════════════════════════════════
-# render_boundary_map_torch — harmonic-native
+# render_boundary_map_torch — tang/norm stencils + 14-D gate
 # ═══════════════════════════════════════════════════════════════
 
 def render_boundary_map_torch(
@@ -374,7 +385,6 @@ def render_boundary_map_torch(
     cos2_norm = cos2_pix / rho_pix_safe
     sin2_norm = sin2_pix / rho_pix_safe
     theta_pix = 0.5 * torch.atan2(sin2_norm, cos2_norm)
-    theta_pix = theta_pix.detach()  # geometric; grad through ρ̄, h2m, gate
 
     kappa_col_pix = pix_stack[..., 3]
 
@@ -396,21 +406,56 @@ def render_boundary_map_torch(
     # Combined h2m as the base edge signal (pixel-native, smooth)
     h2m_combined = h2m_lum + h2m_chr
 
-    if l0_pix is not None and "eta_mod_map" in l0_pix:
-        eta_mod_pix = l0_pix["eta_mod_map"].to(device=device, dtype=dtype)
-        if eta_mod_pix.shape != (H, W):
-            eta_mod_pix = eta_mod_pix[:H, :W]
-    else:
-        eta_mod_pix = torch.zeros(H, W, device=device, dtype=dtype)
+    # ── Step 5: Tangential / normal h2m stencils → 14-D gate ──
+    theta_geom = theta_pix.detach()
+    h4 = h2m_combined.unsqueeze(0).unsqueeze(0)
+    st = renderer.s_t.to(device=device, dtype=dtype)
+    sn = renderer.s_n.to(device=device, dtype=dtype)
+    py = torch.arange(H, device=device, dtype=dtype)
+    px = torch.arange(W, device=device, dtype=dtype)
+    gy, gx = torch.meshgrid(py, px, indexing="ij")
+    c = torch.cos(theta_geom)
+    s = torch.sin(theta_geom)
+    denom_x = max(W - 1, 1)
+    denom_y = max(H - 1, 1)
+    tang_parts: list[torch.Tensor] = []
+    norm_parts: list[torch.Tensor] = []
+    for j in (-2, -1, 0, 1, 2):
+        fj = float(j)
+        sx_t = gx + fj * st * c
+        sy_t = gy + fj * st * s
+        grid_t = torch.stack(
+            [2.0 * sx_t / denom_x - 1.0, 2.0 * sy_t / denom_y - 1.0], dim=-1,
+        ).unsqueeze(0)
+        tang_parts.append(
+            F.grid_sample(
+                h4, grid_t, mode="bilinear", padding_mode="border", align_corners=True,
+            ).squeeze(0).squeeze(0),
+        )
+        sx_n = gx + fj * sn * (-s)
+        sy_n = gy + fj * sn * c
+        grid_n = torch.stack(
+            [2.0 * sx_n / denom_x - 1.0, 2.0 * sy_n / denom_y - 1.0], dim=-1,
+        ).unsqueeze(0)
+        norm_parts.append(
+            F.grid_sample(
+                h4, grid_n, mode="bilinear", padding_mode="border", align_corners=True,
+            ).squeeze(0).squeeze(0),
+        )
+    tang_stack = torch.stack(tang_parts, dim=-1)
+    norm_stack = torch.stack(norm_parts, dim=-1)
 
-    # ── Step 5: Minimal features → gate; B̂ = h2m · ρ̄ · gate ─
+    theta_pix = theta_geom  # geometric; grad through ρ̄, h2m, gate, stencils
+
     fdim = int(renderer.thinning.in_dim)
     features = torch.cat([
-        h2m_combined.unsqueeze(-1),
+        h2m_lum.unsqueeze(-1),
+        h2m_chr.unsqueeze(-1),
         rho_pix.unsqueeze(-1),
         kappa_col_pix.unsqueeze(-1),
-        eta_mod_pix.unsqueeze(-1),
-    ], dim=-1)  # (H, W, 4)
+        tang_stack,
+        norm_stack,
+    ], dim=-1)
 
     if features.shape[-1] != fdim:
         raise RuntimeError(

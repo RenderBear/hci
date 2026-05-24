@@ -28,6 +28,8 @@ from typing import Union
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from hci.renderer import _interp_cell_to_pixel
 
 EtaArg = Union[float, Callable[[], float]]
@@ -510,6 +512,87 @@ def compute_eta_modulation(
     eta_chr_map = eta0_chr * mod_pix
 
     return eta_lum_map.to(dtype=dtype, device=device), eta_chr_map.to(dtype=dtype, device=device)
+
+
+def regional_mean_pool_cells(
+    field: torch.Tensor,
+    is_border: torch.Tensor,
+    R_eta: int,
+) -> torch.Tensor:
+    """Mean-pool ``(nH, nW)`` with replicate padding; border cells zeroed first."""
+    x = torch.where(is_border, torch.zeros_like(field), field)
+    pad = int(R_eta)
+    k = 2 * pad + 1
+    v = x.unsqueeze(0).unsqueeze(0)
+    vp = F.pad(v, (pad, pad, pad, pad), mode="replicate")
+    return F.avg_pool2d(vp, kernel_size=k, stride=1).squeeze(0).squeeze(0)
+
+
+class EtaRegionalMLP(nn.Module):
+    """3 → hidden → 1 logits for regional η (σ applied in ``compute_eta_modulation_mlp``)."""
+
+    def __init__(self, hidden: int | None = None):
+        super().__init__()
+        from params import L0 as L0p
+
+        h = int(hidden if hidden is not None else L0p.ETA_MLP_HIDDEN)
+        self.fc1 = nn.Linear(3, h)
+        self.fc2 = nn.Linear(h, 1)
+        self._init_near_identity()
+
+    def _init_near_identity(self) -> None:
+        with torch.no_grad():
+            self.fc1.weight.zero_()
+            self.fc1.bias.zero_()
+            self.fc2.weight.zero_()
+            self.fc2.bias.fill_(2.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(torch.relu(self.fc1(x)))
+
+
+def compute_eta_modulation_mlp(
+    mlp: nn.Module,
+    kappa_col_grid: torch.Tensor,
+    z0_grid: torch.Tensor,
+    rho_max_grid: torch.Tensor,
+    is_border_grid: torch.Tensor,
+    nH: int, nW: int,
+    H: int, W: int,
+    S: int, P: int,
+    eta0_lum: float,
+    eta0_chr: float,
+    pool_radius: int,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    r"""Regional η from pooled ``(\bar\kappa, \bar z_0, \bar\rho_{\max})`` then MLP.
+
+    Pooled statistics use ``regional_mean_pool_cells`` with radius ``pool_radius``
+    in **cell** indices.  ``z0`` and ``\rho_{\max}`` are max-normalized on the
+    pooled grid for stable MLP inputs (similar spirit to normalizing ``E_col`` in
+    the legacy 3-scalar path).
+    """
+    device = kappa_col_grid.device
+    dtype = kappa_col_grid.dtype
+    r_pool = int(pool_radius)
+
+    kappa_p = regional_mean_pool_cells(kappa_col_grid, is_border_grid, r_pool)
+    z0_p = regional_mean_pool_cells(z0_grid, is_border_grid, r_pool)
+    rho_p = regional_mean_pool_cells(rho_max_grid, is_border_grid, r_pool)
+
+    zmax = z0_p.max().clamp_min(eps)
+    z0_n = z0_p / zmax
+    rmax = rho_p.max().clamp_min(eps)
+    rho_n = rho_p / rmax
+
+    feats = torch.stack([kappa_p, z0_n, rho_n], dim=-1).reshape(-1, 3)
+    logits = mlp(feats).reshape(nH, nW)
+    mod_grid = torch.sigmoid(logits)
+
+    mod_pix = _interp_cell_to_pixel(mod_grid, nH, nW, H, W, S, P)
+    eta_lum_map = torch.as_tensor(eta0_lum, device=device, dtype=dtype) * mod_pix
+    eta_chr_map = torch.as_tensor(eta0_chr, device=device, dtype=dtype) * mod_pix
+    return eta_lum_map, eta_chr_map
 
 
 def run_l0_two_pass(
