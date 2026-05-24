@@ -544,10 +544,17 @@ class EtaRegionalMLP(nn.Module):
         self._init_near_identity()
 
     def _init_near_identity(self) -> None:
+        """Small random first layer — **not** all-zero ``fc1``.
+
+        An all-zero ``fc1`` / ``fc2`` makes ``h = relu(W₁x)=0`` for every cell, so
+        logits are constant ``b₂`` and ``∂L/∂W₂`` vanishes (dead ReLU at init).  A
+        tiny random init keeps σ(logits) ≈ σ(2) on average while gradients can
+        flow into both layers from the first optimization step.
+        """
         with torch.no_grad():
-            self.fc1.weight.zero_()
+            self.fc1.weight.normal_(0.0, 0.03)
             self.fc1.bias.zero_()
-            self.fc2.weight.zero_()
+            self.fc2.weight.normal_(0.0, 0.03)
             self.fc2.bias.fill_(2.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

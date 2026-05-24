@@ -3,7 +3,8 @@ r"""Seed module — thin wrapper providing renderer-compatible interface.
 HypercolumnSeed holds learned η_z used in ``run_l1_hypercolumn`` for
 **pre-GABA** per-bin normalization (min-subtract + divisive NR).  GABA
 recurrence and extraction do not apply further η_z squash.  This module
-forwards cached ρ for the renderer.
+reads dominant ρ from the ``cells_flat`` dict (from **live** L1 in training,
+or precompute in infer).
 """
 
 from __future__ import annotations
@@ -19,14 +20,11 @@ from .L1 import HypercolumnSeed
 class RhoSeedModule(nn.Module):
     """Drop-in replacement using HypercolumnSeed.
 
-    The forward() method expects cells_flat to contain pre-computed
-    'rho' and 'is_border' from run_l1_hypercolumn (which already
-    applied min-subtract + η_z NR before GABA, then GABA recurrence (no
-    post-recurrence squash).  This module
-    just passes them through with the expected return signature.
-
-    The learned η_z parameter lives in self.hc_seed and is used
-    during L1 hypercolumn construction, not here.
+    The forward() method expects cells_flat from ``run_l1_hypercolumn``
+    (min-subtract + η_z NR before GABA, then GABA recurrence).  This module
+    reads dominant ρ from ``lam[...,0]`` and passes through with the renderer
+    return signature.  During training, ``train.prepare_batch`` builds that
+    dict with ``cells_format="torch"`` so ``hc_seed`` participates in autograd.
     """
 
     def __init__(self, r_pool=10, stride=7, eps=1e-9, eta_z_init=SEED.ETA_Z_INIT):

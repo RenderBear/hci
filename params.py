@@ -4,9 +4,10 @@ L1 builds cos² hypercolumns → min-subtract + η_z NR (pre-GABA) → GABA recu
 (κ from ρ–S cosine similarity by default; see ``L1.COL_KAPPA_NORM``).
 The renderer interpolates ρ, θ, κ and applies ``h2m·ρ̄·gate``.
 
-Training disk cache: ``TRAIN.CACHE_VERSION`` invalidates derived L1/render fields;
-``L0.L0_DIST_CACHE_VERSION`` gates reuse of pre-NR ``d_lum``/``d_chr`` across
-those bumps when geometry is unchanged (see ``train.precompute_image``).
+Training disk cache: ``TRAIN.CACHE_VERSION`` invalidates stored L0 tensors used
+for **live** L1 each step (``h2m``, ``theta_h``, masks, etc.); it does not cache
+``cells_flat``.  ``L0.L0_DIST_CACHE_VERSION`` gates reuse of pre-NR ``d_lum``/``d_chr``
+across bumps when geometry is unchanged (see ``train.precompute_image``).
 """
 
 from __future__ import annotations
@@ -54,7 +55,8 @@ SEED = SimpleNamespace(
     R_POOL=10,
     STRIDE=7,
     EPS=1e-9,
-    ETA_Z_INIT=5.0,
+    # Softplus(·) → η_z for pre-GABA NR; keep O(1) vs typical cos² patch ρ_k (not ≫1).
+    ETA_Z_INIT=0.5,
 )
 
 # ── Render: θ combing + bilinear interp + minimal gate (κ_col, E_col from L1) ─
@@ -73,7 +75,7 @@ TRAIN = SimpleNamespace(
     NUM_WORKERS=2,
     LAM_DICE=0.0,
     LAM_BCE=1.0,
-    CACHE_VERSION=15,
+    CACHE_VERSION=16,
 )
 
 # ── Inference ────────────────────────────────────────────────────────────────

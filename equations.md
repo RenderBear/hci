@@ -176,9 +176,17 @@ $\mathrm{MLP}_{\mathrm{read}}$: **15 → 8 → 1** (ReLU between linear layers).
 
 ## 8. Training wrap-up (`train.py`)
 
-- **Disk cache** (`precompute_image`): L0 → L1 with a **standalone** `HypercolumnSeed` init; stores `cells_flat`, `l0_pix`, $d_k$, masks, etc. Versioned by `TRAIN.CACHE_VERSION`.
-- **`RhoSeedModule`** in the trainable model **does not re-run L1**; it forwards **cached** $\rho$ from `cells_flat["lam"][...,0]` (dominant $\lambda$ / precomputed channel). So **loss does not update** $\tilde\eta_z$ or $\tilde\alpha_{d,t}$ unless the pipeline is changed to run L1 inside the step.
-- **Does receive gradients**: `ModulationRenderer` (readout MLP + $s_t,s_n$), and **`EtaRegionalMLP`** via the $\hat\eta_{\mathrm{mod}}$ feature path above when pass-2 tensors are present.
+- **Disk cache** (`precompute_image`): L0 only; stores `h2m`, `theta_h`, `border_mask`, `l0_pix`, $d_k$, GT, geometry — **not** `cells_flat`. Versioned by `TRAIN.CACHE_VERSION`.
+- **Each training step** (`prepare_batch` → `run_l1_live_cells`): L1 runs with the trainable `HypercolumnSeed` inside `model.seed.hc_seed` (`cells_format="torch"`), then `RhoSeedModule` reads dominant $\rho$ from the resulting `cells_flat["lam"][...,0]`. So **loss does update** $\tilde\eta_z$ and $\tilde\alpha_{d,t}$ through the live L1 graph (pass-2 $h_{2m}$ from `fast_l0_pass2` remains detached as before).
+- **Does receive gradients**: `ModulationRenderer` (readout MLP + $s_t,s_n$), **`EtaRegionalMLP`** via the $\hat\eta_{\mathrm{mod}}$ feature path when pass-2 tensors are present, and **L1 seed** parameters via live L1.
+
+**Spec vs.\ training reality (read this once):**
+
+| Claim in prose | Training-time truth |
+|----------------|---------------------|
+| $\eta_z$, $\alpha_{d,t}$ are “learned” | **Updated** by the loss: L1 is re-run each batch with `model.seed.hc_seed`. |
+| MLP$_\eta$ drives spatial $\eta(p)$ | **Yes** for the forward image, but pass-2 **$h_{2m}$** is **detached**, so the loss does **not** backprop through L0 NR/harmonics. Gradients to MLP$_\eta$ go only through the **15th readout feature** ($\hat\eta_{\mathrm{mod}}$). That path is weaker than modulating $h_{2m}$ directly. |
+| MLP$_\eta$ init “near identity” | `EtaRegionalMLP` uses **small random** `fc1`/`fc2` weights (not all zeros) so ReLU is not dead at step 0; `fc2.bias` ≈ 2 keeps $\sigma(\text{logit})$ in a sensible band initially. |
 
 Loss (default mix in `params.TRAIN`): soft-Dice and/or BCE on the valid η-band vs.\ ground-truth edges.
 

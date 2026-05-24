@@ -123,9 +123,11 @@ def _build_collinear_kernels(
     offsets = torch.arange(-R, R + 1, device=device, dtype=dtype)
     di, dj = torch.meshgrid(offsets, offsets, indexing="ij")
     dist_sq = di * di + dj * dj
-    w_d = torch.exp(-dist_sq / (2.0 * sigma_d * sigma_d))
-    w_d[R, R] = 0.0
-    w_d[dist_sq > R * R] = 0.0
+    # Out-of-place masks only: in-place slices on ``w_d`` break ExpBackward when
+    # ``sigma_d`` / ``sigma_t`` are learned (live L1 training).
+    disc = (dist_sq <= float(R * R)).to(dtype=dtype)
+    omit_center = (dist_sq > 0).to(dtype=dtype)
+    w_d = torch.exp(-dist_sq / (2.0 * sigma_d * sigma_d)) * disc * omit_center
 
     kernels = torch.zeros(K, 2 * R + 1, 2 * R + 1, device=device, dtype=dtype)
     for k in range(K):
@@ -345,8 +347,12 @@ def gaba_recurrence(
         if kappa_norm == "cosine":
             # Scalar gate: agreement between cell profile ρ and neighborhood pool S.
             num = (rho_grid * s_k).sum(dim=1, keepdim=True)
-            norm_rho = (rho_grid * rho_grid).sum(dim=1, keepdim=True).clamp_min(0.0).sqrt()
-            norm_s = (s_k * s_k).sum(dim=1, keepdim=True).clamp_min(0.0).sqrt()
+            # Floor **squared** L2 norms before sqrt: clamp_min(0).sqrt() leaves a
+            # sqrt(0) singularity in backward when ρ is tiny (e.g. large η_z NR).
+            sq_rho = (rho_grid * rho_grid).sum(dim=1, keepdim=True).clamp_min(eps)
+            sq_s = (s_k * s_k).sum(dim=1, keepdim=True).clamp_min(eps)
+            norm_rho = sq_rho.sqrt()
+            norm_s = sq_s.sqrt()
             kappa_scalar = num / (norm_rho * norm_s + eps)
             kappa_scalar = kappa_scalar.clamp(0.0, 1.0)
             kappa_grid = kappa_scalar.expand_as(rho_grid)
@@ -528,6 +534,7 @@ def run_l1_hypercolumn(
     eps: float = 1e-6,
     kappa_norm: str | None = None,
     verbose: bool = True,
+    cells_format: str = "numpy",
 ) -> dict:
     """Run the full hypercolumn L1 pipeline.
 
@@ -546,6 +553,9 @@ def run_l1_hypercolumn(
         kappa_norm: ``"cosine"``, ``"max"``, or ``"fair_share"``; default
             ``L1.COL_KAPPA_NORM``.
         verbose: print diagnostics
+        cells_format: ``"numpy"`` (default, disk / infer) or ``"torch"`` — when
+            ``"torch"``, return tensors on ``device`` so autograd can reach
+            ``seed`` (training with live L1).
 
     Returns:
         cells dict compatible with the renderer interface
@@ -626,6 +636,38 @@ def run_l1_hypercolumn(
     dom["rho_max"] = dom["rho_max"] * interior_flat
     rho_pair = torch.stack([dom["rho"], dom["rho"]], dim=-1)
     kappa_pair = torch.stack([dom["kappa_col"], dom["kappa_col"]], dim=-1)
+
+    if cells_format == "torch":
+        lam3_hw = torch.zeros(nH, nW, device=device, dtype=h2m.dtype)
+        cells = {
+            "nH": nH,
+            "nW": nW,
+            "P": P,
+            "S": S,
+            "theta": dom["theta"],
+            "lam": rho_pair,
+            "lam3": lam3_hw.reshape(-1),
+            "z0": z0,
+            "cx": hc["cx"],
+            "cy": hc["cy"],
+            "cx_z2": hc["cx"],
+            "cy_z2": hc["cy"],
+            "is_border": hc["is_border"].bool().contiguous(),
+            "kappa": kappa_pair,
+            "q": torch.zeros(N, 2, device=device, dtype=h2m.dtype),
+            "z1_abs_sum": torch.zeros(N, device=device, dtype=h2m.dtype),
+            "rho_k": rho_k_gaba,
+            "kappa_k": kappa_k,
+            "rho_k_initial": rho_k_initial,
+            "dominant_bin": dom["dominant_bin"],
+            "K": K,
+            "kappa_col_cell": dom["kappa_col"].reshape(nH, nW),
+            "kappa_pass0_cell": kappa_pass0_dom.reshape(nH, nW),
+            "e_col_cell": dom["e_col"].reshape(nH, nW),
+            "rho_initial_cell": dom["rho_initial"].reshape(nH, nW),
+            "rho_max_cell": dom["rho_max"].reshape(nH, nW),
+        }
+        return cells
 
     is_border_out = hc["is_border"].cpu().numpy()
     kappa_cell = dom["kappa_col"].reshape(nH, nW).detach().cpu().numpy()

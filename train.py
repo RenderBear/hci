@@ -1,14 +1,14 @@
 r"""train.py — harmonic-contour-integration: L1 hypercolumns + render.
 
-Pipeline per image: L0 → L1 (cos² hypercolumns, min+NR vs ``η_z`` pre-GABA,
-GABA recurrence, dominant θ/ρ/κ) → cache → **renderer** (interp + thinning MLP).
-The seed module only forwards cached ``lam`` as scalar ρ for the renderer.
+Pipeline per image: L0 (partially cached) → **L1 live in the training step**
+(cos² hypercolumns, min+NR vs ``η_z``, GABA, dominant θ/ρ/κ) → **renderer**
+(interp + thinning MLP).  The disk cache stores L0 inputs for L1
+(``h2m``, ``theta_h``, ``border_mask``) plus ``l0_pix``, GT, geometry — **not**
+precomputed ``cells_flat``.
 
-**Cache:** ``TRAIN.CACHE_VERSION`` gates the full derived bundle (``cells_flat``,
-``l0_pix``, ``proj_info``, …). Pre-NR directional distances ``d_lum``/``d_chr``
-are expensive and η-independent; when ``L0.L0_DIST_CACHE_VERSION`` and the
-stored geometry signature still match, precompute **reuses** them from an
-existing ``.pt`` file and only recomputes L0 NR → L1 → render features.
+**Cache:** ``TRAIN.CACHE_VERSION`` gates stored tensors.  ``d_lum``/``d_chr`` may
+still be reused across bumps when ``L0.L0_DIST_CACHE_VERSION`` and the stored
+geometry signature match.
 
 Loss combines soft-Dice and per-pixel BCE on the η± valid band.
 """
@@ -39,15 +39,13 @@ from hci.L0 import (
     EtaRegionalMLP,
 )
 from hci.L1 import (
-    HypercolumnSeed,
     pad_for_patch_grid,
     run_l1_hypercolumn,
-    z_from_l0_harmonics,
+    stride_from_patch_overlap,
 )
 from hci.seed import RhoSeedModule
 from hci.renderer import (
     ModulationRenderer,
-    compute_render_features,
     render_boundary_map_torch,
     proj_to_device,
 )
@@ -174,33 +172,73 @@ def fast_l0_pass2(
     return {"h2m_lum": h2m_lum, "h2m_chr": h2m_chr}
 
 
+def _as_torch_cell_field(v, shape: tuple[int, ...], *, dtype=torch.float32):
+    """Convert ``cells`` field from numpy or existing tensor → float/bool tensor."""
+    if isinstance(v, torch.Tensor):
+        t = v
+        if t.dtype == torch.bool:
+            return t.reshape(shape).contiguous()
+        return t.reshape(shape).to(dtype=dtype).contiguous()
+    arr = np.asarray(v)
+    if arr.dtype == bool or arr.dtype == np.bool_:
+        return torch.from_numpy(arr.reshape(shape).astype(np.bool_))
+    return torch.from_numpy(arr.reshape(shape).astype(np.float32))
+
+
 def build_cells_flat(cells: dict) -> dict:
     nH, nW = cells["nH"], cells["nW"]
     N = nH * nW
     result = {
         "nH": nH,
         "nW": nW,
-        "theta": torch.from_numpy(cells["theta"].reshape(N, 2).astype(np.float32)),
-        "q": torch.from_numpy(cells["q"].reshape(N, 2).astype(np.float32)),
-        "kappa": torch.from_numpy(cells["kappa"].reshape(N, 2).astype(np.float32)),
-        "z1_abs_sum": torch.from_numpy(cells["z1_abs_sum"].reshape(N).astype(np.float32)),
-        "lam": torch.from_numpy(cells["lam"].reshape(N, 2).astype(np.float32)),
-        "lam3": torch.from_numpy(cells["lam3"].reshape(N).astype(np.float32)),
-        "z0": torch.from_numpy(cells["z0"].reshape(N).astype(np.float32)),
-        "cx_z2": torch.from_numpy(cells["cx_z2"].reshape(N).astype(np.float32)),
-        "cy_z2": torch.from_numpy(cells["cy_z2"].reshape(N).astype(np.float32)),
-        "is_border": torch.from_numpy(cells["is_border"].reshape(N).astype(np.bool_)),
+        "theta": _as_torch_cell_field(cells["theta"], (N, 2)),
+        "q": _as_torch_cell_field(cells["q"], (N, 2)),
+        "kappa": _as_torch_cell_field(cells["kappa"], (N, 2)),
+        "z1_abs_sum": _as_torch_cell_field(cells["z1_abs_sum"], (N,)),
+        "lam": _as_torch_cell_field(cells["lam"], (N, 2)),
+        "lam3": _as_torch_cell_field(cells["lam3"], (N,)),
+        "z0": _as_torch_cell_field(cells["z0"], (N,)),
+        "cx_z2": _as_torch_cell_field(cells["cx_z2"], (N,)),
+        "cy_z2": _as_torch_cell_field(cells["cy_z2"], (N,)),
+        "is_border": _as_torch_cell_field(cells["is_border"], (N,)),
     }
-    result["kappa_col_cell"] = torch.from_numpy(
-        np.asarray(cells["kappa_col_cell"], dtype=np.float32)
+    result["kappa_col_cell"] = _as_torch_cell_field(
+        cells["kappa_col_cell"], (nH, nW),
     )
-    result["e_col_cell"] = torch.from_numpy(
-        np.asarray(cells["e_col_cell"], dtype=np.float32)
-    )
-    result["rho_max_cell"] = torch.from_numpy(
-        np.asarray(cells["rho_max_cell"], dtype=np.float32)
-    )
+    result["e_col_cell"] = _as_torch_cell_field(cells["e_col_cell"], (nH, nW))
+    result["rho_max_cell"] = _as_torch_cell_field(cells["rho_max_cell"], (nH, nW))
     return result
+
+
+def run_l1_live_cells(
+    model: nn.Module,
+    h2m: torch.Tensor,
+    theta_h: torch.Tensor,
+    border_mask: torch.Tensor,
+    H0: int,
+    W0: int,
+) -> dict[str, torch.Tensor]:
+    """Run L1 with ``model.seed.hc_seed``; tensors stay on ``h2m.device`` for autograd."""
+    cells = run_l1_hypercolumn(
+        h2m,
+        theta_h,
+        border_mask.bool(),
+        model.seed.hc_seed,
+        P=L1.PATCH_SIZE,
+        patch_overlap=L1.PATCH_OVERLAP,
+        border_patch_max_frac=L1.BORDER_PATCH_MAX_FRAC,
+        verbose=False,
+        eps=float(L1.EPS),
+        cells_format="torch",
+    )
+    P = int(cells["P"])
+    nH, nW = int(cells["nH"]), int(cells["nW"])
+    cy_hw = cells["cy"].reshape(nH, nW)
+    cx_hw = cells["cx"].reshape(nH, nW)
+    ib_hw = cells["is_border"].reshape(nH, nW)
+    out_b = ib_hw | (cy_hw + P / 2 > float(H0)) | (cx_hw + P / 2 > float(W0))
+    cells["is_border"] = out_b.reshape(-1)
+    return build_cells_flat(cells)
 
 
 class HarmonicContourE2E(nn.Module):
@@ -231,13 +269,12 @@ class HarmonicContourE2E(nn.Module):
             self.eta_mlp = EtaRegionalMLP()
 
     def forward_batch(self, meta_list):
-        """Render boundary maps from cached L1 cells.
+        """Render boundary maps; each ``meta`` carries ``cells_flat_dev`` from live L1.
 
-        Cached ``cells_flat`` fixes ρ/κ at precompute time, so **loss does not
-        reach** ``seed.hc_seed`` (``η_z``, collinear ``α``). Pass-2 ``h2m_*``
-        from ``fast_l0_pass2`` are **detached** (no grad through L0 NR/harmonics);
-        ``eta_mlp`` gradients flow through ``eta_mod_map`` in the renderer
-        thinning feature vector instead.
+        ``prepare_batch`` runs ``run_l1_live_cells`` so ``η_z`` and collinear
+        ``α`` participate in the graph.  Pass-2 ``h2m_*`` from ``fast_l0_pass2``
+        stay **detached**; ``eta_mlp`` gradients use ``eta_mod_map`` in the
+        readout feature vector.
         """
         bmaps = []
         for m in meta_list:
@@ -326,22 +363,31 @@ class HarmonicContourE2E(nn.Module):
         return bmaps
 
 
-def prepare_batch(items, device):
+def prepare_batch(items, device, model: nn.Module):
     meta = []
     for item in items:
-        (gi, gt, Hp, Wp, Hg, Wg, H0, W0, cells_flat, l0_pix, img,
-         d_lum, d_chr, border_mask) = item
+        (gi, gt, Hp, Wp, Hg, Wg, H0, W0, l0_pix, img, d_lum, d_chr, border_mask,
+         h2m, theta_h) = item
+        h2m_d = h2m.to(device=device, dtype=torch.float32).contiguous()
+        theta_d = theta_h.to(device=device, dtype=torch.float32).contiguous()
+        if border_mask is None:
+            bm_d = torch.zeros(
+                h2m_d.shape[:2], device=device, dtype=torch.bool,
+            )
+        else:
+            bm_d = border_mask.to(device=device).bool()
+        cf_flat = run_l1_live_cells(model, h2m_d, theta_d, bm_d, int(H0), int(W0))
         cf_dev = {
             k: (v.to(device) if isinstance(v, torch.Tensor) else v)
-            for k, v in cells_flat.items()
+            for k, v in cf_flat.items()
         }
         l0_dev = {
             k: v.to(device) for k, v in l0_pix.items()
         }
         p_dev = proj_to_device(gi, device)
         m = {
-            "nH": cells_flat["nH"],
-            "nW": cells_flat["nW"],
+            "nH": cf_flat["nH"],
+            "nW": cf_flat["nW"],
             "proj_dev": p_dev,
             "gt": gt.to(device),
             "Hp": Hp,
@@ -412,55 +458,28 @@ def precompute_image(img_path, gt_path, gt_format, *, cached: dict | None = None
     )
     border_mask_t = ~compute_interior(ir_p.shape[0], ir_p.shape[1], ir_t.device)
 
-    z1, z2 = z_from_l0_harmonics(s, border_mask_t)
     theta_h = (0.5 * torch.atan2(s[..., 3], s[..., 2])).to(torch.float32)
     theta_h = torch.where(border_mask_t, torch.zeros_like(theta_h), theta_h)
 
     s_np = s.cpu().numpy()
     border_mask_np = border_mask_t.cpu().numpy()
-    z2_image = (s_np[..., 2] + 1j * s_np[..., 3]).astype(np.complex64)
-    z2_image[border_mask_np] = 0.0
-
     l0_pix = build_l0_pix(
         s_np, h1m, h2m, border_mask_np, h2m_lum=h2m_lum, h2m_chr=h2m_chr,
     )
     del h, vld, s, h1m, h2m_lum, h2m_chr
     gc.collect()
 
-    # Standalone η_z (same init as SEED); cache is geometry-only vs trained ckpt.
-    hc_seed = HypercolumnSeed(
-        r_pool=SEED.R_POOL,
-        stride=SEED.STRIDE,
-        eps=SEED.EPS,
-        eta_z_init=SEED.ETA_Z_INIT,
-    )
-    cells = run_l1_hypercolumn(
-        h2m,
-        theta_h,
-        border_mask_t,
-        hc_seed,
-        P=L1.PATCH_SIZE,
-        patch_overlap=L1.PATCH_OVERLAP,
-        border_patch_max_frac=L1.BORDER_PATCH_MAX_FRAC,
-        verbose=False,
-        eps=float(L1.EPS),
-    )
-    del z1, z2, h2m, theta_h, ir_t
-    gc.collect()
+    H_p, W_p = int(ir_p.shape[0]), int(ir_p.shape[1])
+    S = stride_from_patch_overlap(L1.PATCH_SIZE, L1.PATCH_OVERLAP)
+    nH = (H_p - L1.PATCH_SIZE) // S + 1 if H_p >= L1.PATCH_SIZE else 0
+    nW = (W_p - L1.PATCH_SIZE) // S + 1 if W_p >= L1.PATCH_SIZE else 0
+    proj_info = {"H": H_p, "W": W_p, "nH": nH, "nW": nW, "n_cells": nH * nW}
 
-    P = cells["P"]
-    cells["is_border"] |= (cells["cy"] + P / 2 > H0) | (cells["cx"] + P / 2 > W0)
+    h2m_cpu = h2m.detach().cpu().contiguous().float()
+    theta_h_cpu = theta_h.detach().cpu().contiguous().float()
+    border_mask_cpu = border_mask_t.cpu().contiguous()
 
-    nH, nW = cells["nH"], cells["nW"]
-
-    proj_info = compute_render_features(
-        z2_image,
-        ir_p,
-        cells,
-        border_mask_np,
-        eps=SEED.EPS,
-    )
-    del z2_image, border_mask_np
+    del h2m, theta_h, border_mask_t, ir_t
     gc.collect()
 
     if gt_format == "mat":
@@ -468,13 +487,10 @@ def precompute_image(img_path, gt_path, gt_format, *, cached: dict | None = None
     else:
         gt = load_png_gt(gt_path)
 
-    H_p, W_p = ir_p.shape[:2]
     H_gt, W_gt = gt.shape
 
-    cells_flat = build_cells_flat(cells)
-
     img_cached = ir_p.astype(np.float32)
-    del cells, ir_p
+    del ir_p
     gc.collect()
 
     return {
@@ -489,12 +505,13 @@ def precompute_image(img_path, gt_path, gt_format, *, cached: dict | None = None
         "W_gt": W_gt,
         "H0": H0,
         "W0": W0,
-        "cells_flat": cells_flat,
         "l0_pix": l0_pix,
         "img": img_cached,
         "d_lum": d_lum.cpu(),
         "d_chr": d_chr.cpu(),
-        "border_mask": border_mask_t.cpu(),
+        "border_mask": border_mask_cpu,
+        "h2m": h2m_cpu,
+        "theta_h": theta_h_cpu,
     }
 
 
@@ -520,20 +537,9 @@ def _cache_entry_valid(data: dict) -> bool:
     need_pi = ("H", "W", "n_cells", "nH", "nW")
     if not all(k in pi for k in need_pi):
         return False
-    cf = data.get("cells_flat")
-    if not isinstance(cf, dict):
-        return False
-    for key in (
-        "cx_z2",
-        "cy_z2",
-        "z0",
-        "q",
-        "kappa",
-        "kappa_col_cell",
-        "e_col_cell",
-        "rho_max_cell",
-    ):
-        if key not in cf:
+    for key in ("h2m", "theta_h", "border_mask"):
+        t = data.get(key)
+        if not isinstance(t, torch.Tensor):
             return False
     l0 = data.get("l0_pix")
     if not isinstance(l0, dict):
@@ -653,12 +659,13 @@ class StriateDataset(Dataset):
             data["W_gt"],
             H0,
             W0,
-            data["cells_flat"],
             data["l0_pix"],
             data.get("img"),
             data.get("d_lum"),
             data.get("d_chr"),
             data.get("border_mask"),
+            data["h2m"],
+            data["theta_h"],
         )
 
 
@@ -881,7 +888,7 @@ def format_renderer_param_lines(r: ModulationRenderer, *, indent: str = "  ") ->
     return [
         f"{indent}readout:  tang/norm h2m stencils (s_t, s_n) + 15-D gate (optional η_mod)",
         f"{indent}thinning head:  15→8→1 MLP  ({n_th} params)  + stencil spacings ({n_st})",
-        f"{indent}κ_col:  supplied from L1 hypercolumn (cached in cells_flat)",
+        f"{indent}κ_col:  supplied from L1 hypercolumn (live in train; cells_flat dict)",
     ]
 
 
@@ -1077,11 +1084,15 @@ def main():
         batch = next(iter(train_loader))
         moved = []
         for item in batch:
-            (gi, gt, Hp, Wp, Hg, Wg, H0, W0, cells_flat, l0_pix, img, d_lum, d_chr, border_mask) = item
-            moved.append((gi, gt, Hp, Wp, Hg, Wg, H0, W0, cells_flat, l0_pix, img, d_lum, d_chr, border_mask))
+            (gi, gt, Hp, Wp, Hg, Wg, H0, W0, l0_pix, img, d_lum, d_chr, border_mask,
+             h2m, theta_h) = item
+            moved.append((
+                gi, gt, Hp, Wp, Hg, Wg, H0, W0, l0_pix, img, d_lum, d_chr, border_mask,
+                h2m, theta_h,
+            ))
         debug_drive_batch(
             model,
-            prepare_batch(moved, device),
+            prepare_batch(moved, device, model),
             device,
             lam_dice=args.lam_dice,
             lam_bce=args.lam_bce,
@@ -1106,10 +1117,14 @@ def main():
         for batch in train_loader:
             moved = []
             for item in batch:
-                (gi, gt, Hp, Wp, Hg, Wg, H0, W0, cells_flat, l0_pix, img, d_lum, d_chr, border_mask) = item
-                moved.append((gi, gt, Hp, Wp, Hg, Wg, H0, W0, cells_flat, l0_pix, img, d_lum, d_chr, border_mask))
+                (gi, gt, Hp, Wp, Hg, Wg, H0, W0, l0_pix, img, d_lum, d_chr, border_mask,
+                 h2m, theta_h) = item
+                moved.append((
+                    gi, gt, Hp, Wp, Hg, Wg, H0, W0, l0_pix, img, d_lum, d_chr, border_mask,
+                    h2m, theta_h,
+                ))
 
-            meta_list = prepare_batch(moved, device)
+            meta_list = prepare_batch(moved, device, model)
             bmaps = model.forward_batch(meta_list)
 
             dice_sum = None
