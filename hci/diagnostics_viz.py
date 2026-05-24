@@ -556,11 +556,12 @@ def viz_infer_rho_seed_final_dual_maps(
     *,
     n_collinear_passes: int,
 ) -> None:
-    """Side-by-side cell ρ: L1 NR energy at the post-recurrence dominant bin, pre vs post GABA.
+    """Side-by-side cell ρ: same dominant bin after recurrence, pre-GABA NR vs post-GABA.
 
     ``rho_seed`` / ``rho_final`` are the per-cell scalar channels saved in L1 (not renderer
     bookkeeping). The dominant bin index is taken **after** collinear recurrence; the left
-    map is that bin's NR-normalized energy **before** recurrence, the right map **after**.
+    map is **normalized** pre-GABA energy at that bin (min-subtract + NR vs η_z), the right
+    map is ρ at that bin **after** GABA (no post-GABA squash).
     """
     gs = apply_border_zero(np.asarray(rho_seed, dtype=np.float64), is_border)
     gf = apply_border_zero(np.asarray(rho_final, dtype=np.float64), is_border)
@@ -575,8 +576,8 @@ def viz_infer_rho_seed_final_dual_maps(
     norm_seed = np.clip(gs / vmax, 0.0, 1.0)
     norm_fin = np.clip(gf / vmax, 0.0, 1.0)
     titles = (
-        r"$\rho$ pre-GABA (NR, post-$\theta$ winner bin)",
-        r"$\rho$ post-GABA (after %d collinear passes)" % int(n_collinear_passes),
+        r"$\rho$ pre-GABA (NR at post-recurrence winner bin)",
+        r"$\rho$ post-GABA (winner bin, no extra squash)",
     )
     for ax, arr, title in zip(axes, (norm_seed, norm_fin), titles):
         ax.set_facecolor(VIZ.PANEL_BG)
@@ -584,8 +585,9 @@ def viz_infer_rho_seed_final_dual_maps(
         ax.set_title(title, fontsize=9, color=VIZ.FG, fontfamily="monospace")
         ax.axis("off")
     fig.suptitle(
-        "cell $\\rho$: same dominant bin as after recurrence, before vs after "
-        f"GABA/collinear passes (shared color scale, max={vmax:.4g})",
+        "cell $\\rho$: same dominant bin after recurrence, "
+        "pre-GABA NR vs post-GABA "
+        f"(shared color scale, max={vmax:.4g})",
         fontsize=10,
         color=VIZ.FG,
         fontfamily="monospace",

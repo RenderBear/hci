@@ -7,9 +7,15 @@ K orientation-tuned units pooling over the same receptive field (patch).
 Pipeline:
   1. Extract patches from pixel-level h2m and θ_h fields (from L0).
   2. Project each patch's oriented energy onto K bins via cos² tuning.
-  3. Per cell: subtract min bin (excess), then NR vs eta_z only: rho = rho_tilde^2/(rho_tilde^2+eta_z^2).
-  4. Run recurrent GABA-budget collinear facilitation (T passes).
+  3. Per cell: subtract min across bins, then divisive NR vs learned η_z
+     (pre-GABA squash only).  Recurrence runs on this normalized tensor.
+  4. Run recurrent GABA-budget collinear facilitation (T passes); no further
+     min-subtraction or squashing inside or after recurrence.
   5. Extract dominant orientation, ρ, κ per cell for the renderer.
+
+``rho_k_initial`` / ``rho_initial_cell`` store the **same** pre-GABA
+normalized ``ρ_k`` (for Δρ diagnostics: value at the post-recurrence
+dominant bin vs final ρ at that bin).
 
 The collinear recurrence uses depthwise conv2d — each bin convolved with
 its own tangent-selective kernel.  Junctions with 3+ arms are naturally
@@ -405,11 +411,12 @@ def _inv_softplus(x: float) -> float:
 
 
 class HypercolumnSeed(nn.Module):
-    """Learned eta_z: NR squash of per-bin *excess* orientation energy.
+    """Learned η_z: per-bin NR **before** GABA only (min-subtract + squash).
 
-    Per cell, subtract the weakest bin (baseline removal), then apply
-    Naka-Rushton vs eta_z only: rho_sq / (rho_sq + eta_z**2 + eps).
-    Contrast pooling across bins is left to GABA; L0 already NR-compresses d_k.
+    ``normalize_pre_gaba`` applies min across bins then
+    ``ρ̃²/(ρ̃²+η_z²+ε)``.  That tensor feeds ``gaba_recurrence`` and is
+    cached as ``rho_k_initial`` for diagnostics.  No squashing after
+    recurrence.
     """
 
     def __init__(
@@ -431,20 +438,12 @@ class HypercolumnSeed(nn.Module):
     def eta_z(self) -> torch.Tensor:
         return F.softplus(self._eta_z_raw)
 
-    def normalize(self, rho_k_raw: torch.Tensor, z0: torch.Tensor) -> torch.Tensor:
-        """Min-subtract per cell, then NR: rho_k = rho_tilde^2 / (rho_tilde^2 + eta_z^2 + eps).
+    def normalize_pre_gaba(self, rho_k_raw: torch.Tensor) -> torch.Tensor:
+        """Min-subtract per cell, then NR vs η_z — **input** to GABA recurrence.
 
-        ``rho_tilde_k = rho_k_raw - min_j rho_j_raw`` (excess over the weakest bin).
-        ``z0`` is kept for call-site compatibility but not used here.
-
-        Args:
-            rho_k_raw: (N, K) raw per-bin energies from hypercolumn construction
-            z0: (N,) total raw energy per cell (unused)
-
-        Returns:
-            rho_k: (N, K) in [0, 1) after NR squash
+        ``rho_tilde_k = rho_k_raw - min_j rho_j_raw``; then
+        ``rho_tilde_k² / (rho_tilde_k² + η_z² + ε)``.
         """
-        _ = z0
         rho_min = rho_k_raw.amin(dim=-1, keepdim=True)
         rho_t = rho_k_raw - rho_min
         rho_sq = rho_t * rho_t
@@ -474,8 +473,8 @@ def run_l1_hypercolumn(
 ) -> dict:
     """Run the full hypercolumn L1 pipeline.
 
-    L0 output → K-bin hypercolumns → η_z normalization → GABA recurrence
-    → extract dominant orientation for renderer.
+    L0 output → K-bin hypercolumns → min-subtract + η_z NR (pre-GABA only)
+    → GABA recurrence → extract dominant orientation for renderer.
 
     Args:
         h2m: (H, W) from L0
@@ -504,38 +503,39 @@ def run_l1_hypercolumn(
     if verbose:
         print(f"  hypercolumn grid {nH}×{nW} = {N} cells, K={K} bins")
 
-    # Step 2: Normalize with learned η_z
+    # Step 2: Min-subtract + η_z NR (pre-GABA); same tensor cached for ρ_initial
     rho_k_raw = hc["rho_k"]  # (N, K)
     z0 = hc["z0"]            # (N,)
-    rho_k_norm = seed.normalize(rho_k_raw, z0)
-
-    # Save initial (pre-recurrence) for preservation ratio
-    rho_k_initial = rho_k_norm.detach().clone()
+    rho_k_pre = seed.normalize_pre_gaba(rho_k_raw)
+    rho_k_initial = rho_k_pre.detach().clone()
 
     if verbose:
         interior = ~hc["is_border"]
-        rho_max_init = rho_k_norm[interior].max(dim=-1).values
+        rho_max_raw = rho_k_raw[interior].max(dim=-1).values
+        rho_max_pre = rho_k_pre[interior].max(dim=-1).values
         print(f"  η_z={seed.eta_z.item():.3f}  "
-              f"ρ_k max (interior): mean={rho_max_init.mean():.4f} "
-              f"max={rho_max_init.max():.4f}")
+              f"raw ρ_k max (interior): mean={rho_max_raw.mean():.4f} "
+              f"max={rho_max_raw.max():.4f}")
+        print(f"  pre-GABA NR ρ_k max (interior, GABA in): mean={rho_max_pre.mean():.4f} "
+              f"max={rho_max_pre.max():.4f}")
 
-    # Step 3: GABA-budget recurrence
-    rho_k_out, kappa_k = gaba_recurrence(
-        rho_k_norm, nH, nW, hc["is_border"], K,
+    # Step 3: GABA-budget recurrence (no squashing inside or after)
+    rho_k_gaba, kappa_k = gaba_recurrence(
+        rho_k_pre, nH, nW, hc["is_border"], K,
         R=R, sigma_d=sigma_d, sigma_t=sigma_t,
         n_passes=n_passes, eps=eps,
     )
 
     if verbose:
         interior = ~hc["is_border"]
-        rho_max_out = rho_k_out[interior].max(dim=-1).values
+        rho_max_gaba = rho_k_gaba[interior].max(dim=-1).values
         print(f"  after {n_passes} GABA passes: "
-              f"ρ_max mean={rho_max_out.mean():.4f} "
-              f"max={rho_max_out.max():.4f}")
+              f"ρ_max mean={rho_max_gaba.mean():.4f} "
+              f"max={rho_max_gaba.max():.4f}")
 
     # Step 4: Extract dominant orientation for renderer interface
     dom = extract_dominant(
-        rho_k_out, kappa_k, rho_k_initial,
+        rho_k_gaba, kappa_k, rho_k_initial,
         hc["bin_centers"], hc["is_border"], K,
         nH, nW, R, sigma_d, sigma_t, eps=eps,
     )
@@ -576,9 +576,9 @@ def run_l1_hypercolumn(
         "kappa": kappa_pair.detach().cpu().numpy(),
         "q": torch.zeros(N, 2, device=device).cpu().numpy(),
         "z1_abs_sum": torch.zeros(N, device=device).cpu().numpy(),
-        "rho_k": rho_k_out.detach().cpu().numpy(),
+        "rho_k": rho_k_gaba.detach().cpu().numpy(),
         "kappa_k": kappa_k.detach().cpu().numpy(),
-        "rho_k_initial": rho_k_initial.cpu().numpy(),
+        "rho_k_initial": rho_k_initial.detach().cpu().numpy(),
         "dominant_bin": dom["dominant_bin"].cpu().numpy(),
         "K": K,
         "kappa_col_cell": kappa_cell,

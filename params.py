@@ -1,7 +1,7 @@
 r"""Shared pipeline hyperparameters, module inits, and script defaults.
 
-L1 builds K-bin hypercolumns + GABA collinear recurrence; the renderer only
-interpolates cell fields, builds pixel features, and runs the thinning MLP.
+L1 builds cos² hypercolumns → min-subtract + η_z NR (pre-GABA) → GABA recurrence
+(no further squash).  The renderer interpolates ρ, θ, κ and applies ``h2m·ρ̄·gate``.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ SEED = SimpleNamespace(
     ETA_Z_INIT=5.0,
 )
 
-# ── Render: θ combing + bilinear interp + thinning MLP (κ_col, E_col from L1) ─
+# ── Render: θ combing + bilinear interp + minimal gate (κ_col, E_col from L1) ─
 RENDER = SimpleNamespace(
     CELL_HIDDEN=16,
     PIXEL_HIDDEN=6,
@@ -58,7 +58,7 @@ TRAIN = SimpleNamespace(
     NUM_WORKERS=2,
     LAM_DICE=0.0,
     LAM_BCE=1.0,
-    CACHE_VERSION=9,
+    CACHE_VERSION=12,
 )
 
 # ── Inference ────────────────────────────────────────────────────────────────

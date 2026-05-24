@@ -1,7 +1,7 @@
 r"""train.py — harmonic-contour-integration: L1 hypercolumns + render.
 
-Pipeline per image: L0 → L1 (K-bin hypercolumns, learned ``η_z``, GABA recurrence,
-dominant θ/ρ/κ for the cell grid) → cache → **renderer** (interp + thinning MLP).
+Pipeline per image: L0 → L1 (cos² hypercolumns, min+NR vs ``η_z`` pre-GABA,
+GABA recurrence, dominant θ/ρ/κ) → cache → **renderer** (interp + thinning MLP).
 The seed module only forwards cached ``lam`` as scalar ρ for the renderer.
 
 Loss combines soft-Dice and per-pixel BCE on the η± valid band.
@@ -723,14 +723,6 @@ def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
             print(f"    {label}: grad=None")
         else:
             print(f"    {label}: |grad|={t.grad.abs().mean().item():.2e}")
-    for label, t in (
-        ("s_t", model.renderer.s_t),
-        ("s_n", model.renderer.s_n),
-    ):
-        if t.grad is None:
-            print(f"    {label}: grad=None")
-        else:
-            print(f"    {label}: |grad|={t.grad.abs().mean().item():.2e}")
     for name, t in model.renderer.thinning.named_parameters():
         if t.grad is None:
             print(f"    thinning.{name}: grad=None")
@@ -809,9 +801,8 @@ def format_seed_param_lines(seed: RhoSeedModule, *, indent: str = "  ") -> list[
 def format_renderer_param_lines(r: ModulationRenderer, *, indent: str = "  ") -> list[str]:
     n_th = sum(p.numel() for p in r.thinning.parameters())
     return [
-        f"{indent}harmonic-native:  h2m · gate(MLP)  (no Gaussian splat)",
-        f"{indent}stencil spacings:  s_t={r.s_t.item():.3f}  s_n={r.s_n.item():.3f}",
-        f"{indent}thinning head:  18→16→1 MLP  ({n_th} params)",
+        f"{indent}harmonic-native:  h2m · ρ̄ · gate(MLP), no stencils",
+        f"{indent}thinning head:  4→4→1 MLP  ({n_th} params)",
         f"{indent}κ_col / E_col:  supplied from L1 hypercolumn (cached in cells_flat)",
     ]
 
@@ -821,7 +812,7 @@ def _format_seed_block(model: HarmonicContourE2E) -> str:
     parts = [
         "\n--- L1 seed (NR) ---\n",
         *[ln + "\n" for ln in format_seed_param_lines(s, indent="")],
-        "\nρ = NR_pool(λ₁/(z₀+η_z)) × tile_interior  (no Allen–Cahn refine)\n",
+        "\nρ: min-subtract + η_z NR (pre-GABA) → GABA → dominant ρ × tile_interior\n",
     ]
     return "".join(parts)
 
@@ -841,8 +832,8 @@ def _format_render_params(model: HarmonicContourE2E):
         eta_str = (f" + η-mod σ(a={model.eta_mod_a.item():.1f},"
                    f"b={model.eta_mod_b.item():.1f},"
                    f"c={model.eta_mod_c.item():.1f})")
-    return (f"renderer={n_r} params  (harmonic-native, s_t, s_n, "
-            f"thinning 18→16→1{eta_str})")
+    return (f"renderer={n_r} params  (harmonic-native, "
+            f"thinning 4→4→1{eta_str})")
 
 
 def save_checkpoint(model, path):
@@ -939,7 +930,7 @@ def main():
     )
     print(
         f"Seed: R={SEED.R_POOL}  stride={SEED.STRIDE}  "
-        f"ρ = (λ₁/(z₀+η_z)) × tile_interior  (learned η_z; no NR pool on seed; no dynamics)"
+        f"ρ = pre-GABA NR(min,η_z) → GABA → dominant λ  × tile_interior  (learned η_z)"
     )
     print(
         f"Render: harmonic-native h2m·gate  "

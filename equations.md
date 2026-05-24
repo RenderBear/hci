@@ -280,9 +280,8 @@ Same 3 learned scalars, same sigmoid, same two-pass pipeline.
 |---|---:|
 | $\tilde{\eta}_z$ | 1 |
 | $a, b, c$ (η mod) | 3 |
-| $s_t, s_n$ | 2 |
-| MLP (e.g. 14→12→1) | 181 |
-| **Total** | **~187** |
+| Thinning MLP (4→4→1) | 25 |
+| **Total** | **~29** |
 
 ---
 

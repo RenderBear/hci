@@ -1,8 +1,9 @@
 r"""Seed module — thin wrapper providing renderer-compatible interface.
 
-HypercolumnSeed applies min-subtraction across bins per cell, then a
-Naka-Rushton squash vs learned eta_z only.  GABA recurrence handles
-competitive normalization.  This module forwards cached rho for the renderer.
+HypercolumnSeed holds learned η_z used in ``run_l1_hypercolumn`` for
+**pre-GABA** per-bin normalization (min-subtract + divisive NR).  GABA
+recurrence and extraction do not apply further η_z squash.  This module
+forwards cached ρ for the renderer.
 """
 
 from __future__ import annotations
@@ -20,7 +21,8 @@ class RhoSeedModule(nn.Module):
 
     The forward() method expects cells_flat to contain pre-computed
     'rho' and 'is_border' from run_l1_hypercolumn (which already
-    applied η_z normalization and GABA recurrence).  This module
+    applied min-subtract + η_z NR before GABA, then GABA recurrence (no
+    post-recurrence squash).  This module
     just passes them through with the expected return signature.
 
     The learned η_z parameter lives in self.hc_seed and is used
