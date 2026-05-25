@@ -611,30 +611,31 @@ def bce_loss_with_ignore(
 
 
 def remap_checkpoint_state_dict(sd: dict) -> dict:
-    """Remap legacy dynamics/eta keys; warm-start ``_eta_p_raw`` / ``_alpha_raw`` when absent.
+    """Remap legacy dynamics/eta keys; warm-start new β params when absent.
 
     ``seed._eta_rho_raw`` / ``dynamics._eta_rho_raw`` are omitted.  Legacy ``eta_mod_*``,
-    ``eta_mlp.*``, Heeger ``_sigma_sat_raw``, and learned ``β_*`` are dropped.
+    ``eta_mlp.*``, Heeger ``_sigma_sat_raw``, and ``_alpha_raw`` are dropped.
 
     ``η_z``: pass through ``seed.hc_seed._eta_z_raw``; map buffer ``_eta_z_fixed`` or
     orphan ``dynamics._eta_z_raw`` / ``seed._eta_z_raw`` into ``_eta_z_raw`` when needed.
     Old ``_eta_pass_raw`` / ``_eta0_raw`` seeds ``η_p`` when ``_eta_p_raw`` is missing.
-    ``_gaba_alpha_raw`` maps to ``_alpha_raw`` when present.
+    Legacy ``_beta_seed_raw``, ``_beta_coll_raw``, ``_beta_cross_raw`` warm-start new β keys.
     """
     skip = frozenset({"seed._eta_rho_raw", "dynamics._eta_rho_raw"})
     out: dict = {}
     legacy_eta_pass_raw: torch.Tensor | None = None
     legacy_eta0_raw: torch.Tensor | None = None
     legacy_sigma_sat_raw: torch.Tensor | None = None
-    legacy_gaba_alpha_raw: torch.Tensor | None = None
     legacy_orphan_eta_z_raw: torch.Tensor | None = None
     legacy_eta_z_fixed: torch.Tensor | None = None
+    legacy_beta_seed_raw: torch.Tensor | None = None
+    legacy_beta_coll_raw: torch.Tensor | None = None
+    legacy_beta_cross_raw: torch.Tensor | None = None
     drop_suffixes = (
-        "seed.hc_seed._beta_seed_raw",
-        "seed.hc_seed._beta_coll_raw",
-        "seed.hc_seed._beta_cross_raw",
         "seed.hc_seed._sigma_sat_raw",
         "seed.hc_seed._eta0_raw",
+        "seed.hc_seed._alpha_raw",
+        "seed.hc_seed._gaba_alpha_raw",
     )
     for k, v in sd.items():
         if k in skip:
@@ -649,8 +650,14 @@ def remap_checkpoint_state_dict(sd: dict) -> dict:
             if k == "seed.hc_seed._eta0_raw":
                 legacy_eta0_raw = v
             continue
-        if k == "seed.hc_seed._gaba_alpha_raw":
-            legacy_gaba_alpha_raw = v
+        if k == "seed.hc_seed._beta_seed_raw":
+            legacy_beta_seed_raw = v
+            continue
+        if k == "seed.hc_seed._beta_coll_raw":
+            legacy_beta_coll_raw = v
+            continue
+        if k == "seed.hc_seed._beta_cross_raw":
+            legacy_beta_cross_raw = v
             continue
         if k in ("seed.hc_seed._tau_raw", "seed.hc_seed._gain_alpha_raw"):
             continue
@@ -688,13 +695,41 @@ def remap_checkpoint_state_dict(sd: dict) -> dict:
             out["seed.hc_seed._eta_p_raw"] = torch.tensor(
                 [_inv_softplus(float(SEED.ETA_P))], dtype=torch.float32
             )
-    if "seed.hc_seed._alpha_raw" not in out:
-        if legacy_gaba_alpha_raw is not None and legacy_gaba_alpha_raw.numel() >= 1:
-            out["seed.hc_seed._alpha_raw"] = legacy_gaba_alpha_raw.reshape(-1)[0].clone().float()
+    if "seed.hc_seed._beta_seed_raw" not in out:
+        if legacy_beta_seed_raw is not None and legacy_beta_seed_raw.numel() >= 1:
+            out["seed.hc_seed._beta_seed_raw"] = legacy_beta_seed_raw.reshape(-1)[0].clone().float()
         else:
-            out["seed.hc_seed._alpha_raw"] = torch.tensor(
-                [_inv_softplus(float(SEED.ALPHA))], dtype=torch.float32
+            out["seed.hc_seed._beta_seed_raw"] = torch.tensor(
+                [_inv_softplus(float(SEED.BETA_SEED))], dtype=torch.float32
             )
+    if "seed.hc_seed._beta_c_raw" not in out:
+        if legacy_beta_coll_raw is not None and legacy_beta_coll_raw.numel() >= 1:
+            out["seed.hc_seed._beta_c_raw"] = legacy_beta_coll_raw.reshape(-1)[0].clone().float()
+        else:
+            out["seed.hc_seed._beta_c_raw"] = torch.tensor(
+                [_inv_softplus(float(SEED.BETA_C))], dtype=torch.float32
+            )
+    if "seed.hc_seed._beta_f_raw" not in out:
+        out["seed.hc_seed._beta_f_raw"] = torch.tensor(
+            [_inv_softplus(float(SEED.BETA_F))], dtype=torch.float32
+        )
+    if "seed.hc_seed._beta_x_raw" not in out:
+        if legacy_beta_cross_raw is not None and legacy_beta_cross_raw.numel() >= 1:
+            out["seed.hc_seed._beta_x_raw"] = legacy_beta_cross_raw.reshape(-1)[0].clone().float()
+        else:
+            out["seed.hc_seed._beta_x_raw"] = torch.tensor(
+                [_inv_softplus(float(SEED.BETA_X))], dtype=torch.float32
+            )
+    if "seed.hc_seed._alpha_t_raw" not in out:
+        out["seed.hc_seed._alpha_t_raw"] = torch.tensor(
+            [_inv_softplus(max(float(L1.COL_SIGMA_T) / float(L1.COL_RADIUS), 1e-4))],
+            dtype=torch.float32,
+        )
+    if "seed.hc_seed._alpha_iso_raw" not in out:
+        out["seed.hc_seed._alpha_iso_raw"] = torch.tensor(
+            [_inv_softplus(max(float(L1.COL_SIGMA_ISO) / float(L1.COL_RADIUS), 1e-4))],
+            dtype=torch.float32,
+        )
     return out
 
 
@@ -735,13 +770,17 @@ def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
     print(
         f"    η_z={float(s.hc_seed.eta_z.detach()):.4f}  "
         f"η_p={float(s.hc_seed.eta_p.detach()):.4f}  "
-        f"α={float(s.hc_seed.alpha.detach()):.4f}",
+        f"β_seed={float(s.hc_seed.beta_seed.detach()):.4f}  "
+        f"β_c={float(s.hc_seed.beta_c.detach()):.4f}",
     )
     print("\n  |grad| on raw params:")
     for raw, label in (
         ("_eta_z_raw", "η_z"),
         ("_eta_p_raw", "η_p"),
-        ("_alpha_raw", "α"),
+        ("_beta_seed_raw", "β_seed"),
+        ("_beta_c_raw", "β_c"),
+        ("_beta_f_raw", "β_f"),
+        ("_beta_x_raw", "β_x"),
     ):
         t = getattr(s.hc_seed, raw, None)
         if t is None or t.grad is None:
@@ -762,6 +801,7 @@ def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
     for raw, label in (
         ("_alpha_d_raw", "α_d"),
         ("_alpha_t_raw", "α_t"),
+        ("_alpha_iso_raw", "α_iso"),
     ):
         t = getattr(s.hc_seed, raw, None)
         if t is None or t.grad is None:
@@ -827,13 +867,14 @@ def format_seed_param_lines(seed: RhoSeedModule, *, indent: str = "  ") -> list[
     """Learned seed NR + pass NR scalars (infer / train logging)."""
     hc = seed.hc_seed
     sig_d, sig_t = hc.collinear_sigmas(float(L1.COL_RADIUS))
+    sig_iso = hc.cross_sigma(float(L1.COL_RADIUS))
     return [
         f"{indent}tile geometry:  R={seed.R}  stride={seed.stride}",
-        f"{indent}seed η_z:  {hc.eta_z.item():.3f}  |  pass η_p:  {hc.eta_p.item():.4f}  "
-        f"|  α:  {hc.alpha.item():.3f}",
-        f"{indent}β_coll={SEED.BETA_COLL:g}  β_curr={SEED.BETA_CURR:g}  (fixed)",
-        f"{indent}collinear σ:  σ_d={sig_d.item():.3f}  σ_t={sig_t.item():.3f}  "
-        f"(R={L1.COL_RADIUS})",
+        f"{indent}seed η_z:  {hc.eta_z.item():.3f}  |  pass η_p:  {hc.eta_p.item():.4f}",
+        f"{indent}β_seed={hc.beta_seed.item():.3f}  β_c={hc.beta_c.item():.3f}  "
+        f"β_f={hc.beta_f.item():.3f}  β_x={hc.beta_x.item():.3f}",
+        f"{indent}kernel σ:  σ_d={sig_d.item():.3f}  σ_t={sig_t.item():.3f}  "
+        f"σ_iso={sig_iso.item():.3f}  (R={L1.COL_RADIUS})",
     ]
 
 
@@ -853,8 +894,9 @@ def _format_seed_block(model: HarmonicContourE2E) -> str:
         "\n--- L1 seed (NR) ---\n",
         *[ln + "\n" for ln in format_seed_param_lines(s, indent="")],
         "\nρ: raw → η_z seed NR (μ→[0,1]) → pass NR: "
-        "x = ρ_seed + α(β_coll·s_coll − β_curr·s_surr); ρ ← x²/(x²+η_p²+ε)  "
-        "(η_p, α learned; β_coll, β_curr fixed; s_coll, s_surr kernel-normalized) → dominant ρ × tile_interior\n",
+        "drive=max(0,β_seed·ρ_seed+β_c·s_coll−β_f·s_flank); "
+        "ρ←drive²/(drive²+η_p²+β_x·s_cross²+ε)  "
+        "(η_z, η_p, β_*, σ_d/σ_t/σ_iso learned; pools kernel-normalized) → dominant ρ × tile_interior\n",
     ]
     return "".join(parts)
 

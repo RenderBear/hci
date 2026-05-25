@@ -10,12 +10,11 @@ Pipeline:
   3. **Seed NR (preprocess only):** ``ρ^{\\mathrm{seed}}_k = μ_k^2/(μ_k^2+η_z^2+ε)`` with learned
      ``η_z`` — compresses raw drive to ``[0,1]`` so it matches normalized pools below.
   4. ``T`` **pass NR** steps on ``ρ^{(t)}`` (starts from ``ρ^{(0)}=ρ^{\\mathrm{seed}}``):
-     kernel-normalized collinear ``s_{\\mathrm{coll}}`` and LOO **annular** surround
-     ``s_{\\mathrm{surr}}`` (``\\max(0,\\,H-G_k)`` conv, non-overlapping with collinear);
-     ``x = ρ^{\\mathrm{seed}} + α(β_{\\mathrm{coll}} s_{\\mathrm{coll}} - β_{\\mathrm{curr}} s_{\\mathrm{surr}})``;
-     ``ρ^{(t+1)} = x^2/(x^2 + η_p^2 + ε)`` with learned scalars ``η_p``, ``α`` (fixed ``β_{\\mathrm{coll}}``,
-     ``β_{\\mathrm{curr}}`` from ``params.SEED``).  Spatial adaptation enters via the local boost, not a
-     spatial ``η``.
+     kernel-normalized collinear / flank / cross pools
+     (``G_k = \\mathrm{gauss}(r,σ_d,σ_t)\\cos^2(\\phi-\\theta_k)``,
+     ``\\mathrm{gauss}(r,σ_d,σ_t)\\sin^2(\\phi-\\theta_k)``, LOO × ``\\mathrm{gauss}(r,σ_{\\mathrm{iso}})``);
+     ``\\mathrm{drive} = \\max(0,\\, β_{\\mathrm{seed}} ρ^{\\mathrm{seed}} + β_c s_{\\mathrm{coll}} - β_f s_{\\mathrm{flank}})``;
+     ``ρ^{(t+1)} = \\mathrm{drive}^2/(\\mathrm{drive}^2 + η_p^2 + β_x s_{\\mathrm{cross}}^2 + ε)``.
   5. Extract dominant ``ρ``, ``θ``, and diagnostic ``κ`` for the renderer / readout.
 
 ``rho_k_initial`` stores **post–seed-NR** ``ρ^{\\mathrm{seed}}``.  ``kappa_pass0_cell`` /
@@ -101,6 +100,37 @@ def z_from_l0_harmonics(
 # Collinear kernels (same as renderer, factored out)
 # ═══════════════════════════════════════════════════════════════
 
+def _radial_gaussian_disk(
+    R: int,
+    sigma_d: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Radial Gaussian × disk, center omitted; returns ``(w_d, di, dj)``."""
+    sigma_d = sigma_d.to(device=device, dtype=dtype).clamp_min(
+        torch.tensor(1e-4, device=device, dtype=dtype)
+    )
+    offsets = torch.arange(-R, R + 1, device=device, dtype=dtype)
+    di, dj = torch.meshgrid(offsets, offsets, indexing="ij")
+    dist_sq = di * di + dj * dj
+    disc = (dist_sq <= float(R * R)).to(dtype=dtype)
+    omit_center = (dist_sq > 0).to(dtype=dtype)
+    w_d = torch.exp(-dist_sq / (2.0 * sigma_d * sigma_d)) * disc * omit_center
+    return w_d, di, dj
+
+
+def _oriented_gaussian_envelope(
+    w_d: torch.Tensor,
+    di: torch.Tensor,
+    dj: torch.Tensor,
+    sigma_t: torch.Tensor,
+    theta_k: float,
+) -> torch.Tensor:
+    """Separable ``\\mathrm{gauss}(r, σ_d, σ_t)`` tangential factor at orientation ``θ_k``."""
+    d_perp = dj * math.cos(theta_k) - di * math.sin(theta_k)
+    return w_d * torch.exp(-d_perp * d_perp / (2.0 * sigma_t * sigma_t))
+
+
 def _build_collinear_kernels(
     R: int, K: int,
     sigma_d: torch.Tensor,
@@ -108,64 +138,63 @@ def _build_collinear_kernels(
     device: torch.device,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Precompute K depthwise kernels of shape (K, 1, 2R+1, 2R+1).
-
-    ``sigma_d`` and ``sigma_t`` are 0-dim tensors (differentiable w.r.t. learned
-    α in ``HypercolumnSeed``).
-    """
-    sigma_d = sigma_d.to(device=device, dtype=dtype).clamp_min(torch.tensor(1e-4, device=device, dtype=dtype))
-    sigma_t = sigma_t.to(device=device, dtype=dtype).clamp_min(torch.tensor(1e-4, device=device, dtype=dtype))
-    offsets = torch.arange(-R, R + 1, device=device, dtype=dtype)
-    di, dj = torch.meshgrid(offsets, offsets, indexing="ij")
-    dist_sq = di * di + dj * dj
-    # Out-of-place masks only: in-place slices on ``w_d`` break ExpBackward when
-    # ``sigma_d`` / ``sigma_t`` are learned (live L1 training).
-    disc = (dist_sq <= float(R * R)).to(dtype=dtype)
-    omit_center = (dist_sq > 0).to(dtype=dtype)
-    w_d = torch.exp(-dist_sq / (2.0 * sigma_d * sigma_d)) * disc * omit_center
-
+    """Precompute K depthwise kernels ``G_k = \\mathrm{gauss}(r,σ_d,σ_t)\\cos^2(\\phi-\\theta_k)``."""
+    w_d, di, dj = _radial_gaussian_disk(R, sigma_d, device, dtype)
+    sigma_t = sigma_t.to(device=device, dtype=dtype).clamp_min(
+        torch.tensor(1e-4, device=device, dtype=dtype)
+    )
+    phi = torch.atan2(di, dj)
     kernels = torch.zeros(K, 2 * R + 1, 2 * R + 1, device=device, dtype=dtype)
     for k in range(K):
         theta_k = k * math.pi / K
-        d_perp = dj * math.cos(theta_k) - di * math.sin(theta_k)
-        w_t = torch.exp(-d_perp * d_perp / (2.0 * sigma_t * sigma_t))
-        kernels[k] = w_d * w_t
+        w_env = _oriented_gaussian_envelope(w_d, di, dj, sigma_t, theta_k)
+        kernels[k] = w_env * torch.cos(phi - theta_k).pow(2)
     return kernels.unsqueeze(1)
 
 
-def _build_isotropic_surround_kernel(
-    R: int,
+def _build_flank_kernels(
+    R: int, K: int,
     sigma_d: torch.Tensor,
+    sigma_t: torch.Tensor,
     device: torch.device,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Single-channel kernel ``(1,1,2R+1,2R+1)``: radial Gaussian × disk, center omitted.
-
-    Matches the **radial** factor ``w_d`` of ``_build_collinear_kernels`` (no tangential
-    selectivity). Used to build **annular** per-bin kernels ``\\max(0, H - G_k)`` for surround
-    (``H`` this tensor; ``G_k`` collinear). LOO mean ``(1/\\max(K-1,1))\\sum_{j\\neq k} ρ_j`` is
-    then convolved with that annular kernel.
-    """
-    sigma_d = sigma_d.to(device=device, dtype=dtype).clamp_min(torch.tensor(1e-4, device=device, dtype=dtype))
-    offsets = torch.arange(-R, R + 1, device=device, dtype=dtype)
-    di, dj = torch.meshgrid(offsets, offsets, indexing="ij")
-    dist_sq = di * di + dj * dj
-    disc = (dist_sq <= float(R * R)).to(dtype=dtype)
-    omit_center = (dist_sq > 0).to(dtype=dtype)
-    w = torch.exp(-dist_sq / (2.0 * sigma_d * sigma_d)) * disc * omit_center
-    return w.unsqueeze(0).unsqueeze(0)
+    """Precompute K depthwise kernels ``G_k = \\mathrm{gauss}(r,σ_d,σ_t)\\sin^2(\\phi-\\theta_k)``."""
+    w_d, di, dj = _radial_gaussian_disk(R, sigma_d, device, dtype)
+    sigma_t = sigma_t.to(device=device, dtype=dtype).clamp_min(
+        torch.tensor(1e-4, device=device, dtype=dtype)
+    )
+    phi = torch.atan2(di, dj)
+    kernels = torch.zeros(K, 2 * R + 1, 2 * R + 1, device=device, dtype=dtype)
+    for k in range(K):
+        theta_k = k * math.pi / K
+        w_env = _oriented_gaussian_envelope(w_d, di, dj, sigma_t, theta_k)
+        kernels[k] = w_env * torch.sin(phi - theta_k).pow(2)
+    return kernels.unsqueeze(1)
 
 
-def _build_annular_surround_kernels(
-    iso_kernel: torch.Tensor,
-    collinear_kernels: torch.Tensor,
+def _build_isotropic_kernel(
+    R: int,
+    sigma_iso: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Depthwise kernels ``(K,1,2R+1,2R+1)``: isotropic radial ``H`` minus collinear ``G_k``, clamped.
+    """Single-channel kernel ``(1,1,2R+1,2R+1)``: ``\\mathrm{gauss}(r, σ_{\\mathrm{iso}})`` × disk."""
+    w_d, _, _ = _radial_gaussian_disk(R, sigma_iso, device, dtype)
+    return w_d.unsqueeze(0).unsqueeze(0)
 
-    ``surround_k = \\max(0, H - G_k)`` so inhibition pools neighbors **off** the collinear corridor
-    for bin ``k`` (same disk / ``σ_d`` as ``G_k``; tangential selectivity only in ``G_k``).
-    """
-    return (iso_kernel - collinear_kernels).clamp_min(0.0)
+
+def _norm_conv(
+    x: torch.Tensor,
+    kernels: torch.Tensor,
+    R: int,
+    K: int,
+) -> torch.Tensor:
+    """Kernel-normalized depthwise conv: ``conv(x, G) / conv(1, G)`` per bin."""
+    ones = torch.ones_like(x)
+    sum_w = F.conv2d(ones, kernels, padding=R, groups=K).clamp_min(1e-6)
+    raw = F.conv2d(x, kernels, padding=R, groups=K)
+    return raw / sum_w
 
 
 def _build_tile_grid(nH, nW, R, stride, dev):
@@ -363,12 +392,14 @@ def gaba_recurrence(
     R: int,
     sigma_d: torch.Tensor,
     sigma_t: torch.Tensor,
+    sigma_iso: torch.Tensor,
     n_passes: int,
     eta_z: torch.Tensor,
     eta_p: torch.Tensor,
-    alpha: torch.Tensor,
-    beta_coll: float,
-    beta_curr: float,
+    beta_seed: torch.Tensor,
+    beta_c: torch.Tensor,
+    beta_f: torch.Tensor,
+    beta_x: torch.Tensor,
     nr_eps: float,
     eps: float = 1e-6,
     eta_update_fn: Callable | None = None,
@@ -379,27 +410,29 @@ def gaba_recurrence(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor,
 ]:
-    """Seed NR on raw ``μ``, then contextual pass NR (scalar ``η_p``, ``α``).
+    """Seed NR on raw ``μ``, then contextual pass NR.
 
     **Seed:** ``ρ^{\\mathrm{seed}} = \\mathrm{NR}(μ, η_z)`` maps raw cos² mass to ``[0,1]``.
     ``ρ^{\\mathrm{seed}}`` is fixed for all passes.
 
-    **Passes:** kernel-normalized collinear ``s_{\\mathrm{coll}}`` and annular surround
-    ``s_{\\mathrm{surr}}`` on the current ``ρ^{(t)}``; contextual drive
-    ``x = ρ^{\\mathrm{seed}} + α(β_{\\mathrm{coll}} s_{\\mathrm{coll}} - β_{\\mathrm{curr}} s_{\\mathrm{surr}})``;
-    ``ρ^{(t+1)} = x^2/(x^2 + η_p^2 + ε)``.  Diagnostic ``κ`` uses **raw** collinear conv vs ``ρ``.
+    **Passes:** kernel-normalized collinear / flank / cross pools;
+    ``\\mathrm{drive} = \\max(0,\\, β_{\\mathrm{seed}} ρ^{\\mathrm{seed}} + β_c s_{\\mathrm{coll}}
+    - β_f s_{\\mathrm{flank}})``;
+    ``ρ^{(t+1)} = \\mathrm{drive}^2/(\\mathrm{drive}^2 + η_p^2 + β_x s_{\\mathrm{cross}}^2 + ε)``.
+    Diagnostic ``κ`` uses **raw** collinear conv vs ``ρ``.
 
     Returns:
-        rho_k_out, kappa_k, kappa_k_pass0, rho_k_seed_snap, s_coll_first, s_surr_first.
-        ``rho_k_seed_snap`` is post–seed-NR ``ρ^{\\mathrm{seed}}`` ``(N,K)`` (``rho_k_initial``).
-        ``s_surr_first`` holds **normalized** annular-surround from pass 0.
+        rho_k_out, kappa_k, kappa_k_pass0, rho_k_seed_snap,
+        s_coll_first, s_flank_first, s_cross_first (pass-0 normalized pools).
     """
     device = rho_k_raw.device
     dtype = rho_k_raw.dtype
-    kernels = _build_collinear_kernels(R, K, sigma_d, sigma_t, device, dtype)
-    iso_kernel = _build_isotropic_surround_kernel(R, sigma_d, device, dtype)
-    surr_kernels = _build_annular_surround_kernels(iso_kernel, kernels)
+    coll_kernels = _build_collinear_kernels(R, K, sigma_d, sigma_t, device, dtype)
+    flank_kernels = _build_flank_kernels(R, K, sigma_d, sigma_t, device, dtype)
+    iso_kernel = _build_isotropic_kernel(R, sigma_iso, device, dtype)
+    cross_kernels = iso_kernel.expand(K, -1, -1, -1)
 
     ib_grid = is_border.reshape(nH, nW)
     border_mask_4d = ib_grid.unsqueeze(0).unsqueeze(0)  # (1,1,nH,nW)
@@ -426,15 +459,18 @@ def gaba_recurrence(
     kappa_k_pass0 = torch.zeros_like(rho_k_raw)
     kappa_last_nw = torch.zeros(nH, nW, device=device, dtype=dtype)
     s_coll_first: torch.Tensor | None = None
-    s_surr_first: torch.Tensor | None = None
+    s_flank_first: torch.Tensor | None = None
+    s_cross_first: torch.Tensor | None = None
 
     eta_p_t = torch.as_tensor(eta_p, device=device, dtype=dtype)
-    alpha_t = torch.as_tensor(alpha, device=device, dtype=dtype).view(())
-    beta_c = torch.as_tensor(float(beta_coll), device=device, dtype=dtype)
-    beta_s = torch.as_tensor(float(beta_curr), device=device, dtype=dtype)
+    b_seed = torch.as_tensor(beta_seed, device=device, dtype=dtype).view(())
+    b_c = torch.as_tensor(beta_c, device=device, dtype=dtype).view(())
+    b_f = torch.as_tensor(beta_f, device=device, dtype=dtype).view(())
+    b_x = torch.as_tensor(beta_x, device=device, dtype=dtype).view(())
+    eta_p_sq = eta_p_t * eta_p_t
+    ep = torch.as_tensor(nr_eps, device=device, dtype=dtype)
     k_i = int(K)
     den_other = float(max(k_i - 1, 1))
-    ones_rho = torch.ones_like(rho_grid)
 
     for t in range(n_passes):
         if eta_update_fn is not None:
@@ -449,25 +485,26 @@ def gaba_recurrence(
                 torch.zeros_like(rho_grid), rho_grid,
             )
 
-        sum_col = F.conv2d(ones_rho, kernels, padding=R, groups=K).clamp_min(1e-6)
-        s_coll_raw = F.conv2d(rho_grid, kernels, padding=R, groups=K)
-        s_coll = s_coll_raw / sum_col
+        s_coll_raw = F.conv2d(rho_grid, coll_kernels, padding=R, groups=K)
+        s_coll = _norm_conv(rho_grid, coll_kernels, R, K)
+        s_flank = _norm_conv(rho_grid, flank_kernels, R, K)
 
         rho_total = rho_grid.sum(dim=1, keepdim=True)
         rho_other_mean = (rho_total - rho_grid) / den_other
-        ones_other = torch.ones_like(rho_other_mean)
-        sum_surr = F.conv2d(ones_other, surr_kernels, padding=R, groups=K).clamp_min(1e-6)
-        s_surr_raw = F.conv2d(rho_other_mean, surr_kernels, padding=R, groups=K)
-        s_surr = s_surr_raw / sum_surr
+        s_cross = _norm_conv(rho_other_mean, cross_kernels, R, K)
 
         kap_t = _cosine_kappa_grid(rho_grid, s_coll_raw, eps)
         if t == 0:
             s_coll_first = s_coll.detach().clone()
-            s_surr_first = s_surr.detach().clone()
+            s_flank_first = s_flank.detach().clone()
+            s_cross_first = s_cross.detach().clone()
 
-        x = rho_seed + alpha_t * (beta_c * s_coll - beta_s * s_surr)
-        x = torch.where(border_mask_4d.expand_as(x), torch.zeros_like(x), x)
-        rho_grid = nr_squash_k_bins(x, eta_p_t, nr_eps)
+        drive = b_seed * rho_seed + b_c * s_coll - b_f * s_flank
+        drive = drive.clamp_min(0.0)
+        drive = torch.where(border_mask_4d.expand_as(drive), torch.zeros_like(drive), drive)
+        drive_sq = drive * drive
+        denom = drive_sq + eta_p_sq + b_x * s_cross * s_cross + ep
+        rho_grid = drive_sq / denom
         rho_grid = torch.where(
             border_mask_4d.expand_as(rho_grid),
             torch.zeros_like(rho_grid), rho_grid,
@@ -483,9 +520,13 @@ def gaba_recurrence(
     if s_coll_first is None:
         zshape = (1, int(K), nH, nW)
         s_coll_first = torch.zeros(zshape, device=device, dtype=dtype)
-        s_surr_first = torch.zeros_like(s_coll_first)
+        s_flank_first = torch.zeros_like(s_coll_first)
+        s_cross_first = torch.zeros_like(s_coll_first)
 
-    return rho_k_out, kappa_k_out, kappa_k_pass0, rho_k_seed_snap, s_coll_first, s_surr_first
+    return (
+        rho_k_out, kappa_k_out, kappa_k_pass0, rho_k_seed_snap,
+        s_coll_first, s_flank_first, s_cross_first,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -552,7 +593,7 @@ def extract_dominant(
 
 
 class HypercolumnSeed(nn.Module):
-    """Learned ``η_z`` (seed NR), ``η_p`` (pass NR), ``α`` (contextual boost); σ_d/σ_t for kernels."""
+    """Learned ``η_z``, ``η_p``, four ``β`` weights, and kernel scales ``σ_d``, ``σ_t``, ``σ_{\\mathrm{iso}}``."""
 
     def __init__(
         self,
@@ -562,7 +603,10 @@ class HypercolumnSeed(nn.Module):
         n_gaba_passes: int | None = None,
         eta_z_init: float | None = None,
         eta_p_init: float | None = None,
-        alpha_init: float | None = None,
+        beta_seed_init: float | None = None,
+        beta_c_init: float | None = None,
+        beta_f_init: float | None = None,
+        beta_x_init: float | None = None,
     ):
         super().__init__()
         self.R = int(r_pool)
@@ -580,21 +624,37 @@ class HypercolumnSeed(nn.Module):
         self._eta_p_raw = nn.Parameter(
             torch.tensor(_inv_softplus(ep), dtype=torch.float32)
         )
-        a0 = float(alpha_init if alpha_init is not None else SEED.ALPHA)
-        a0 = max(a0, 1e-6)
-        self._alpha_raw = nn.Parameter(
-            torch.tensor(_inv_softplus(a0), dtype=torch.float32)
+        bs0 = float(beta_seed_init if beta_seed_init is not None else SEED.BETA_SEED)
+        bc0 = float(beta_c_init if beta_c_init is not None else SEED.BETA_C)
+        bf0 = float(beta_f_init if beta_f_init is not None else SEED.BETA_F)
+        bx0 = float(beta_x_init if beta_x_init is not None else SEED.BETA_X)
+        self._beta_seed_raw = nn.Parameter(
+            torch.tensor(_inv_softplus(max(bs0, 1e-6)), dtype=torch.float32)
+        )
+        self._beta_c_raw = nn.Parameter(
+            torch.tensor(_inv_softplus(max(bc0, 1e-6)), dtype=torch.float32)
+        )
+        self._beta_f_raw = nn.Parameter(
+            torch.tensor(_inv_softplus(max(bf0, 1e-6)), dtype=torch.float32)
+        )
+        self._beta_x_raw = nn.Parameter(
+            torch.tensor(_inv_softplus(max(bx0, 1e-6)), dtype=torch.float32)
         )
         R_geom = float(L1.COL_RADIUS)
         sd0 = float(L1.COL_SIGMA_D) if L1.COL_SIGMA_D is not None else R_geom / 2.0
         st0 = float(L1.COL_SIGMA_T)
+        si0 = float(L1.COL_SIGMA_ISO)
         ratio_d = max(sd0 / R_geom, 1e-4)
         ratio_t = max(st0 / R_geom, 1e-4)
+        ratio_iso = max(si0 / R_geom, 1e-4)
         self._alpha_d_raw = nn.Parameter(
             torch.tensor(_inv_softplus(ratio_d), dtype=torch.float32)
         )
         self._alpha_t_raw = nn.Parameter(
             torch.tensor(_inv_softplus(ratio_t), dtype=torch.float32)
+        )
+        self._alpha_iso_raw = nn.Parameter(
+            torch.tensor(_inv_softplus(ratio_iso), dtype=torch.float32)
         )
 
     def collinear_sigmas(self, R_col: int | float) -> tuple[torch.Tensor, torch.Tensor]:
@@ -604,6 +664,11 @@ class HypercolumnSeed(nn.Module):
         sigma_t = F.softplus(self._alpha_t_raw) * Rt
         return sigma_d, sigma_t
 
+    def cross_sigma(self, R_col: int | float) -> torch.Tensor:
+        """Return ``σ_{\\mathrm{iso}}`` = softplus(α_iso) · R_col for the cross-orientation kernel."""
+        Rt = torch.as_tensor(float(R_col), device=self._alpha_iso_raw.device, dtype=self._alpha_iso_raw.dtype)
+        return F.softplus(self._alpha_iso_raw) * Rt
+
     @property
     def eta_z(self) -> torch.Tensor:
         """Positive seed-NR scale ``η_z = softplus(raw)`` (clamped ``≥ 10^{-6}``)."""
@@ -611,13 +676,24 @@ class HypercolumnSeed(nn.Module):
 
     @property
     def eta_p(self) -> torch.Tensor:
-        """Positive pass-NR scale ``η_p = softplus(raw)`` (clamped ``≥ 10^{-6}``)."""
+        """Positive pass-NR floor ``η_p = softplus(raw)`` (clamped ``≥ 10^{-6}``)."""
         return F.softplus(self._eta_p_raw).clamp_min(1e-6).view(())
 
     @property
-    def alpha(self) -> torch.Tensor:
-        """Contextual boost strength ``α = softplus(raw)`` on collinear − surround."""
-        return F.softplus(self._alpha_raw).clamp_min(1e-6).view(())
+    def beta_seed(self) -> torch.Tensor:
+        return F.softplus(self._beta_seed_raw).clamp_min(1e-6).view(())
+
+    @property
+    def beta_c(self) -> torch.Tensor:
+        return F.softplus(self._beta_c_raw).clamp_min(1e-6).view(())
+
+    @property
+    def beta_f(self) -> torch.Tensor:
+        return F.softplus(self._beta_f_raw).clamp_min(1e-6).view(())
+
+    @property
+    def beta_x(self) -> torch.Tensor:
+        return F.softplus(self._beta_x_raw).clamp_min(1e-6).view(())
 
     def normalize_pre_gaba(self, rho_k_raw: torch.Tensor) -> torch.Tensor:
         """Scalar ``η_z`` NR on flat ``(N,K)`` (matches seed NR before pass recurrence)."""
@@ -651,13 +727,13 @@ def run_l1_hypercolumn(
     """Run the full hypercolumn L1 pipeline.
 
     L0 output → K-bin hypercolumns → **seed NR** (``μ`` → ``[0,1]``) → ``T`` **pass NR**
-    steps (learned ``η_p``, ``α``; fixed ``β_coll``, ``β_curr``), dominant readout.
+    steps (learned ``η_p``, ``β_{\\mathrm{seed}}``, ``β_c``, ``β_f``, ``β_x``), dominant readout.
 
     Args:
         h2m: (H, W) from L0
         theta_h: (H, W) from L0
         border_mask: (H, W) bool
-        seed: HypercolumnSeed (``η_z``, ``η_p``, ``α``, σ_d/σ_t)
+        seed: HypercolumnSeed (``η_z``, ``η_p``, ``β_*``, σ_d)
         P, patch_overlap, border_patch_max_frac: patch geometry
         K, R, n_passes: recurrence params (``n_passes`` must match ``seed.n_gaba_passes``)
         sigma_d, sigma_t: optional **fixed** floats for tests; default uses
@@ -672,12 +748,12 @@ def run_l1_hypercolumn(
     """
     device = h2m.device
     R_int = int(R)
-    k_int = int(K)
     if sigma_d is not None and sigma_t is not None:
         sigma_d_t = torch.as_tensor(float(sigma_d), device=device, dtype=torch.float32)
         sigma_t_t = torch.as_tensor(float(sigma_t), device=device, dtype=torch.float32)
     else:
         sigma_d_t, sigma_t_t = seed.collinear_sigmas(float(R_int))
+    sigma_iso_t = seed.cross_sigma(float(R_int))
 
     # Step 1: Build hypercolumns
     hc = build_hypercolumns(
@@ -705,39 +781,35 @@ def run_l1_hypercolumn(
         rho_max_raw = rho_k_raw[interior].max(dim=-1).values
         ez = float(seed.eta_z.detach().cpu().item())
         ep = float(seed.eta_p.detach().cpu().item())
-        al = float(seed.alpha.detach().cpu().item())
         print(
-            f"  η_z={ez:.3f}  η_p={ep:.4f}  α={al:.3f}  "
-            f"β_coll={SEED.BETA_COLL:g}  β_curr={SEED.BETA_CURR:g}",
+            f"  η_z={ez:.3f}  η_p={ep:.4f}  "
+            f"β_seed={float(seed.beta_seed.detach()):.3f}  "
+            f"β_c={float(seed.beta_c.detach()):.3f}  "
+            f"β_f={float(seed.beta_f.detach()):.3f}  "
+            f"β_x={float(seed.beta_x.detach()):.3f}",
         )
         print(f"  raw ρ_k max (interior): mean={rho_max_raw.mean():.4f} "
               f"max={rho_max_raw.max():.4f}")
 
-    rho_k_gaba, kappa_k, kappa_k_pass0, rho_k_initial, s_coll_first, s_surr_first = (
+    rho_k_gaba, kappa_k, kappa_k_pass0, rho_k_initial, s_coll_first, s_flank_first, s_cross_first = (
         gaba_recurrence(
             rho_k_raw, nH, nW, hc["is_border"], K,
-            R=R_int, sigma_d=sigma_d_t, sigma_t=sigma_t_t,
+            R=R_int, sigma_d=sigma_d_t, sigma_t=sigma_t_t, sigma_iso=sigma_iso_t,
             n_passes=n_passes,
             eta_z=seed.eta_z,
             eta_p=seed.eta_p,
-            alpha=seed.alpha,
-            beta_coll=float(SEED.BETA_COLL),
-            beta_curr=float(SEED.BETA_CURR),
+            beta_seed=seed.beta_seed,
+            beta_c=seed.beta_c,
+            beta_f=seed.beta_f,
+            beta_x=seed.beta_x,
             nr_eps=float(seed.eps),
             eps=eps,
             eta_update_fn=None,
         )
     )
-    sk_max_hw = s_coll_first.squeeze(0).max(dim=0).values
-    rho0_hwk = rho_k_initial.reshape(nH, nW, k_int).permute(2, 0, 1)
-    dom_hw = rho0_hwk.argmax(dim=0)
-    sc_k_hw = s_coll_first.squeeze(0)
-    sb_k_hw = s_surr_first.squeeze(0)
-    sbar_hw = torch.gather(sb_k_hw, 0, dom_hw.unsqueeze(0)).squeeze(0)
-    s_delta_k_hw = (
-        float(SEED.BETA_COLL) * sc_k_hw - float(SEED.BETA_CURR) * sb_k_hw
-    )
-    sdelta_max_hw = s_delta_k_hw.max(dim=0).values
+    scoll_max_hw = s_coll_first.squeeze(0).max(dim=0).values
+    sflank_max_hw = s_flank_first.squeeze(0).max(dim=0).values
+    scross_max_hw = s_cross_first.squeeze(0).max(dim=0).values
 
     if verbose:
         interior = ~hc["is_border"]
@@ -803,9 +875,9 @@ def run_l1_hypercolumn(
             "e_col_cell": dom["e_col"].reshape(nH, nW),
             "rho_initial_cell": dom["rho_initial"].reshape(nH, nW),
             "rho_max_cell": dom["rho_max"].reshape(nH, nW),
-            "sk_max_cell": sk_max_hw,
-            "sbar_cell": sbar_hw,
-            "sdelta_cell": sdelta_max_hw,
+            "scoll_max_cell": scoll_max_hw,
+            "sflank_max_cell": sflank_max_hw,
+            "scross_max_cell": scross_max_hw,
         }
         return cells
 
@@ -846,9 +918,9 @@ def run_l1_hypercolumn(
         "e_col_cell": e_cell,
         "rho_initial_cell": rho_initial_cell,
         "rho_max_cell": rho_max_cell,
-        "sk_max_cell": sk_max_hw.detach().cpu().numpy(),
-        "sbar_cell": sbar_hw.detach().cpu().numpy(),
-        "sdelta_cell": sdelta_max_hw.detach().cpu().numpy(),
+        "scoll_max_cell": scoll_max_hw.detach().cpu().numpy(),
+        "sflank_max_cell": sflank_max_hw.detach().cpu().numpy(),
+        "scross_max_cell": scross_max_hw.detach().cpu().numpy(),
     }
     return cells
 

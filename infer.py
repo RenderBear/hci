@@ -184,9 +184,9 @@ def run_l0_l1(
     N = nH * nW
     cells_flat = build_cells_flat(cells)
 
-    sk_max_grid = np.asarray(cells["sk_max_cell"], dtype=np.float64).copy()
-    sbar_grid = np.asarray(cells["sbar_cell"], dtype=np.float64).copy()
-    sdelta_grid = np.asarray(cells["sdelta_cell"], dtype=np.float64).copy()
+    scoll_max_grid = np.asarray(cells["scoll_max_cell"], dtype=np.float64).copy()
+    sflank_max_grid = np.asarray(cells["sflank_max_cell"], dtype=np.float64).copy()
+    scross_max_grid = np.asarray(cells["scross_max_cell"], dtype=np.float64).copy()
     rho_initial_grid = np.asarray(
         cells["rho_initial_cell"], dtype=np.float64,
     ).copy()
@@ -213,9 +213,9 @@ def run_l0_l1(
         "W0": W0,
         "nH": nH,
         "nW": nW,
-        "sk_max_grid": sk_max_grid,
-        "sbar_grid": sbar_grid,
-        "sdelta_grid": sdelta_grid,
+        "scoll_max_grid": scoll_max_grid,
+        "sflank_max_grid": sflank_max_grid,
+        "scross_max_grid": scross_max_grid,
         "rho_initial_grid": rho_initial_grid,
         "kappa_pass0_grid": kappa_pass0_grid,
         "kappa_final_grid": kappa_final_grid,
@@ -520,9 +520,9 @@ def main():
 
         p_geom = os.path.join(od, f"{stem}_geometry.png")
         viz_infer_gaba_geometry(
-            prep["sk_max_grid"],
-            prep["sbar_grid"],
-            prep["sdelta_grid"],
+            prep["scoll_max_grid"],
+            prep["sflank_max_grid"],
+            prep["scross_max_grid"],
             is_border,
             p_geom,
             n_collinear_passes=n_gaba_passes,

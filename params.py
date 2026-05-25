@@ -1,11 +1,11 @@
 r"""Shared pipeline hyperparameters, module inits, and script defaults.
 
 L1 builds cos² hypercolumns → **seed NR** (learned ``η_z``) compresses raw ``μ`` to ``[0,1]``,
-then **pass NR** steps: ``x = ρ^{\\mathrm{seed}} + α(β_{\\mathrm{coll}} s_{\\mathrm{coll}} - β_{\\mathrm{curr}} s_{\\mathrm{surr}})``,
-``ρ ← x^2/(x^2+η_p^2+ε)`` with learned ``η_p``, ``α`` (fixed ``β_{\\mathrm{coll}}``, ``β_{\\mathrm{curr}}``).
-``s_{\\mathrm{coll}}``, ``s_{\\mathrm{surr}}`` from **kernel-normalized** depthwise convs (annular surround).
-Learned ``η_z``, ``η_p``, ``α``.
-Surround uses LOO mean across bins then **annular** depthwise weights ``\\max(0, H-G_k)`` (radial ``H`` minus collinear ``G_k``).
+then **pass NR** steps: ``drive = max(0, β_seed·ρ_seed + β_c·s_coll − β_f·s_flank)``,
+``ρ ← drive²/(drive²+η_p²+β_x·s_cross²+ε)`` with learned
+``η_z``, ``η_p``, ``β_{\\mathrm{seed}}``, ``β_c``, ``β_f``, ``β_x``, ``σ_d``, ``σ_t``, ``σ_{\\mathrm{iso}}``.
+``s_{\\mathrm{coll}}``, ``s_{\\mathrm{flank}}``, ``s_{\\mathrm{cross}}`` from **kernel-normalized**
+depthwise convs (oriented cos²/sin² / isotropic LOO-cross).
 ``κ`` is cosine alignment ``(ρ·S)/(‖ρ‖‖S‖)`` for diagnostics / readout.
 The renderer interpolates ρ, θ, κ and applies ``h2m·ρ̄·gate`` (14-D readout, no η_mod).
 
@@ -44,20 +44,21 @@ L1 = SimpleNamespace(
     COL_K_BINS=24,
     COL_SIGMA_D=None,       # default: R/2 inside L1
     COL_SIGMA_T=1.0,
+    COL_SIGMA_ISO=1.5,      # cross-ori pool: short round kernel (default σ_iso/R)
     COL_PASSES=5,
 )
 
-# ── SEED: tile geometry + seed η_z + pass η_p + boost α (HypercolumnSeed) ───
+# ── SEED: tile geometry + seed η_z + pass η_p + learned β weights ───────────
 SEED = SimpleNamespace(
     R_POOL=10,
     STRIDE=7,
     EPS=1e-9,
     ETA_Z=5.0,
     ETA_P=0.08,
-    ALPHA=1.0,
-    # Fixed mix weights in pass drive (not learned).
-    BETA_COLL=0.5,
-    BETA_CURR=0.3,
+    BETA_SEED=1.0,
+    BETA_C=0.5,
+    BETA_F=0.3,
+    BETA_X=0.3,
 )
 
 # ── Render: θ combing + bilinear interp + minimal gate (κ_col, E_col from L1) ─

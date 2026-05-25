@@ -839,59 +839,36 @@ def viz_infer_l0_pinwheel(
 
 
 def viz_infer_gaba_geometry(
-    sk_max: np.ndarray,
-    sbar: np.ndarray,
-    sdelta: np.ndarray,
+    scoll_max: np.ndarray,
+    sflank_max: np.ndarray,
+    scross_max: np.ndarray,
     is_border: np.ndarray,
     out_path: str,
     *,
     n_collinear_passes: int | None = None,
-    beta_coll: float | None = None,
-    beta_curr: float | None = None,
 ) -> None:
-    r"""First-pass collinear geometry: normalized ``s_coll``, ``s_surr``, and contextual delta."""
-    from params import SEED
-
-    bc = float(SEED.BETA_COLL if beta_coll is None else beta_coll)
-    bs = float(SEED.BETA_CURR if beta_curr is None else beta_curr)
+    r"""First-pass pool geometry: ``s_coll``, ``s_flank``, ``s_cross`` (max over bins)."""
+    del n_collinear_passes
     ib = np.asarray(is_border, dtype=bool)
-    sk_a = np.asarray(sk_max, dtype=np.float64)
-    sb_a = np.asarray(sbar, dtype=np.float64)
-    sd_a = np.asarray(sdelta, dtype=np.float64)
-    if ib.ndim == 1 and sk_a.ndim == 2:
-        ib = ib.reshape(sk_a.shape)
+    sc_a = np.asarray(scoll_max, dtype=np.float64)
+    sf_a = np.asarray(sflank_max, dtype=np.float64)
+    sx_a = np.asarray(scross_max, dtype=np.float64)
+    if ib.ndim == 1 and sc_a.ndim == 2:
+        ib = ib.reshape(sc_a.shape)
     ib = np.asarray(ib, dtype=bool)
-    sk = apply_border_zero(sk_a, ib)
-    sb = apply_border_zero(sb_a, ib)
-    sd = apply_border_zero(sd_a, ib)
+    sc = apply_border_zero(sc_a, ib)
+    sf = apply_border_zero(sf_a, ib)
+    sx = apply_border_zero(sx_a, ib)
     interior = ~ib
 
-    pass_note = (
-        f" (first of {int(n_collinear_passes)} collinear passes)"
-        if n_collinear_passes is not None
-        else " (first collinear pass)"
-    )
-
-    fig = plt.figure(figsize=(12.4, 9.2), facecolor=VIZ.BG)
-    gs = fig.add_gridspec(2, 2, height_ratios=[1.0, 0.92], hspace=0.28, wspace=0.18)
-    ax_sk = fig.add_subplot(gs[0, 0])
-    ax_sb = fig.add_subplot(gs[0, 1])
-    ax_sd = fig.add_subplot(gs[1, :])
-
-    top_panels: list[tuple[Any, np.ndarray, str]] = [
-        (
-            ax_sk,
-            sk,
-            r"$\max_k \hat{s}_{\mathrm{coll},k}^{(0)}$ — kernel-normalized $G_k * \rho_k$",
-        ),
-        (
-            ax_sb,
-            sb,
-            r"$\hat{s}_{\mathrm{surr},k^*}^{(0)}$ at seed-$\rho$ dominant $k^*$ — "
-            r"kernel-normalized annular $(\max(0,H-G_{k^*}) * \bar{Z}_{k^*})$",
-        ),
+    fig = plt.figure(figsize=(12.0, 4.2), facecolor=VIZ.BG)
+    gs = fig.add_gridspec(1, 3, wspace=0.14)
+    panels: list[tuple[Any, np.ndarray, str]] = [
+        (fig.add_subplot(gs[0, 0]), sc, "s_coll"),
+        (fig.add_subplot(gs[0, 1]), sf, "s_flank"),
+        (fig.add_subplot(gs[0, 2]), sx, "s_cross"),
     ]
-    for ax, arr, title in top_panels:
+    for ax, arr, label in panels:
         ax.set_facecolor(VIZ.PANEL_BG)
         vmin, vmax = _interior_vmin_vmax(arr, interior)
         im = ax.imshow(
@@ -902,7 +879,7 @@ def viz_infer_gaba_geometry(
             interpolation="nearest",
         )
         ax.set_title(
-            f"{title}{pass_note}\nmin={vmin:.4g}  max={vmax:.4g}",
+            f"{label}\nmax={vmax:.4g}  min={vmin:.4g}",
             fontsize=9,
             color=VIZ.FG,
             fontfamily="monospace",
@@ -910,37 +887,6 @@ def viz_infer_gaba_geometry(
         ax.axis("off")
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
 
-    ax_sd.set_facecolor(VIZ.PANEL_BG)
-    if interior.any():
-        sd_v = sd[interior]
-        sd_abs = float(max(abs(np.min(sd_v)), abs(np.max(sd_v)), 1e-12))
-        sd_vmin, sd_vmax = -sd_abs, sd_abs
-    else:
-        sd_vmin, sd_vmax = -1.0, 1.0
-    im_sd = ax_sd.imshow(
-        sd,
-        cmap="RdBu_r",
-        vmin=sd_vmin,
-        vmax=sd_vmax,
-        interpolation="nearest",
-    )
-    ax_sd.set_title(
-        rf"$\max_k ({bc:g}\,\hat{{s}}_{{\mathrm{{coll}},k}} "
-        rf"- {bs:g}\,\hat{{s}}_{{\mathrm{{surr}},k}})$"
-        f"{pass_note}\nmin={sd_vmin:.4g}  max={sd_vmax:.4g}",
-        fontsize=9,
-        color=VIZ.FG,
-        fontfamily="monospace",
-    )
-    ax_sd.axis("off")
-    fig.colorbar(im_sd, ax=ax_sd, fraction=0.02, pad=0.02)
-
-    fig.suptitle(
-        "L1 collinear geometry (first pass)" + pass_note,
-        fontsize=10,
-        color=VIZ.FG,
-        fontfamily="monospace",
-    )
     fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
     plt.close(fig)
 
