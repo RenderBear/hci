@@ -126,8 +126,14 @@ def _oriented_gaussian_envelope(
     sigma_t: torch.Tensor,
     theta_k: float,
 ) -> torch.Tensor:
-    """Separable ``\\mathrm{gauss}(r, σ_d, σ_t)`` tangential factor at orientation ``θ_k``."""
-    d_perp = dj * math.cos(theta_k) - di * math.sin(theta_k)
+    """Separable ``\\mathrm{gauss}(r, σ_d, σ_t)``: radial ``w_d`` × narrow Gaussian across the axis.
+
+    Offsets use ``φ = atan2(d_i, d_j)`` (``d_j`` horizontal, ``d_i`` vertical).  The envelope
+    must suppress neighbors **perpendicular** to bin axis ``θ_k``, not along it.  With
+    ``d_\\perp = d_i\\cos\\theta_k + d_j\\sin\\theta_k`` (e.g. ``θ_k=0`` → ``d_\\perp=d_i``,
+    kills above/below, keeps left/right for the collinear strip).
+    """
+    d_perp = di * math.cos(theta_k) + dj * math.sin(theta_k)
     return w_d * torch.exp(-d_perp * d_perp / (2.0 * sigma_t * sigma_t))
 
 
