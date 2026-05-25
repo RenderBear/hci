@@ -838,55 +838,172 @@ def viz_infer_l0_pinwheel(
     viz_l0_pinwheel(h_np, img_pinwheel, out_path)
 
 
+def _pool_grid_pair(
+    first: np.ndarray,
+    last: np.ndarray,
+    is_border: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ib = np.asarray(is_border, dtype=bool)
+    a0 = np.asarray(first, dtype=np.float64)
+    a1 = np.asarray(last, dtype=np.float64)
+    if ib.ndim == 1 and a0.ndim == 2:
+        ib = ib.reshape(a0.shape)
+    ib = np.asarray(ib, dtype=bool)
+    return apply_border_zero(a0, ib), apply_border_zero(a1, ib), ib
+
+
 def viz_infer_gaba_geometry(
-    scoll_max: np.ndarray,
-    sflank_max: np.ndarray,
-    scross_max: np.ndarray,
+    scoll_first: np.ndarray,
+    sflank_first: np.ndarray,
+    scross_first: np.ndarray,
+    scoll_last: np.ndarray,
+    sflank_last: np.ndarray,
+    scross_last: np.ndarray,
     is_border: np.ndarray,
     out_path: str,
     *,
     n_collinear_passes: int | None = None,
 ) -> None:
-    r"""First-pass pool geometry: ``s_coll``, ``s_flank``, ``s_cross`` (max over bins)."""
-    del n_collinear_passes
-    ib = np.asarray(is_border, dtype=bool)
-    sc_a = np.asarray(scoll_max, dtype=np.float64)
-    sf_a = np.asarray(sflank_max, dtype=np.float64)
-    sx_a = np.asarray(scross_max, dtype=np.float64)
-    if ib.ndim == 1 and sc_a.ndim == 2:
-        ib = ib.reshape(sc_a.shape)
-    ib = np.asarray(ib, dtype=bool)
-    sc = apply_border_zero(sc_a, ib)
-    sf = apply_border_zero(sf_a, ib)
-    sx = apply_border_zero(sx_a, ib)
+    r"""Pool geometry: ``s_coll``, ``s_flank``, ``s_cross`` at pass ``t=0`` and ``t=T-1``."""
+    sc0, scn, ib = _pool_grid_pair(scoll_first, scoll_last, is_border)
+    sf0, sfn, _ = _pool_grid_pair(sflank_first, sflank_last, is_border)
+    sx0, sxn, _ = _pool_grid_pair(scross_first, scross_last, is_border)
     interior = ~ib
+    t_last = int(n_collinear_passes) - 1 if n_collinear_passes is not None else "n"
 
-    fig = plt.figure(figsize=(12.0, 4.2), facecolor=VIZ.BG)
-    gs = fig.add_gridspec(1, 3, wspace=0.14)
-    panels: list[tuple[Any, np.ndarray, str]] = [
-        (fig.add_subplot(gs[0, 0]), sc, "s_coll"),
-        (fig.add_subplot(gs[0, 1]), sf, "s_flank"),
-        (fig.add_subplot(gs[0, 2]), sx, "s_cross"),
+    fig = plt.figure(figsize=(8.4, 10.8), facecolor=VIZ.BG)
+    gs = fig.add_gridspec(3, 2, hspace=0.22, wspace=0.12)
+    rows: list[tuple[np.ndarray, np.ndarray, str]] = [
+        (sc0, scn, "s_coll"),
+        (sf0, sfn, "s_flank"),
+        (sx0, sxn, "s_cross"),
     ]
-    for ax, arr, label in panels:
-        ax.set_facecolor(VIZ.PANEL_BG)
-        vmin, vmax = _interior_vmin_vmax(arr, interior)
-        im = ax.imshow(
+    for row, (arr0, arrn, label) in enumerate(rows):
+        for col, (arr, ttag) in enumerate(((arr0, "t=0"), (arrn, f"t={t_last}"))):
+            ax = fig.add_subplot(gs[row, col])
+            ax.set_facecolor(VIZ.PANEL_BG)
+            vmin, vmax = _interior_vmin_vmax(arr, interior)
+            im = ax.imshow(
+                arr,
+                cmap="magma",
+                vmin=vmin,
+                vmax=vmax,
+                interpolation="nearest",
+            )
+            ax.set_title(
+                f"{label} {ttag}\nmax={vmax:.4g}  min={vmin:.4g}",
+                fontsize=9,
+                color=VIZ.FG,
+                fontfamily="monospace",
+            )
+            ax.axis("off")
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+
+    fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
+    plt.close(fig)
+
+
+def viz_infer_gaba_geometry_diff(
+    scoll_first: np.ndarray,
+    sflank_first: np.ndarray,
+    scross_first: np.ndarray,
+    scoll_last: np.ndarray,
+    sflank_last: np.ndarray,
+    scross_last: np.ndarray,
+    is_border: np.ndarray,
+    out_path: str,
+    *,
+    n_collinear_passes: int | None = None,
+    ratio_eps: float = 0.05,
+    n_bins: int = 48,
+) -> None:
+    r"""Ratio of **kernel-normalized** pools ``(ŝ_num + ε)/(ŝ_den + ε)`` with histograms."""
+    sc0, scn, ib = _pool_grid_pair(scoll_first, scoll_last, is_border)
+    sf0, sfn, _ = _pool_grid_pair(sflank_first, sflank_last, is_border)
+    sx0, sxn, _ = _pool_grid_pair(scross_first, scross_last, is_border)
+    interior = ~ib
+    t_last = int(n_collinear_passes) - 1 if n_collinear_passes is not None else "n"
+    eps = max(float(ratio_eps), float(VIZ.EPS))
+
+    def _norm_ratio(num: np.ndarray, den: np.ndarray) -> np.ndarray:
+        return (num + eps) / (den + eps)
+
+    panels: list[tuple[np.ndarray, str]] = [
+        (_norm_ratio(sc0, sf0), f"ŝ_coll/ŝ_flank t=0"),
+        (_norm_ratio(scn, sfn), f"ŝ_coll/ŝ_flank t={t_last}"),
+        (_norm_ratio(sc0, sx0), f"ŝ_coll/ŝ_cross t=0"),
+        (_norm_ratio(scn, sxn), f"ŝ_coll/ŝ_cross t={t_last}"),
+    ]
+
+    fig = plt.figure(figsize=(11.2, 10.4), facecolor=VIZ.BG)
+    gs = fig.add_gridspec(4, 2, width_ratios=[2.3, 1.0], hspace=0.30, wspace=0.14)
+    for i, (arr, label) in enumerate(panels):
+        ax_map = fig.add_subplot(gs[i, 0])
+        ax_hist = fig.add_subplot(gs[i, 1])
+        ax_map.set_facecolor(VIZ.PANEL_BG)
+        ax_hist.set_facecolor(VIZ.PANEL_BG)
+
+        flat = arr[interior].ravel()
+        if flat.size:
+            lo = float(np.percentile(flat, 2))
+            hi = float(np.percentile(flat, 98))
+            if hi <= lo:
+                lo, hi = float(flat.min()), float(flat.max())
+            if hi <= lo:
+                hi = lo + 1.0
+        else:
+            lo, hi = 0.0, 1.0
+
+        im = ax_map.imshow(
             arr,
             cmap="magma",
-            vmin=vmin,
-            vmax=vmax,
+            vmin=lo,
+            vmax=hi,
             interpolation="nearest",
         )
-        ax.set_title(
-            f"{label}\nmax={vmax:.4g}  min={vmin:.4g}",
+        ax_map.set_title(
+            f"{label}  (ε={eps:g})\n"
+            f"p2={lo:.3g}  p98={hi:.3g}",
             fontsize=9,
             color=VIZ.FG,
             fontfamily="monospace",
         )
-        ax.axis("off")
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+        ax_map.axis("off")
+        fig.colorbar(im, ax=ax_map, fraction=0.046, pad=0.02)
 
+        n_cells = int(flat.size)
+        med = float(np.median(flat)) if n_cells else 0.0
+        if n_cells > 0:
+            ax_hist.hist(
+                flat,
+                bins=n_bins,
+                range=(lo, hi),
+                color=VIZ.ACCENT,
+                edgecolor=VIZ.PANEL_BG,
+                linewidth=0.3,
+            )
+            ax_hist.axvline(med, color=VIZ.FG, linewidth=0.8, linestyle="--", alpha=0.7)
+        ax_hist.set_xlim(lo, hi)
+        ax_hist.set_title(
+            f"interior  n={n_cells}  med={med:.3g}"
+            if n_cells
+            else "interior (empty)",
+            fontsize=8,
+            color=VIZ.FG,
+            fontfamily="monospace",
+        )
+        ax_hist.set_ylabel("count", fontsize=7, color=VIZ.FG)
+        ax_hist.tick_params(colors=VIZ.FG, labelsize=6)
+        for sp in ax_hist.spines.values():
+            sp.set_color("#333")
+
+    fig.suptitle(
+        f"Normalized pool ratios  (ŝ = kernel-normalized conv, ε={eps:g} in num & den)",
+        fontsize=10,
+        color=VIZ.FG,
+        fontfamily="monospace",
+        y=0.995,
+    )
     fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
     plt.close(fig)
 

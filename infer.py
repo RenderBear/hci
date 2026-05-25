@@ -33,6 +33,7 @@ from hci.renderer import (
 from hci.diagnostics_viz import (
     viz_infer_l0_pinwheel,
     viz_infer_gaba_geometry,
+    viz_infer_gaba_geometry_diff,
     viz_infer_kappa_pass0_final_dual_maps,
     viz_infer_rho_map_hist_cdf,
     viz_infer_rho_post_minus_pre_map_hist_cdf,
@@ -187,6 +188,9 @@ def run_l0_l1(
     scoll_max_grid = np.asarray(cells["scoll_max_cell"], dtype=np.float64).copy()
     sflank_max_grid = np.asarray(cells["sflank_max_cell"], dtype=np.float64).copy()
     scross_max_grid = np.asarray(cells["scross_max_cell"], dtype=np.float64).copy()
+    scoll_max_last_grid = np.asarray(cells["scoll_max_last_cell"], dtype=np.float64).copy()
+    sflank_max_last_grid = np.asarray(cells["sflank_max_last_cell"], dtype=np.float64).copy()
+    scross_max_last_grid = np.asarray(cells["scross_max_last_cell"], dtype=np.float64).copy()
     rho_initial_grid = np.asarray(
         cells["rho_initial_cell"], dtype=np.float64,
     ).copy()
@@ -216,6 +220,9 @@ def run_l0_l1(
         "scoll_max_grid": scoll_max_grid,
         "sflank_max_grid": sflank_max_grid,
         "scross_max_grid": scross_max_grid,
+        "scoll_max_last_grid": scoll_max_last_grid,
+        "sflank_max_last_grid": sflank_max_last_grid,
+        "scross_max_last_grid": scross_max_last_grid,
         "rho_initial_grid": rho_initial_grid,
         "kappa_pass0_grid": kappa_pass0_grid,
         "kappa_final_grid": kappa_final_grid,
@@ -427,8 +434,8 @@ def main():
         "--diagnostics",
         action="store_true",
         help="Save additional diagnostics: base, l0_pinwheel, "
-        "geometry.png (first-pass normalized $\\hat{s}_{\\mathrm{coll}}$, $\\hat{s}_{\\mathrm{surr}}$, and "
-        "$\\beta_{\\mathrm{coll}}\\hat{s}_{\\mathrm{coll}}-\\beta_{\\mathrm{curr}}\\hat{s}_{\\mathrm{surr}}$), "
+        "geometry.png (s_coll/s_flank/s_cross at t=0 and t=T-1), "
+        "geometry_diff.png (s_coll/s_flank and s_coll/s_cross ratios), "
         "rho (map+histogram+CDF), L1 pre/post GABA ρ (dual map + hist/CDF), "
         "Δρ map+histogram+CDF (rho_delta.png), "
         "κ first vs final GABA pass at post-dominant bin (kappa.png), "
@@ -523,11 +530,28 @@ def main():
             prep["scoll_max_grid"],
             prep["sflank_max_grid"],
             prep["scross_max_grid"],
+            prep["scoll_max_last_grid"],
+            prep["sflank_max_last_grid"],
+            prep["scross_max_last_grid"],
             is_border,
             p_geom,
             n_collinear_passes=n_gaba_passes,
         )
         saved_files.append(p_geom)
+
+        p_geom_diff = os.path.join(od, f"{stem}_geometry_diff.png")
+        viz_infer_gaba_geometry_diff(
+            prep["scoll_max_grid"],
+            prep["sflank_max_grid"],
+            prep["scross_max_grid"],
+            prep["scoll_max_last_grid"],
+            prep["sflank_max_last_grid"],
+            prep["scross_max_last_grid"],
+            is_border,
+            p_geom_diff,
+            n_collinear_passes=n_gaba_passes,
+        )
+        saved_files.append(p_geom_diff)
 
         p_rho = os.path.join(od, f"{stem}_rho.png")
         viz_infer_rho_map_hist_cdf(rho_post, is_border, p_rho, eta_z=eta_z)

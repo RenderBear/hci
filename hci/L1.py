@@ -417,6 +417,9 @@ def gaba_recurrence(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
 ]:
     """Seed NR on raw ``μ``, then contextual pass NR.
 
@@ -431,7 +434,8 @@ def gaba_recurrence(
 
     Returns:
         rho_k_out, kappa_k, kappa_k_pass0, rho_k_seed_snap,
-        s_coll_first, s_flank_first, s_cross_first (pass-0 normalized pools).
+        s_coll_first, s_flank_first, s_cross_first,
+        s_coll_last, s_flank_last, s_cross_last (pass-0 / pass-(T-1) normalized pools).
     """
     device = rho_k_raw.device
     dtype = rho_k_raw.dtype
@@ -467,6 +471,9 @@ def gaba_recurrence(
     s_coll_first: torch.Tensor | None = None
     s_flank_first: torch.Tensor | None = None
     s_cross_first: torch.Tensor | None = None
+    s_coll_last: torch.Tensor | None = None
+    s_flank_last: torch.Tensor | None = None
+    s_cross_last: torch.Tensor | None = None
 
     eta_p_t = torch.as_tensor(eta_p, device=device, dtype=dtype)
     b_seed = torch.as_tensor(beta_seed, device=device, dtype=dtype).view(())
@@ -504,6 +511,10 @@ def gaba_recurrence(
             s_coll_first = s_coll.detach().clone()
             s_flank_first = s_flank.detach().clone()
             s_cross_first = s_cross.detach().clone()
+        if t == n_passes - 1:
+            s_coll_last = s_coll.detach().clone()
+            s_flank_last = s_flank.detach().clone()
+            s_cross_last = s_cross.detach().clone()
 
         drive = b_seed * rho_seed + b_c * s_coll - b_f * s_flank
         drive = drive.clamp_min(0.0)
@@ -528,10 +539,15 @@ def gaba_recurrence(
         s_coll_first = torch.zeros(zshape, device=device, dtype=dtype)
         s_flank_first = torch.zeros_like(s_coll_first)
         s_cross_first = torch.zeros_like(s_coll_first)
+    if s_coll_last is None:
+        s_coll_last = s_coll_first
+        s_flank_last = s_flank_first
+        s_cross_last = s_cross_first
 
     return (
         rho_k_out, kappa_k_out, kappa_k_pass0, rho_k_seed_snap,
         s_coll_first, s_flank_first, s_cross_first,
+        s_coll_last, s_flank_last, s_cross_last,
     )
 
 
@@ -797,8 +813,11 @@ def run_l1_hypercolumn(
         print(f"  raw ρ_k max (interior): mean={rho_max_raw.mean():.4f} "
               f"max={rho_max_raw.max():.4f}")
 
-    rho_k_gaba, kappa_k, kappa_k_pass0, rho_k_initial, s_coll_first, s_flank_first, s_cross_first = (
-        gaba_recurrence(
+    (
+        rho_k_gaba, kappa_k, kappa_k_pass0, rho_k_initial,
+        s_coll_first, s_flank_first, s_cross_first,
+        s_coll_last, s_flank_last, s_cross_last,
+    ) = gaba_recurrence(
             rho_k_raw, nH, nW, hc["is_border"], K,
             R=R_int, sigma_d=sigma_d_t, sigma_t=sigma_t_t, sigma_iso=sigma_iso_t,
             n_passes=n_passes,
@@ -812,10 +831,12 @@ def run_l1_hypercolumn(
             eps=eps,
             eta_update_fn=None,
         )
-    )
     scoll_max_hw = s_coll_first.squeeze(0).max(dim=0).values
     sflank_max_hw = s_flank_first.squeeze(0).max(dim=0).values
     scross_max_hw = s_cross_first.squeeze(0).max(dim=0).values
+    scoll_max_last_hw = s_coll_last.squeeze(0).max(dim=0).values
+    sflank_max_last_hw = s_flank_last.squeeze(0).max(dim=0).values
+    scross_max_last_hw = s_cross_last.squeeze(0).max(dim=0).values
 
     if verbose:
         interior = ~hc["is_border"]
@@ -884,6 +905,9 @@ def run_l1_hypercolumn(
             "scoll_max_cell": scoll_max_hw,
             "sflank_max_cell": sflank_max_hw,
             "scross_max_cell": scross_max_hw,
+            "scoll_max_last_cell": scoll_max_last_hw,
+            "sflank_max_last_cell": sflank_max_last_hw,
+            "scross_max_last_cell": scross_max_last_hw,
         }
         return cells
 
@@ -927,6 +951,9 @@ def run_l1_hypercolumn(
         "scoll_max_cell": scoll_max_hw.detach().cpu().numpy(),
         "sflank_max_cell": sflank_max_hw.detach().cpu().numpy(),
         "scross_max_cell": scross_max_hw.detach().cpu().numpy(),
+        "scoll_max_last_cell": scoll_max_last_hw.detach().cpu().numpy(),
+        "sflank_max_last_cell": sflank_max_last_hw.detach().cpu().numpy(),
+        "scross_max_last_cell": scross_max_last_hw.detach().cpu().numpy(),
     }
     return cells
 
