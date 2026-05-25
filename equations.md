@@ -126,13 +126,19 @@ $$
 \hat s_k^{(t)}(c) = \frac{(G_k * \rho_k^{(t)})(c)}{(G_k * \mathbf{1})(c) + \varepsilon}.
 $$
 
-Implementation: `_norm_conv` in `hci/L1.py`. Pools $\hat s_{\mathrm{coll},k}$, $\hat s_{\mathrm{flank},k}$ convolve $\rho_k^{(t)}$ with $G^{\mathrm{coll}}_k$, $G^{\mathrm{flank}}_k$. **Cross pool** uses leave-one-out mean across bins,
+Implementation: `_norm_conv` in `hci/L1.py`. Pools $\hat s_{\mathrm{coll},k}$, $\hat s_{\mathrm{flank},k}$ convolve $\rho_k^{(t)}$ with $G^{\mathrm{coll}}_k$, $G^{\mathrm{flank}}_k$. **Cross pool** mixes other bins with orientation distance weights before spatial pooling:
 
 $$
-\bar Z_k^{(t)}(c) = \frac{1}{\max(K-1,\,1)}\sum_{j\neq k} \rho_j^{(t)}(c),
+w_{k,j} = \frac{\sin^2\!\bigl(\pi(k-j)/K\bigr)}{\sum_{j'\neq k}\sin^2\!\bigl(\pi(k-j')/K\bigr)}, \quad j\neq k; \qquad w_{k,k}=0,
 $$
 
-then $\hat s_{\mathrm{cross},k}^{(t)}(c) = \mathrm{norm\_conv}(\bar Z_k^{(t)}, G^{\mathrm{cross}})$.
+$$
+\tilde\rho_k^{(t)}(c) = \sum_{j=0}^{K-1} w_{k,j}\,\rho_j^{(t)}(c),
+\qquad
+\hat s_{\mathrm{cross},k}^{(t)}(c) = \mathrm{norm\_conv}(\tilde\rho_k^{(t)}, G^{\mathrm{cross}}).
+$$
+
+Neighboring bins ($\approx 7.5°$ at $K=24$) get weight $\sin^2(\pi/K)\approx 0.017$; orthogonal bins ($90°$) get weight $1.0$.
 
 ### Pass update ($t = 0,\ldots,T-1$, `L1.COL_PASSES`)
 

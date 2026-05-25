@@ -5,7 +5,7 @@ then **pass NR** steps: ``drive = β_seed·ρ_seed + β_c·s_coll``,
 ``ρ ← drive²/(drive²+η_p²+β_f·s_flank²+β_x·s_cross²+ε)`` with learned
 ``η_z``, ``η_p``, ``β_{\\mathrm{seed}}``, ``β_c``, ``β_f``, ``β_x``, ``σ_d``, ``σ_t``, ``σ_{\\mathrm{iso}}``.
 ``s_{\\mathrm{coll}}``, ``s_{\\mathrm{flank}}``, ``s_{\\mathrm{cross}}`` from **kernel-normalized**
-depthwise convs (oriented cos²/sin² / isotropic LOO-cross).
+depthwise convs (oriented cos²/sin² / sin²-weighted cross mix × isotropic).
 ``κ`` is cosine alignment ``(ρ·S)/(‖ρ‖‖S‖)`` for diagnostics / readout.
 The renderer interpolates ρ, θ, κ and applies ``h2m·ρ̄·gate`` (14-D readout, no η_mod).
 
@@ -54,11 +54,11 @@ SEED = SimpleNamespace(
     STRIDE=7,
     EPS=1e-9,
     ETA_Z=5.0,
-    ETA_P=0.08,
+    ETA_P=0.05,
     BETA_SEED=1.0,
-    BETA_C=0.5,
-    BETA_F=0.3,
-    BETA_X=0.3,
+    BETA_C=1.0,
+    BETA_F=0.5,
+    BETA_X=0.5,
 )
 
 # ── Render: θ combing + bilinear interp + minimal gate (κ_col, E_col from L1) ─

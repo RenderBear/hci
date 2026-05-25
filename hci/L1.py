@@ -12,7 +12,7 @@ Pipeline:
   4. ``T`` **pass NR** steps on ``ρ^{(t)}`` (starts from ``ρ^{(0)}=ρ^{\\mathrm{seed}}``):
      kernel-normalized collinear / flank / cross pools
      (``G_k = \\mathrm{gauss}(r,σ_d,σ_t)\\cos^2(\\phi-\\theta_k)``,
-     ``\\mathrm{gauss}(r,σ_d,σ_t)\\sin^2(\\phi-\\theta_k)``, LOO × ``\\mathrm{gauss}(r,σ_{\\mathrm{iso}})``);
+     ``\\mathrm{gauss}(r,σ_d,σ_t)\\sin^2(\\phi-\\theta_k)``, sin²-weighted cross mix × ``\\mathrm{gauss}(r,σ_{\\mathrm{iso}})``);
      ``\\mathrm{drive} = β_{\\mathrm{seed}} ρ^{\\mathrm{seed}} + β_c s_{\\mathrm{coll}}``;
      ``ρ^{(t+1)} = \\mathrm{drive}^2/(\\mathrm{drive}^2 + η_p^2 + β_f s_{\\mathrm{flank}}^2 + β_x s_{\\mathrm{cross}}^2 + ε)``.
   5. Extract dominant ``ρ``, ``θ``, and diagnostic ``κ`` for the renderer / readout.
@@ -188,6 +188,21 @@ def _build_isotropic_kernel(
     """Single-channel kernel ``(1,1,2R+1,2R+1)``: ``\\mathrm{gauss}(r, σ_{\\mathrm{iso}})`` × disk."""
     w_d, _, _ = _radial_gaussian_disk(R, sigma_iso, device, dtype)
     return w_d.unsqueeze(0).unsqueeze(0)
+
+
+def _build_cross_orientation_weights(
+    K: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Row-normalized ``(K, K)`` mix: ``w_{k,j} \\propto \\sin^2(\\pi(k-j)/K)``, diagonal zero."""
+    k_i = int(K)
+    bin_idx = torch.arange(k_i, device=device, dtype=dtype)
+    diff = math.pi * (bin_idx.unsqueeze(0) - bin_idx.unsqueeze(1)) / k_i
+    cross_weights = torch.sin(diff).pow(2)
+    cross_weights.fill_diagonal_(0.0)
+    row_sum = cross_weights.sum(dim=1, keepdim=True).clamp_min(1e-6)
+    return cross_weights / row_sum
 
 
 def _norm_conv(
@@ -442,6 +457,7 @@ def gaba_recurrence(
     flank_kernels = _build_flank_kernels(R, K, sigma_d, sigma_t, device, dtype)
     iso_kernel = _build_isotropic_kernel(R, sigma_iso, device, dtype)
     cross_kernels = iso_kernel.expand(K, -1, -1, -1)
+    cross_weights = _build_cross_orientation_weights(K, device, dtype)
 
     ib_grid = is_border.reshape(nH, nW)
     border_mask_4d = ib_grid.unsqueeze(0).unsqueeze(0)  # (1,1,nH,nW)
@@ -482,7 +498,6 @@ def gaba_recurrence(
     eta_p_sq = eta_p_t * eta_p_t
     ep = torch.as_tensor(nr_eps, device=device, dtype=dtype)
     k_i = int(K)
-    den_other = float(max(k_i - 1, 1))
 
     for t in range(n_passes):
         if eta_update_fn is not None:
@@ -501,9 +516,10 @@ def gaba_recurrence(
         s_coll = _norm_conv(rho_grid, coll_kernels, R, K)
         s_flank = _norm_conv(rho_grid, flank_kernels, R, K)
 
-        rho_total = rho_grid.sum(dim=1, keepdim=True)
-        rho_other_mean = (rho_total - rho_grid) / den_other
-        s_cross = _norm_conv(rho_other_mean, cross_kernels, R, K)
+        rho_k = rho_grid.squeeze(0)
+        rho_cross = torch.mm(cross_weights, rho_k.reshape(k_i, -1))
+        rho_cross = rho_cross.reshape(k_i, nH, nW).unsqueeze(0)
+        s_cross = _norm_conv(rho_cross, cross_kernels, R, K)
 
         kap_t = _cosine_kappa_grid(rho_grid, s_coll_raw, eps)
         if t == 0:
