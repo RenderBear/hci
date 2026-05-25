@@ -10,7 +10,7 @@ precomputed ``cells_flat``.
 still be reused across bumps when ``L0.L0_DIST_CACHE_VERSION`` and the stored
 geometry signature match.
 
-Loss combines soft-Dice and per-pixel BCE on the η± valid band.
+Loss combines soft-Dice and class-balanced per-pixel BCE on the η± valid band.
 """
 
 from __future__ import annotations
@@ -594,9 +594,11 @@ def bce_loss_with_ignore(
     eta_neg: float = 0.5,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Mean BCE on non-ignored pixels (same η± edge band as soft Dice).
+    """Class-balanced mean BCE on non-ignored pixels (same η± edge band as soft Dice).
 
     Valid = (target≥η_pos) ∨ (target<η_neg); label y = 1 on positives, 0 on negatives.
+    Positives are weighted by ``n_neg / n_pos`` so edge and non-edge pixels contribute
+    equal total loss mass (BSDS is ~5–10% edges).
     """
     pred = pred.nan_to_num(0.0).clamp(eps, 1.0 - eps)
     pos_mask = target >= eta_pos
@@ -607,7 +609,13 @@ def bce_loss_with_ignore(
     y = pos_mask.float()
     v = valid.float()
     bce = F.binary_cross_entropy(pred, y, reduction="none")
-    return (bce * v).sum() / v.sum().clamp_min(eps)
+    n_pos = (v * y).sum()
+    n_neg = (v * (1.0 - y)).sum()
+    if n_pos < eps or n_neg < eps:
+        weight = v
+    else:
+        weight = v * (y * (n_neg / (n_pos + eps)) + (1.0 - y))
+    return (bce * weight).sum() / weight.sum().clamp_min(eps)
 
 
 def remap_checkpoint_state_dict(sd: dict) -> dict:
@@ -1004,7 +1012,7 @@ def main():
         f"(L1 collinear pass NR: R={L1.COL_RADIUS}, K={L1.COL_K_BINS}, passes={L1.COL_PASSES})"
     )
     print(
-        f"Loss: λ_dice·soft-Dice + λ_bce·BCE (η± edge band)  "
+        f"Loss: λ_dice·soft-Dice + λ_bce·balanced BCE (η± edge band)  "
         f"λ_dice={args.lam_dice:g}  λ_bce={args.lam_bce:g}"
     )
     if args.lam_dice == 0.0 and args.lam_bce == 0.0:

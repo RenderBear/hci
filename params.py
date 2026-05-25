@@ -55,8 +55,8 @@ SEED = SimpleNamespace(
     EPS=1e-9,
     ETA_Z=5.0,
     ETA_P=0.05,
-    BETA_SEED=1.0,
-    BETA_C=1.0,
+    BETA_SEED=0.5,
+    BETA_C=0.5,
     BETA_F=0.5,
     BETA_X=0.5,
 )
