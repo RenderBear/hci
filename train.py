@@ -902,7 +902,7 @@ def _format_seed_block(model: HarmonicContourE2E) -> str:
         "\n--- L1 seed (NR) ---\n",
         *[ln + "\n" for ln in format_seed_param_lines(s, indent="")],
         "\nρ: raw → η_z seed NR (μ→[0,1]) → pass NR: "
-        "drive=β_seed·ρ_seed+β_c·s_coll; "
+        "drive=ρ_seed·(β_seed+β_c·s_coll); "
         "ρ←drive²/(drive²+η_p²+β_f·s_flank²+β_x·s_cross²+ε)  "
         "(η_z, η_p, β_*, σ_d/σ_t/σ_iso learned; pools kernel-normalized) → dominant ρ × tile_interior\n",
     ]

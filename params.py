@@ -1,7 +1,7 @@
 r"""Shared pipeline hyperparameters, module inits, and script defaults.
 
 L1 builds cos² hypercolumns → **seed NR** (learned ``η_z``) compresses raw ``μ`` to ``[0,1]``,
-then **pass NR** steps: ``drive = β_seed·ρ_seed + β_c·s_coll``,
+then **pass NR** steps: ``drive = ρ_seed·(β_seed + β_c·s_coll)``,
 ``ρ ← drive²/(drive²+η_p²+β_f·s_flank²+β_x·s_cross²+ε)`` with learned
 ``η_z``, ``η_p``, ``β_{\\mathrm{seed}}``, ``β_c``, ``β_f``, ``β_x``, ``σ_d``, ``σ_t``, ``σ_{\\mathrm{iso}}``.
 ``s_{\\mathrm{coll}}``, ``s_{\\mathrm{flank}}``, ``s_{\\mathrm{cross}}`` from **kernel-normalized**

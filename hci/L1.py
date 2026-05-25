@@ -13,7 +13,7 @@ Pipeline:
      kernel-normalized collinear / flank / cross pools
      (``G_k = \\mathrm{gauss}(r,σ_d,σ_t)\\cos^2(\\phi-\\theta_k)``,
      ``\\mathrm{gauss}(r,σ_d,σ_t)\\sin^2(\\phi-\\theta_k)``, sin²-weighted cross mix × ``\\mathrm{gauss}(r,σ_{\\mathrm{iso}})``);
-     ``\\mathrm{drive} = β_{\\mathrm{seed}} ρ^{\\mathrm{seed}} + β_c s_{\\mathrm{coll}}``;
+     ``\\mathrm{drive} = ρ^{\\mathrm{seed}}(β_{\\mathrm{seed}} + β_c s_{\\mathrm{coll}})``;
      ``ρ^{(t+1)} = \\mathrm{drive}^2/(\\mathrm{drive}^2 + η_p^2 + β_f s_{\\mathrm{flank}}^2 + β_x s_{\\mathrm{cross}}^2 + ε)``.
   5. Extract dominant ``ρ``, ``θ``, and diagnostic ``κ`` for the renderer / readout.
 
@@ -442,7 +442,8 @@ def gaba_recurrence(
     ``ρ^{\\mathrm{seed}}`` is fixed for all passes.
 
     **Passes:** kernel-normalized collinear / flank / cross pools;
-    ``\\mathrm{drive} = β_{\\mathrm{seed}} ρ^{\\mathrm{seed}} + β_c s_{\\mathrm{coll}}``;
+    ``\\mathrm{drive} = ρ^{\\mathrm{seed}}(β_{\\mathrm{seed}} + β_c s_{\\mathrm{coll}})``;
+    collinear facilitation is gated by the receiving cell's ``ρ^{\\mathrm{seed}}``;
     ``ρ^{(t+1)} = \\mathrm{drive}^2/(\\mathrm{drive}^2 + η_p^2 + β_f s_{\\mathrm{flank}}^2
     + β_x s_{\\mathrm{cross}}^2 + ε)``.  Diagnostic ``κ`` uses **raw** collinear conv vs ``ρ``.
 
@@ -531,7 +532,7 @@ def gaba_recurrence(
             s_flank_last = s_flank.detach().clone()
             s_cross_last = s_cross.detach().clone()
 
-        drive = b_seed * rho_seed + b_c * s_coll
+        drive = rho_seed * (b_seed + b_c * s_coll)
         drive = torch.where(border_mask_4d.expand_as(drive), torch.zeros_like(drive), drive)
         drive_sq = drive * drive
         denom = drive_sq + eta_p_sq + b_f * s_flank * s_flank + b_x * s_cross * s_cross + ep

@@ -7,7 +7,7 @@ This file records the **notation and equations implemented in this repository**:
 ## 1. End-to-end pipeline
 
 1. **L0** — RGB → directional differences $d_k^{\mathrm{lum}}, d_k^{\mathrm{chr}}$ (optionally **cached** across training steps when geometry and `L0.L0_DIST_CACHE_VERSION` match). Naka–Rushton with **fixed** scalars $\eta_0^{\mathrm{lum}}, \eta_0^{\mathrm{chr}}$ (`L0.ETA_LUM`, `L0.ETA_CHR`) and gain $\gamma$ (`L0.GAMMA`). Outputs include pixel $h_{2m}$, split $h_{2m}^{\mathrm{lum}}, h_{2m}^{\mathrm{chr}}$, and orientation $\theta_h = \tfrac12 \arg z_2$.
-2. **L1** — $\cos^2$ hypercolumns on $h_{2m}$; **seed NR** with learned $\eta_z$ maps raw $\boldsymbol{\mu}$ to $\boldsymbol{\rho}^{\mathrm{seed}}\in[0,1]^K$; then $T$ **pass NR** steps with kernel-normalized collinear / flank / cross pools, excitatory drive $\beta_{\mathrm{seed}}\boldsymbol{\rho}^{\mathrm{seed}}+\beta_c\mathbf{s}_{\mathrm{coll}}$, and divisive update $\boldsymbol{\rho}\leftarrow \mathrm{drive}^2/(\mathrm{drive}^2+\eta_p^2+\beta_f\mathbf{s}_{\mathrm{flank}}^2+\beta_x\mathbf{s}_{\mathrm{cross}}^2+\varepsilon)$ with learned scalars $\eta_z,\eta_p,\beta_{\cdot}$ and kernel scales $\sigma_d,\sigma_t,\sigma_{\mathrm{iso}}$. Diagnostic $\kappa$ (cosine alignment of $\boldsymbol{\rho}$ vs raw collinear conv) is **not** multiplied into $\rho$; the renderer reads $\bar\kappa_{\mathrm{col}}$ from the dominant bin.
+2. **L1** — $\cos^2$ hypercolumns on $h_{2m}$; **seed NR** with learned $\eta_z$ maps raw $\boldsymbol{\mu}$ to $\boldsymbol{\rho}^{\mathrm{seed}}\in[0,1]^K$; then $T$ **pass NR** steps with kernel-normalized collinear / flank / cross pools, seed-gated excitatory drive $\rho^{\mathrm{seed}}(\beta_{\mathrm{seed}}+\beta_c\mathbf{s}_{\mathrm{coll}})$, and divisive update $\boldsymbol{\rho}\leftarrow \mathrm{drive}^2/(\mathrm{drive}^2+\eta_p^2+\beta_f\mathbf{s}_{\mathrm{flank}}^2+\beta_x\mathbf{s}_{\mathrm{cross}}^2+\varepsilon)$ with learned scalars $\eta_z,\eta_p,\beta_{\cdot}$ and kernel scales $\sigma_d,\sigma_t,\sigma_{\mathrm{iso}}$. Diagnostic $\kappa$ (cosine alignment of $\boldsymbol{\rho}$ vs raw collinear conv) is **not** multiplied into $\rho$; the renderer reads $\bar\kappa_{\mathrm{col}}$ from the dominant bin.
 3. **Seed module** — `RhoSeedModule` passes dominant $\rho$ from `cells_flat["lam"][...,0]` through to the renderer (no extra recurrent dynamics on the seed tensor).
 4. **Renderer** — θ combing on cells, bilinear interp of $\bar\rho, \bar\theta, \bar\kappa_{\mathrm{col}}$ to pixels, tangential / normal **stencils** on $h_{2m}^{\mathrm{lum}}+h_{2m}^{\mathrm{chr}}$, **14→8→1** thinning MLP gate:
    $$\hat B(p) = \bigl(h_{2m}^{\mathrm{lum}}(p)+h_{2m}^{\mathrm{chr}}(p)\bigr)\,\bar\rho(p)\,\mathrm{gate}(p).$$
@@ -142,13 +142,17 @@ Neighboring bins ($\approx 7.5°$ at $K=24$) get weight $\sin^2(\pi/K)\approx 0.
 
 ### Pass update ($t = 0,\ldots,T-1$, `L1.COL_PASSES`)
 
-**Drive** (purely excitatory — seed + collinear):
+**Drive** (seed-gated excitation — collinear facilitation requires local $\rho^{\mathrm{seed}}$):
 
 $$
 \mathrm{drive}_k^{(t)}(c) =
-\beta_{\mathrm{seed}}\,\rho_k^{\mathrm{seed}}(c)
-+ \beta_c\,\hat s_{\mathrm{coll},k}^{(t)}(c).
+\rho_k^{\mathrm{seed}}(c)\,\Bigl(
+\beta_{\mathrm{seed}}
++ \beta_c\,\hat s_{\mathrm{coll},k}^{(t)}(c)
+\Bigr).
 $$
+
+Where $\rho_k^{\mathrm{seed}}$ is low (no local oriented energy), drive vanishes regardless of neighbor collinear context; where $\rho_k^{\mathrm{seed}}$ is high, collinear pooling adds facilitation as before.
 
 **Divisive NR** (scalar floor $\eta_p$; flank and cross as independent suppressive channels):
 
@@ -243,7 +247,7 @@ $\mathrm{MLP}_{\mathrm{read}}$: **14 → 8 → 1** (ReLU between linear layers).
 | Block | Count | Notes |
 |------:|------:|------|
 | $\tilde\eta_z, \tilde\eta_p$ | 2 | Seed NR + pass NR floor |
-| $\tilde\beta_{\mathrm{seed}}, \tilde\beta_c, \tilde\beta_f, \tilde\beta_x$ | 4 | Drive ($\tilde\beta_{\mathrm{seed}}, \tilde\beta_c$) + NR denom ($\tilde\beta_f, \tilde\beta_x$) |
+| $\tilde\beta_{\mathrm{seed}}, \tilde\beta_c, \tilde\beta_f, \tilde\beta_x$ | 4 | Seed-gated drive ($\tilde\beta_{\mathrm{seed}}, \tilde\beta_c$) + NR denom ($\tilde\beta_f, \tilde\beta_x$) |
 | $\tilde\alpha_d, \tilde\alpha_t, \tilde\alpha_{\mathrm{iso}}$ | 3 | Kernel scales → $\sigma_d,\sigma_t,\sigma_{\mathrm{iso}}$ |
 | $s_t, s_n$ | 2 | Stencil spacing |
 | $\mathrm{MLP}_{\mathrm{read}}$ (14→8→1) | 129 | $14\cdot 8 + 8 + 8 + 1$ |
@@ -269,4 +273,4 @@ Legacy checkpoints may contain `eta_mlp.*`, `seed.hc_seed._alpha_raw`, or `seed.
 
 ## 10. Revision note
 
-This document matches the **three-pool GABA recurrence** in `hci/L1.py`: learned **seed NR** ($\eta_z$), kernel-normalized **collinear / flank / cross** pools, **excitatory drive** ($\beta_{\mathrm{seed}}\rho^{\mathrm{seed}}+\beta_c s_{\mathrm{coll}}$), **divisive flank and cross** in the NR denominator, scalar pass floor $\eta_p$, learned $\sigma_{\mathrm{iso}}$ for cross-orientation inhibition, **14-dimensional** renderer readout, and **no** spatial η-MLP.
+This document matches the **three-pool GABA recurrence** in `hci/L1.py`: learned **seed NR** ($\eta_z$), kernel-normalized **collinear / flank / cross** pools, **seed-gated excitatory drive** ($\rho^{\mathrm{seed}}(\beta_{\mathrm{seed}}+\beta_c s_{\mathrm{coll}})$), **divisive flank and cross** in the NR denominator, scalar pass floor $\eta_p$, learned $\sigma_{\mathrm{iso}}$ for cross-orientation inhibition, **14-dimensional** renderer readout, and **no** spatial η-MLP.
