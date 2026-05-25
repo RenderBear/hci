@@ -841,20 +841,29 @@ def viz_infer_l0_pinwheel(
 def viz_infer_gaba_geometry(
     sk_max: np.ndarray,
     sbar: np.ndarray,
+    sdelta: np.ndarray,
     is_border: np.ndarray,
     out_path: str,
     *,
     n_collinear_passes: int | None = None,
+    beta_coll: float | None = None,
+    beta_curr: float | None = None,
 ) -> None:
-    r"""Single figure: $\max_k \tilde{S}_k$ and per-bin annular surround $\mathcal{I}_k=\max(0,H-G_k)*\bar{Z}_k$, $\bar{Z}_k=\frac{1}{\max(K-1,1)}\sum_{j\neq k}\rho_j$, on pass 0."""
+    r"""First-pass collinear geometry: normalized ``s_coll``, ``s_surr``, and contextual delta."""
+    from params import SEED
+
+    bc = float(SEED.BETA_COLL if beta_coll is None else beta_coll)
+    bs = float(SEED.BETA_CURR if beta_curr is None else beta_curr)
     ib = np.asarray(is_border, dtype=bool)
     sk_a = np.asarray(sk_max, dtype=np.float64)
     sb_a = np.asarray(sbar, dtype=np.float64)
+    sd_a = np.asarray(sdelta, dtype=np.float64)
     if ib.ndim == 1 and sk_a.ndim == 2:
         ib = ib.reshape(sk_a.shape)
     ib = np.asarray(ib, dtype=bool)
     sk = apply_border_zero(sk_a, ib)
     sb = apply_border_zero(sb_a, ib)
+    sd = apply_border_zero(sd_a, ib)
     interior = ~ib
 
     pass_note = (
@@ -863,14 +872,26 @@ def viz_infer_gaba_geometry(
         else " (first collinear pass)"
     )
 
-    fig, axes = plt.subplots(
-        1, 2, figsize=(12.4, 5.4), facecolor=VIZ.BG,
-    )
-    panels: list[tuple[np.ndarray, str]] = [
-        (sk, r"$\max_k \tilde{S}_k^{(0)}$ — $G_k * \rho_k$ (unnormalized)"),
-        (sb, r"$\mathcal{I}_{k^*}^{(0)}$ at seed-$\rho$ dominant $k^*$ — $(\max(0,H-G_{k^*}) * \bar{Z}_{k^*})^{(0)}$, $\bar{Z}_k=\frac{1}{\max(K-1,1)}\sum_{j\neq k}\rho_j$"),
+    fig = plt.figure(figsize=(12.4, 9.2), facecolor=VIZ.BG)
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.0, 0.92], hspace=0.28, wspace=0.18)
+    ax_sk = fig.add_subplot(gs[0, 0])
+    ax_sb = fig.add_subplot(gs[0, 1])
+    ax_sd = fig.add_subplot(gs[1, :])
+
+    top_panels: list[tuple[Any, np.ndarray, str]] = [
+        (
+            ax_sk,
+            sk,
+            r"$\max_k \hat{s}_{\mathrm{coll},k}^{(0)}$ — kernel-normalized $G_k * \rho_k$",
+        ),
+        (
+            ax_sb,
+            sb,
+            r"$\hat{s}_{\mathrm{surr},k^*}^{(0)}$ at seed-$\rho$ dominant $k^*$ — "
+            r"kernel-normalized annular $(\max(0,H-G_{k^*}) * \bar{Z}_{k^*})$",
+        ),
     ]
-    for ax, (arr, title) in zip(axes, panels):
+    for ax, arr, title in top_panels:
         ax.set_facecolor(VIZ.PANEL_BG)
         vmin, vmax = _interior_vmin_vmax(arr, interior)
         im = ax.imshow(
@@ -889,13 +910,37 @@ def viz_infer_gaba_geometry(
         ax.axis("off")
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
 
+    ax_sd.set_facecolor(VIZ.PANEL_BG)
+    if interior.any():
+        sd_v = sd[interior]
+        sd_abs = float(max(abs(np.min(sd_v)), abs(np.max(sd_v)), 1e-12))
+        sd_vmin, sd_vmax = -sd_abs, sd_abs
+    else:
+        sd_vmin, sd_vmax = -1.0, 1.0
+    im_sd = ax_sd.imshow(
+        sd,
+        cmap="RdBu_r",
+        vmin=sd_vmin,
+        vmax=sd_vmax,
+        interpolation="nearest",
+    )
+    ax_sd.set_title(
+        rf"$\max_k ({bc:g}\,\hat{{s}}_{{\mathrm{{coll}},k}} "
+        rf"- {bs:g}\,\hat{{s}}_{{\mathrm{{surr}},k}})$"
+        f"{pass_note}\nmin={sd_vmin:.4g}  max={sd_vmax:.4g}",
+        fontsize=9,
+        color=VIZ.FG,
+        fontfamily="monospace",
+    )
+    ax_sd.axis("off")
+    fig.colorbar(im_sd, ax=ax_sd, fraction=0.02, pad=0.02)
+
     fig.suptitle(
         "L1 collinear geometry (first pass)" + pass_note,
         fontsize=10,
         color=VIZ.FG,
         fontfamily="monospace",
     )
-    fig.tight_layout(rect=[0, 0.02, 1, 0.92])
     fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
     plt.close(fig)
 

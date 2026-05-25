@@ -186,6 +186,7 @@ def run_l0_l1(
 
     sk_max_grid = np.asarray(cells["sk_max_cell"], dtype=np.float64).copy()
     sbar_grid = np.asarray(cells["sbar_cell"], dtype=np.float64).copy()
+    sdelta_grid = np.asarray(cells["sdelta_cell"], dtype=np.float64).copy()
     rho_initial_grid = np.asarray(
         cells["rho_initial_cell"], dtype=np.float64,
     ).copy()
@@ -214,6 +215,7 @@ def run_l0_l1(
         "nW": nW,
         "sk_max_grid": sk_max_grid,
         "sbar_grid": sbar_grid,
+        "sdelta_grid": sdelta_grid,
         "rho_initial_grid": rho_initial_grid,
         "kappa_pass0_grid": kappa_pass0_grid,
         "kappa_final_grid": kappa_final_grid,
@@ -425,7 +427,8 @@ def main():
         "--diagnostics",
         action="store_true",
         help="Save additional diagnostics: base, l0_pinwheel, "
-        "geometry.png (first-pass $\\max_k \\tilde{S}_k$ and LOO annular surround $\\mathcal{I}_{k^*}=\\max(0,H-G_{k^*})*\\bar{Z}_{k^*}$), "
+        "geometry.png (first-pass normalized $\\hat{s}_{\\mathrm{coll}}$, $\\hat{s}_{\\mathrm{surr}}$, and "
+        "$\\beta_{\\mathrm{coll}}\\hat{s}_{\\mathrm{coll}}-\\beta_{\\mathrm{curr}}\\hat{s}_{\\mathrm{surr}}$), "
         "rho (map+histogram+CDF), L1 pre/post GABA ρ (dual map + hist/CDF), "
         "Δρ map+histogram+CDF (rho_delta.png), "
         "κ first vs final GABA pass at post-dominant bin (kappa.png), "
@@ -519,6 +522,7 @@ def main():
         viz_infer_gaba_geometry(
             prep["sk_max_grid"],
             prep["sbar_grid"],
+            prep["sdelta_grid"],
             is_border,
             p_geom,
             n_collinear_passes=n_gaba_passes,

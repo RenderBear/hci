@@ -1,10 +1,10 @@
 r"""Shared pipeline hyperparameters, module inits, and script defaults.
 
 L1 builds cos² hypercolumns → **seed NR** (learned ``η_z``) compresses raw ``μ`` to ``[0,1]``,
-then **Heeger-style** passes: ``\\mathrm{drive}=β_s ρ^{\\mathrm{seed}}+β_c \\hat S_k``,
-``ρ ← \\mathrm{drive}^2/(\\mathrm{drive}^2+σ^2+β_x \\hat I_k^2+ε)`` with learned semi-saturation ``σ`` (``[0,1]``-scale after seed NR),
-``ε`` a fixed numeric floor. ``\\hat S``, ``\\hat I`` from **kernel-normalized** depthwise convs.
-Learned ``η_z``, ``σ``, ``β_s``, ``β_c``, ``β_x``.
+then **pass NR** steps: ``x = ρ^{\\mathrm{seed}} + α(β_{\\mathrm{coll}} s_{\\mathrm{coll}} - β_{\\mathrm{curr}} s_{\\mathrm{surr}})``,
+``ρ ← x^2/(x^2+η_p^2+ε)`` with learned ``η_p``, ``α`` (fixed ``β_{\\mathrm{coll}}``, ``β_{\\mathrm{curr}}``).
+``s_{\\mathrm{coll}}``, ``s_{\\mathrm{surr}}`` from **kernel-normalized** depthwise convs (annular surround).
+Learned ``η_z``, ``η_p``, ``α``.
 Surround uses LOO mean across bins then **annular** depthwise weights ``\\max(0, H-G_k)`` (radial ``H`` minus collinear ``G_k``).
 ``κ`` is cosine alignment ``(ρ·S)/(‖ρ‖‖S‖)`` for diagnostics / readout.
 The renderer interpolates ρ, θ, κ and applies ``h2m·ρ̄·gate`` (14-D readout, no η_mod).
@@ -45,21 +45,19 @@ L1 = SimpleNamespace(
     COL_SIGMA_D=None,       # default: R/2 inside L1
     COL_SIGMA_T=1.0,
     COL_PASSES=5,
-    # Mean-pool radius for GABA η MLP inputs (kernel 2*r+1 = 21 → r=10).
-    GABA_ETA_POOL_RADIUS=10,
 )
 
-# ── SEED: tile geometry + seed η_z + Heeger σ + β_seed/β_coll/β_cross (HypercolumnSeed) ───
+# ── SEED: tile geometry + seed η_z + pass η_p + boost α (HypercolumnSeed) ───
 SEED = SimpleNamespace(
     R_POOL=10,
     STRIDE=7,
     EPS=1e-9,
     ETA_Z=5.0,
-    BETA_SEED_INIT=1.0,
-    BETA_COLL_INIT=0.5,
-    BETA_CROSS_INIT=0.3,
-    # Learned ``σ`` in Heeger denom ``drive^2/(drive^2+σ^2+β_x·Î^2+ε)`` (post–seed-NR scale).
-    SIGMA_SAT_INIT=0.08,
+    ETA_P=0.08,
+    ALPHA=1.0,
+    # Fixed mix weights in pass drive (not learned).
+    BETA_COLL=0.5,
+    BETA_CURR=0.3,
 )
 
 # ── Render: θ combing + bilinear interp + minimal gate (κ_col, E_col from L1) ─
@@ -78,7 +76,7 @@ TRAIN = SimpleNamespace(
     NUM_WORKERS=2,
     LAM_DICE=0.0,
     LAM_BCE=1.0,
-    CACHE_VERSION=29,
+    CACHE_VERSION=30,
 )
 
 # ── Inference ────────────────────────────────────────────────────────────────

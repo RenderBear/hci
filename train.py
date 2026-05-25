@@ -1,7 +1,7 @@
 r"""train.py — harmonic-contour-integration: L1 hypercolumns + render.
 
 Pipeline per image: L0 (partially cached) → **L1 live in the training step**
-(cos² hypercolumns, seed ``η_z`` NR → Heeger recurrence with learned ``σ``, surround, fixed ``ε``,
+(cos² hypercolumns, seed ``η_z`` NR → pass NR recurrence with learned ``η_p``, ``α``,
 dominant θ/ρ/κ) → **renderer** (interp + thinning MLP).  The disk cache stores L0 inputs for L1
 (``h2m``, ``theta_h``, ``border_mask``) plus ``l0_pix``, GT, geometry — **not**
 precomputed ``cells_flat``.
@@ -33,7 +33,6 @@ from hci.L0 import (
     _compute_d_lum_chroma,
 )
 from hci.L1 import (
-    HEEGER_DENOM_EPS,
     _inv_softplus,
     pad_for_patch_grid,
     run_l1_hypercolumn,
@@ -612,20 +611,31 @@ def bce_loss_with_ignore(
 
 
 def remap_checkpoint_state_dict(sd: dict) -> dict:
-    """Remap legacy dynamics/eta keys; warm-start ``_eta0_raw`` when absent.
+    """Remap legacy dynamics/eta keys; warm-start ``_eta_p_raw`` / ``_alpha_raw`` when absent.
 
     ``seed._eta_rho_raw`` / ``dynamics._eta_rho_raw`` are omitted.  Legacy ``eta_mod_*``,
-    ``eta_mlp.*``, and ``seed.hc_seed._gaba_alpha_raw`` are dropped.
+    ``eta_mlp.*``, Heeger ``_sigma_sat_raw``, and learned ``β_*`` are dropped.
 
     ``η_z``: pass through ``seed.hc_seed._eta_z_raw``; map buffer ``_eta_z_fixed`` or
     orphan ``dynamics._eta_z_raw`` / ``seed._eta_z_raw`` into ``_eta_z_raw`` when needed.
-    Old ``_eta_pass_raw`` seeds ``η₀`` when ``_eta0_raw`` is missing.
+    Old ``_eta_pass_raw`` / ``_eta0_raw`` seeds ``η_p`` when ``_eta_p_raw`` is missing.
+    ``_gaba_alpha_raw`` maps to ``_alpha_raw`` when present.
     """
     skip = frozenset({"seed._eta_rho_raw", "dynamics._eta_rho_raw"})
     out: dict = {}
     legacy_eta_pass_raw: torch.Tensor | None = None
+    legacy_eta0_raw: torch.Tensor | None = None
+    legacy_sigma_sat_raw: torch.Tensor | None = None
+    legacy_gaba_alpha_raw: torch.Tensor | None = None
     legacy_orphan_eta_z_raw: torch.Tensor | None = None
     legacy_eta_z_fixed: torch.Tensor | None = None
+    drop_suffixes = (
+        "seed.hc_seed._beta_seed_raw",
+        "seed.hc_seed._beta_coll_raw",
+        "seed.hc_seed._beta_cross_raw",
+        "seed.hc_seed._sigma_sat_raw",
+        "seed.hc_seed._eta0_raw",
+    )
     for k, v in sd.items():
         if k in skip:
             continue
@@ -633,7 +643,14 @@ def remap_checkpoint_state_dict(sd: dict) -> dict:
             continue
         if k.startswith("eta_mlp."):
             continue
+        if k in drop_suffixes:
+            if k == "seed.hc_seed._sigma_sat_raw":
+                legacy_sigma_sat_raw = v
+            if k == "seed.hc_seed._eta0_raw":
+                legacy_eta0_raw = v
+            continue
         if k == "seed.hc_seed._gaba_alpha_raw":
+            legacy_gaba_alpha_raw = v
             continue
         if k in ("seed.hc_seed._tau_raw", "seed.hc_seed._gain_alpha_raw"):
             continue
@@ -659,18 +676,25 @@ def remap_checkpoint_state_dict(sd: dict) -> dict:
             )
         elif legacy_orphan_eta_z_raw is not None and legacy_orphan_eta_z_raw.numel() >= 1:
             out["seed.hc_seed._eta_z_raw"] = legacy_orphan_eta_z_raw.reshape(-1)[0].clone().float()
-    if "seed.hc_seed._eta0_raw" not in out:
-        if legacy_eta_pass_raw is not None and legacy_eta_pass_raw.numel() >= 1:
-            out["seed.hc_seed._eta0_raw"] = legacy_eta_pass_raw.reshape(-1)[0].clone()
-    # Warm-start β_s when loading checkpoints from before β_seed existed.
-    if "seed.hc_seed._beta_seed_raw" not in out:
-        out["seed.hc_seed._beta_seed_raw"] = torch.tensor(
-            [_inv_softplus(float(SEED.BETA_SEED_INIT))], dtype=torch.float32
-        )
-    if "seed.hc_seed._sigma_sat_raw" not in out:
-        out["seed.hc_seed._sigma_sat_raw"] = torch.tensor(
-            [_inv_softplus(float(SEED.SIGMA_SAT_INIT))], dtype=torch.float32
-        )
+    if "seed.hc_seed._eta_p_raw" not in out:
+        src = legacy_eta_pass_raw
+        if src is None and legacy_eta0_raw is not None:
+            src = legacy_eta0_raw
+        if src is None and legacy_sigma_sat_raw is not None:
+            src = legacy_sigma_sat_raw
+        if src is not None and src.numel() >= 1:
+            out["seed.hc_seed._eta_p_raw"] = src.reshape(-1)[0].clone().float()
+        else:
+            out["seed.hc_seed._eta_p_raw"] = torch.tensor(
+                [_inv_softplus(float(SEED.ETA_P))], dtype=torch.float32
+            )
+    if "seed.hc_seed._alpha_raw" not in out:
+        if legacy_gaba_alpha_raw is not None and legacy_gaba_alpha_raw.numel() >= 1:
+            out["seed.hc_seed._alpha_raw"] = legacy_gaba_alpha_raw.reshape(-1)[0].clone().float()
+        else:
+            out["seed.hc_seed._alpha_raw"] = torch.tensor(
+                [_inv_softplus(float(SEED.ALPHA))], dtype=torch.float32
+            )
     return out
 
 
@@ -710,14 +734,14 @@ def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
     print("\n  learned (value):")
     print(
         f"    η_z={float(s.hc_seed.eta_z.detach()):.4f}  "
-        f"σ={float(s.hc_seed.sigma_sat.detach()):.4f}  "
-        f"β_s={float(s.hc_seed.beta_seed.detach()):.4f}",
+        f"η_p={float(s.hc_seed.eta_p.detach()):.4f}  "
+        f"α={float(s.hc_seed.alpha.detach()):.4f}",
     )
     print("\n  |grad| on raw params:")
     for raw, label in (
         ("_eta_z_raw", "η_z"),
-        ("_sigma_sat_raw", "σ_Heeger"),
-        ("_beta_seed_raw", "β_seed"),
+        ("_eta_p_raw", "η_p"),
+        ("_alpha_raw", "α"),
     ):
         t = getattr(s.hc_seed, raw, None)
         if t is None or t.grad is None:
@@ -738,8 +762,6 @@ def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
     for raw, label in (
         ("_alpha_d_raw", "α_d"),
         ("_alpha_t_raw", "α_t"),
-        ("_beta_coll_raw", "β_coll"),
-        ("_beta_cross_raw", "β_cross"),
     ):
         t = getattr(s.hc_seed, raw, None)
         if t is None or t.grad is None:
@@ -802,15 +824,14 @@ def plot_training_curves(history, out_dir):
 
 
 def format_seed_param_lines(seed: RhoSeedModule, *, indent: str = "  ") -> list[str]:
-    """Learned seed NR + Heeger divisive scalars (infer / train logging)."""
+    """Learned seed NR + pass NR scalars (infer / train logging)."""
     hc = seed.hc_seed
     sig_d, sig_t = hc.collinear_sigmas(float(L1.COL_RADIUS))
     return [
         f"{indent}tile geometry:  R={seed.R}  stride={seed.stride}",
-        f"{indent}seed η_z:  {hc.eta_z.item():.3f}  |  Heeger σ:  {hc.sigma_sat.item():.4f}  "
-        f"ε={HEEGER_DENOM_EPS:g}",
-        f"{indent}β_seed={hc.beta_seed.item():.3f}  β_coll={hc.beta_coll.item():.3f}  "
-        f"β_cross={hc.beta_cross.item():.3f}",
+        f"{indent}seed η_z:  {hc.eta_z.item():.3f}  |  pass η_p:  {hc.eta_p.item():.4f}  "
+        f"|  α:  {hc.alpha.item():.3f}",
+        f"{indent}β_coll={SEED.BETA_COLL:g}  β_curr={SEED.BETA_CURR:g}  (fixed)",
         f"{indent}collinear σ:  σ_d={sig_d.item():.3f}  σ_t={sig_t.item():.3f}  "
         f"(R={L1.COL_RADIUS})",
     ]
@@ -831,10 +852,9 @@ def _format_seed_block(model: HarmonicContourE2E) -> str:
     parts = [
         "\n--- L1 seed (NR) ---\n",
         *[ln + "\n" for ln in format_seed_param_lines(s, indent="")],
-        "\nρ: raw → η_z seed NR (μ→[0,1]) → Heeger passes: "
-        "drive = β_s·ρ_seed + β_c·Ŝ_k ; ρ ← drive²/(drive²+σ²+β_x·Î_k²+ε)  "
-        f"(σ learned, ε={HEEGER_DENOM_EPS:g} fixed; "
-        "Ŝ, Î kernel-normalized convs) → dominant ρ × tile_interior\n",
+        "\nρ: raw → η_z seed NR (μ→[0,1]) → pass NR: "
+        "x = ρ_seed + α(β_coll·s_coll − β_curr·s_surr); ρ ← x²/(x²+η_p²+ε)  "
+        "(η_p, α learned; β_coll, β_curr fixed; s_coll, s_surr kernel-normalized) → dominant ρ × tile_interior\n",
     ]
     return "".join(parts)
 
@@ -934,12 +954,12 @@ def main():
     )
     print(
         f"Seed: R={SEED.R_POOL}  stride={SEED.STRIDE}  "
-        f"ρ = raw → η_z NR → Heeger (drive²/(drive²+σ²+β_x·Î²+ε)) → dominant λ  "
+        f"ρ = raw → η_z NR → pass NR (x²/(x²+η_p²+ε)) → dominant λ  "
         f"× tile_interior"
     )
     print(
         f"Render: harmonic-native h2m·gate  "
-        f"(L1 collinear Heeger: R={L1.COL_RADIUS}, K={L1.COL_K_BINS}, passes={L1.COL_PASSES})"
+        f"(L1 collinear pass NR: R={L1.COL_RADIUS}, K={L1.COL_K_BINS}, passes={L1.COL_PASSES})"
     )
     print(
         f"Loss: λ_dice·soft-Dice + λ_bce·BCE (η± edge band)  "
