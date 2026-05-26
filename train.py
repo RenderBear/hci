@@ -618,6 +618,37 @@ def bce_loss_with_ignore(
     return (bce * weight).sum() / weight.sum().clamp_min(eps)
 
 
+def focal_bce_loss_with_ignore(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    eta_pos: float = 0.5,
+    eta_neg: float = 0.5,
+    gamma: float = 2.0,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """HED β-weighted focal BCE on non-ignored pixels (η± edge band).
+
+    Focal modulation ``(1 - p_t)^γ`` down-weights easy pixels; class balance uses
+    ``β = n_neg / (n_pos + n_neg)`` on positives and ``1 - β`` on negatives.
+    """
+    pred = pred.nan_to_num(0.0).clamp(eps, 1.0 - eps)
+    pos_mask = target >= eta_pos
+    neg_mask = target < eta_neg
+    valid = pos_mask | neg_mask
+    if not valid.any():
+        return pred.sum() * 0.0
+    y = pos_mask.float()
+    v = valid.float()
+    n_pos = (v * y).sum()
+    n_neg = (v * (1.0 - y)).sum()
+    beta = n_neg / (n_pos + n_neg + eps)
+    pt = y * pred + (1.0 - y) * (1.0 - pred)
+    focal_weight = (1.0 - pt).pow(gamma)
+    class_weight = y * beta + (1.0 - y) * (1.0 - beta)
+    bce = F.binary_cross_entropy(pred, y, reduction="none")
+    return (bce * v * focal_weight * class_weight).sum() / v.sum().clamp_min(eps)
+
+
 def remap_checkpoint_state_dict(sd: dict) -> dict:
     """Remap legacy dynamics/eta keys; warm-start new β params when absent.
 
@@ -741,7 +772,16 @@ def remap_checkpoint_state_dict(sd: dict) -> dict:
     return out
 
 
-def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
+def debug_drive_batch(
+    model,
+    meta_list,
+    device,
+    *,
+    lam_dice=1.0,
+    lam_bce=0.0,
+    lam_focal=0.0,
+    focal_gamma=2.0,
+):
     """One training batch: seed/renderer grads sanity check."""
     model.train()
     s = model.seed
@@ -770,6 +810,10 @@ def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
     if lam_bce:
         loss = loss + lam_bce * bce_loss_with_ignore(
             bmap[:Hg, :Wg], meta["gt"][:Hg, :Wg],
+        )
+    if lam_focal:
+        loss = loss + lam_focal * focal_bce_loss_with_ignore(
+            bmap[:Hg, :Wg], meta["gt"][:Hg, :Wg], gamma=focal_gamma,
         )
     loss.backward()
 
@@ -858,6 +902,14 @@ def plot_training_curves(history, out_dir):
             color="#88ffaa",
             lw=1.0,
             label="BCE (mean)",
+        )
+    if history and "loss_focal" in history[0]:
+        axes[0].plot(
+            epochs,
+            [h["loss_focal"] for h in history],
+            color="#ff88ff",
+            lw=1.0,
+            label="focal BCE (mean)",
         )
     axes[0].legend(fontsize=7, facecolor="#111", edgecolor="#333", labelcolor=VIZ.FG)
     axes[0].set_title("train loss", fontsize=9, color=VIZ.FG, fontfamily="monospace")
@@ -984,6 +1036,18 @@ def main():
         help="weight on BCE term (0 disables)",
     )
     ap.add_argument(
+        "--lam_focal",
+        type=float,
+        default=TRAIN.LAM_FOCAL,
+        help="weight on HED β-weighted focal BCE term (0 disables)",
+    )
+    ap.add_argument(
+        "--focal_gamma",
+        type=float,
+        default=TRAIN.FOCAL_GAMMA,
+        help="focal loss γ (modulation exponent; typical 2)",
+    )
+    ap.add_argument(
         "--debug-drive",
         action="store_true",
         help="Run one batch, print drive term stats and param gradients, then exit",
@@ -1012,11 +1076,12 @@ def main():
         f"(L1 collinear pass NR: R={L1.COL_RADIUS}, K={L1.COL_K_BINS}, passes={L1.COL_PASSES})"
     )
     print(
-        f"Loss: λ_dice·soft-Dice + λ_bce·balanced BCE (η± edge band)  "
-        f"λ_dice={args.lam_dice:g}  λ_bce={args.lam_bce:g}"
+        f"Loss: λ_dice·soft-Dice + λ_bce·balanced BCE + λ_focal·focal BCE (η± edge band)  "
+        f"λ_dice={args.lam_dice:g}  λ_bce={args.lam_bce:g}  "
+        f"λ_focal={args.lam_focal:g}  γ={args.focal_gamma:g}"
     )
-    if args.lam_dice == 0.0 and args.lam_bce == 0.0:
-        print("  warning: both lambdas are 0 — loss is identically zero")
+    if args.lam_dice == 0.0 and args.lam_bce == 0.0 and args.lam_focal == 0.0:
+        print("  warning: all loss lambdas are 0 — loss is identically zero")
     print(
         f"L0 (precompute, fixed): η_lum={L0.ETA_LUM}  η_chr={L0.ETA_CHR}  "
         f"γ={L0.GAMMA}  (tune in params.py)"
@@ -1083,6 +1148,8 @@ def main():
             device,
             lam_dice=args.lam_dice,
             lam_bce=args.lam_bce,
+            lam_focal=args.lam_focal,
+            focal_gamma=args.focal_gamma,
         )
         return
 
@@ -1096,6 +1163,7 @@ def main():
         ep_loss = 0.0
         ep_soft_dice = 0.0
         ep_bce = 0.0
+        ep_focal = 0.0
         n_img = 0
         n_batch = 0
         t0 = time.time()
@@ -1116,24 +1184,35 @@ def main():
 
             dice_sum = None
             bce_sum = None
+            focal_sum = None
             for bmap, m in zip(bmaps, meta_list):
                 Hg, Wg = m["Hg"], m["Wg"]
                 bc = bmap[:Hg, :Wg]
                 gc_ = m["gt"][:Hg, :Wg]
                 loss_dice = soft_dice_loss_with_ignore(bc, gc_)
                 loss_bce = bce_loss_with_ignore(bc, gc_)
+                loss_focal = focal_bce_loss_with_ignore(
+                    bc, gc_, gamma=args.focal_gamma,
+                )
                 dice_sum = loss_dice if dice_sum is None else dice_sum + loss_dice
                 bce_sum = loss_bce if bce_sum is None else bce_sum + loss_bce
+                focal_sum = loss_focal if focal_sum is None else focal_sum + loss_focal
             n_bm = len(bmaps)
             mean_dice = dice_sum / n_bm
             mean_bce = bce_sum / n_bm
-            loss = args.lam_dice * mean_dice + args.lam_bce * mean_bce
+            mean_focal = focal_sum / n_bm
+            loss = (
+                args.lam_dice * mean_dice
+                + args.lam_bce * mean_bce
+                + args.lam_focal * mean_focal
+            )
             soft_dice_mean = mean_dice
             bce_mean = mean_bce
+            focal_mean = mean_focal
 
             if not loss.requires_grad:
                 raise RuntimeError(
-                    "loss has no grad_fn — check λ_dice/λ_bce, GT η band, ρ/renderer graph"
+                    "loss has no grad_fn — check λ_dice/λ_bce/λ_focal, GT η band, ρ/renderer graph"
                 )
 
             optimizer.zero_grad()
@@ -1146,6 +1225,7 @@ def main():
             ep_loss += loss.item()
             ep_soft_dice += soft_dice_mean.item()
             ep_bce += bce_mean.item()
+            ep_focal += focal_mean.item()
             n_batch += 1
             loss_item = loss.item()
             while n_img >= next_dbg_img:
@@ -1155,6 +1235,7 @@ def main():
                     f"  batch {n_batch}  loss(run)={ep_loss / n_batch:.4f}"
                     f"  batch_loss={loss_item:.4f}"
                     f"  dice={soft_dice_mean.item():.4f}  bce={bce_mean.item():.4f}"
+                    f"  focal={focal_mean.item():.4f}"
                     f"  {dt_p:.1f}s elapsed",
                     flush=True,
                 )
@@ -1165,12 +1246,14 @@ def main():
         al = ep_loss / max(n_batch, 1)
         al_sdice = ep_soft_dice / max(n_batch, 1)
         al_bce = ep_bce / max(n_batch, 1)
+        al_focal = ep_focal / max(n_batch, 1)
         lr_now = scheduler.get_last_lr()[0]
         dt = time.time() - t0
 
         print(
             f"  epoch {epoch + 1:3d}/{args.epochs}:  "
             f"loss={al:.4f}  dice={al_sdice:.4f}  bce={al_bce:.4f}  "
+            f"focal={al_focal:.4f}  "
             f"lr={lr_now:.2e}  {dt:.1f}s"
         )
         history.append(
@@ -1179,8 +1262,11 @@ def main():
                 "loss": al,
                 "loss_soft_dice": al_sdice,
                 "loss_bce": al_bce,
+                "loss_focal": al_focal,
                 "lam_dice": args.lam_dice,
                 "lam_bce": args.lam_bce,
+                "lam_focal": args.lam_focal,
+                "focal_gamma": args.focal_gamma,
                 "lr": lr_now,
                 "time": dt,
             }
