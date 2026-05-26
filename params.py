@@ -42,8 +42,8 @@ L2 = SimpleNamespace(
     B_ISO_INIT=0.3,
     B_CROSS_INIT=0.3,
     ETA_COLL_INIT=0.3,   # NR half-sat on ρ_coll (raw ~0.5)
-    ETA_ISO_INIT=20.0,    # NR half-sat on lateral ρ² numerator (stable, O(1–20))
-    ETA_CROSS_INIT=100.0,  # NR half-sat on cross-bin ρ² sum (no count norm)
+    ETA_ISO_INIT=0.3,    # NR half-sat on lateral ρ² numerator (stable, O(1–20))
+    ETA_CROSS_INIT=0.3,  # NR half-sat on cross-bin ρ² sum (no count norm)
     ETA_P_INIT=0.1,  # NR floor η_p² in ρ update denominator
 )
 
