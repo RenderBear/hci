@@ -12,7 +12,7 @@ Per-pixel minimum across directions, then independent Naka–Rushton per channel
 
   h_k = h_k^lum + h_k^chr,   z_n = Σ_k h_k e^{inφ_k}  (n ∈ {1,2} via ``compute_harmonics``).
 
-Second-harmonic magnitudes from split fields (renderer):
+Second-harmonic magnitudes from split fields (renderer + L1 photometry):
   h_{2m}^lum = |Σ_k h_k^lum e^{2iφ_k}|,   h_{2m}^chr = |Σ_k h_k^chr e^{2iφ_k}|.
 
 η_lum and η_chr are read from ``params.L0`` at precompute time only; they are not model
@@ -28,9 +28,6 @@ from typing import Union
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from hci.renderer import _interp_cell_to_pixel
 
 EtaArg = Union[float, Callable[[], float]]
 
@@ -134,12 +131,7 @@ def _compute_d_lum_chroma(
     img_rgb: torch.Tensor,
     offsets: list[tuple[int, int]],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Scalar |ΔL| and vector chroma L2 ‖ΔC‖₂ (no /√3 normalization).
-
-    η-independent: training precompute can reuse stored tensors across
-    ``TRAIN.CACHE_VERSION`` bumps when ``params.L0.L0_DIST_CACHE_VERSION`` and
-    geometry match (see ``train._can_reuse_l0_dist_tensors``).
-    """
+    """Scalar |ΔL| and vector chroma L2 ‖ΔC‖₂ (no /√3 normalization)."""
     H, W, _ = img_rgb.shape
     N = len(offsets)
     R = img_rgb[..., 0]
@@ -177,27 +169,16 @@ def _compute_d_lum_chroma(
 
 def _naka_per_direction(
     d: torch.Tensor,
-    eta: float | torch.Tensor,
+    eta: float,
     gamma: float,
     device: torch.device,
 ) -> torch.Tensor:
-    """γ d̃² / (η² + d̃²) with d̃_k = d_k − min_j d_j (per pixel).
-
-    eta can be a scalar or an (H, W) tensor for spatially-varying
-    semi-saturation (pass-2 η modulation).
-    """
+    """γ d̃² / (η² + d̃²) with d̃_k = d_k − min_j d_j (per pixel)."""
     d_t = d - torch.amin(d, dim=-1, keepdim=True)
+    eta_sq = float(eta) * float(eta)
     d_sq = d_t * d_t
     g = torch.tensor(float(gamma), dtype=torch.float32, device=device)
-    # Avoid 0/0 when η→0 and all directional d̃ are 0 (flat region).
-    _den_floor = 1e-8
-    if isinstance(eta, torch.Tensor):
-        # eta is (H, W) → expand to (H, W, 1) for broadcasting with (H, W, N)
-        eta_sq = (eta * eta).unsqueeze(-1).clamp_min(_den_floor)
-    else:
-        eta_sq = max(float(eta) * float(eta), _den_floor)
-    den = eta_sq + d_sq
-    return g * d_sq / den.clamp_min(_den_floor)
+    return g * d_sq / (eta_sq + d_sq)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -261,15 +242,15 @@ def compute_contrast_field_rgb(
 def compute_l0_rgb(
     img_rgb: torch.Tensor,
     *,
-    eta_lum: EtaArg | torch.Tensor,
-    eta_chr: EtaArg | torch.Tensor,
+    eta_lum: EtaArg,
+    eta_chr: EtaArg,
     gamma: float,
     offsets: list[tuple[int, int]],
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
-    float | torch.Tensor,
-    float | torch.Tensor,
+    float,
+    float,
     float,
     torch.Tensor,
     torch.Tensor,
@@ -278,8 +259,6 @@ def compute_l0_rgb(
     torch.Tensor,
 ]:
     """Split-channel L0 on (H,W,3) RGB.
-
-    eta_lum / eta_chr can be scalars (pass 1) or (H, W) tensors (pass 2).
 
     Returns
       h, vld, eta_lum_used, eta_chr_used, gamma_used,
@@ -290,17 +269,9 @@ def compute_l0_rgb(
     img_rgb = img_rgb.float()
     H, W, _ = img_rgb.shape
     device = img_rgb.device
+    eta_l = resolve_eta(eta_lum)
+    eta_c = resolve_eta(eta_chr)
     gamma_used = float(gamma)
-
-    # Resolve eta — scalar or per-pixel tensor
-    if isinstance(eta_lum, torch.Tensor):
-        eta_l = eta_lum.to(device=device, dtype=torch.float32)
-    else:
-        eta_l = resolve_eta(eta_lum)
-    if isinstance(eta_chr, torch.Tensor):
-        eta_c = eta_chr.to(device=device, dtype=torch.float32)
-    else:
-        eta_c = resolve_eta(eta_chr)
 
     vld = compute_valid(H, W, offsets, device)
     d_lum, d_chr = _compute_d_lum_chroma(img_rgb, offsets)
@@ -332,26 +303,6 @@ def compute_harmonics(
     h1m = (s[..., 0] ** 2 + s[..., 1] ** 2).sqrt()
     h2m = (s[..., 2] ** 2 + s[..., 3] ** 2).sqrt()
     return s, h1m, h2m
-
-
-def compute_h2m_safe(
-    h: torch.Tensor,
-    offsets: list[tuple[int, int]],
-    eps: float = 1e-12,
-) -> torch.Tensor:
-    r"""Grad-safe second-harmonic magnitude.
-
-    Same math as ``compute_harmonics`` but floors the squared magnitude
-    before ``sqrt`` so ``d/dx \sqrt{x}`` stays finite at ``x=0`` (flat
-    regions / borders).  Use in paths that carry autograd through η.
-    """
-    H, W = h.shape[:2]
-    N = len(offsets)
-    unit = _make_unit(offsets).to(h.device)
-    fm = _make_F(unit).to(h.device)
-    s = (h.reshape(-1, N) @ fm.T).reshape(H, W, 4)
-    h2m_sq = (s[..., 2] ** 2 + s[..., 3] ** 2).clamp_min(eps)
-    return h2m_sq.sqrt()
 
 
 def compute_seed(
@@ -413,7 +364,7 @@ def run_l0(
         ) = compute_l0_rgb(
             ir, eta_lum=eta_lum, eta_chr=eta_chr, gamma=gamma, offsets=offsets,
         )
-        eta_used_print = float(eta_l) if not isinstance(eta_l, torch.Tensor) else f"map[{eta_l.min():.4f},{eta_l.max():.4f}]"
+        eta_used_print = float(eta_l)
     else:
         contrast_field, vld, eta_u, gamma_used = compute_contrast_field(
             ir, eta_lum, gamma, offsets,
@@ -434,16 +385,14 @@ def run_l0(
     a0[border_mask] = 0.0
     if verbose:
         if ir.ndim == 3 and ir.shape[-1] == 3:
-            el_str = f"{eta_used_print}" if isinstance(eta_used_print, str) else f"{eta_used_print:.4f}"
-            ec_str = (f"map[{eta_c.min():.4f},{eta_c.max():.4f}]"
-                      if isinstance(eta_c, torch.Tensor) else f"{float(eta_c):.4f}")
-            print(f"  η_lum={el_str}  η_chr={ec_str}  γ={gamma_used:.3f}  (split RGB)")
+            print(
+                f"  η_lum={float(eta_l):.4f}  η_chr={float(eta_c):.4f}  "
+                f"γ={gamma_used:.3f}  (split RGB)"
+            )
         else:
-            print(f"  η={eta_used_print}  γ={gamma_used:.3f}  (grayscale)")
+            print(f"  η={eta_used_print:.4f}  γ={gamma_used:.3f}  (grayscale)")
         print(f"  excluded {border_mask.sum().item()} border pixels")
         print(f"  h2m: mean={h2m.mean().item():.4f} max={h2m.max().item():.4f}")
-    eta_l_out = float(eta_l) if not isinstance(eta_l, torch.Tensor) else eta_l
-    eta_c_out = float(eta_c) if not isinstance(eta_c, torch.Tensor) else eta_c
     return {
         "contrast_field": contrast_field,
         "vld": vld,
@@ -455,248 +404,8 @@ def run_l0(
         "a0": a0,
         "border_mask": border_mask,
         "interior": interior,
-        "eta_lum_used": eta_l_out,
-        "eta_chr_used": eta_c_out,
+        "eta_lum_used": float(eta_l),
+        "eta_chr_used": float(eta_c),
         "eta_used": eta_used_print,
         "gamma_used": gamma_used,
     }
-
-
-# ═══════════════════════════════════════════════════════════════
-# η modulation from collinear coherence (pass-2 feedback)
-# ═══════════════════════════════════════════════════════════════
-
-def compute_eta_modulation(
-    kappa_col_grid: torch.Tensor,
-    e_col_grid: torch.Tensor,
-    is_border_grid: torch.Tensor,
-    nH: int, nW: int,
-    H: int, W: int,
-    S: int, P: int,
-    eta0_lum: float,
-    eta0_chr: float,
-    a: torch.Tensor | float,
-    b: torch.Tensor | float,
-    c: torch.Tensor | float,
-    eps: float = 1e-6,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    r"""Compute spatially-varying η maps for L0 pass 2.
-
-    Learned modulation via sigmoid:
-
-    .. math::
-        \eta(p) = \eta_0 \cdot \sigma\!\bigl(a - b\cdot\bar\kappa(p)
-                  + c\cdot\bar E_{\text{col}}(p)\bigr)
-
-    Scalars (a, b, c) control the modulation; at init (a=2, b=c=0),
-    :math:`\sigma(2)\approx 0.88` → near-identity.
-
-    Args:
-        kappa_col_grid: (nH, nW) normalized collinear coherence
-        e_col_grid:     (nH, nW) raw (unnormalized) collinear energy
-        is_border_grid: (nH, nW) bool
-        nH, nW: cell grid dimensions
-        H, W: pixel dimensions
-        S, P: cell grid stride and patch size
-        eta0_lum, eta0_chr: base η values from pass 1
-        a, b, c: learned modulation parameters (scalars or 0-d tensors)
-
-    Returns:
-        eta_lum_map: (H, W) per-pixel η for luminance
-        eta_chr_map: (H, W) per-pixel η for chrominance
-    """
-    device = kappa_col_grid.device
-    dtype = kappa_col_grid.dtype
-
-    # Mask borders
-    kappa = torch.where(is_border_grid, torch.zeros_like(kappa_col_grid), kappa_col_grid)
-    e_col = torch.where(is_border_grid, torch.zeros_like(e_col_grid), e_col_grid)
-
-    # Normalize E_col to [0, 1] for stable sigmoid input
-    e_max = e_col.max().clamp_min(eps)
-    e_col_norm = e_col / e_max
-
-    # Resolve scalars to tensors on the right device
-    def _t(x):
-        if isinstance(x, torch.Tensor):
-            return x.to(device=device, dtype=dtype)
-        return torch.tensor(float(x), device=device, dtype=dtype)
-
-    a_t, b_t, c_t = _t(a), _t(b), _t(c)
-
-    # σ(a - b·κ + c·E_col_norm) on cell grid; floor mod so η stays > 0 for Naka stability
-    logit = a_t - b_t * kappa + c_t * e_col_norm
-    mod_grid = torch.sigmoid(logit.clamp(-40.0, 40.0)).clamp(1e-3, 1.0)
-
-    # Interpolate to pixel resolution
-    mod_pix = _interp_cell_to_pixel(mod_grid, nH, nW, H, W, S, P).clamp(1e-3, 1.0)
-
-    eta_lum_map = eta0_lum * mod_pix
-    eta_chr_map = eta0_chr * mod_pix
-
-    return eta_lum_map.to(dtype=dtype, device=device), eta_chr_map.to(dtype=dtype, device=device)
-
-
-def regional_mean_pool_cells(
-    field: torch.Tensor,
-    is_border: torch.Tensor,
-    R_eta: int,
-) -> torch.Tensor:
-    """Mean-pool ``(nH, nW)`` with replicate padding; border cells zeroed first."""
-    x = torch.where(is_border, torch.zeros_like(field), field)
-    pad = int(R_eta)
-    k = 2 * pad + 1
-    v = x.unsqueeze(0).unsqueeze(0)
-    vp = F.pad(v, (pad, pad, pad, pad), mode="replicate")
-    return F.avg_pool2d(vp, kernel_size=k, stride=1).squeeze(0).squeeze(0)
-
-
-class EtaRegionalMLP(nn.Module):
-    """3 → hidden → 1 logits for regional η (σ applied in ``compute_eta_modulation_mlp``)."""
-
-    def __init__(self, hidden: int | None = None):
-        super().__init__()
-        h = int(hidden if hidden is not None else 8)
-        self.fc1 = nn.Linear(3, h)
-        self.fc2 = nn.Linear(h, 1)
-        self._init_near_identity()
-
-    def _init_near_identity(self) -> None:
-        """Kaiming fc1, moderate fc2 — logits ≈ 2 ± O(1).
-
-        The mean σ(2) ≈ 0.88 gives near-identity η modulation at init,
-        but O(1) logit variance ensures the output *varies* spatially so
-        gradients can break symmetry from the first step.
-        """
-        with torch.no_grad():
-            nn.init.kaiming_uniform_(self.fc1.weight, nonlinearity="relu")
-            self.fc1.bias.zero_()
-            nn.init.normal_(self.fc2.weight, 0.0, 0.3)
-            self.fc2.bias.fill_(2.0)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(torch.relu(self.fc1(x)))
-
-
-def compute_eta_modulation_mlp(
-    mlp: nn.Module,
-    kappa_col_grid: torch.Tensor,
-    z0_grid: torch.Tensor,
-    rho_max_grid: torch.Tensor,
-    is_border_grid: torch.Tensor,
-    nH: int, nW: int,
-    H: int, W: int,
-    S: int, P: int,
-    eta0_lum: float,
-    eta0_chr: float,
-    pool_radius: int,
-    eps: float = 1e-6,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    r"""Regional η from pooled ``(\bar\kappa, \bar z_0, \bar\rho_{\max})`` then MLP.
-
-    Pooled statistics use ``regional_mean_pool_cells`` with radius ``pool_radius``
-    in **cell** indices.  ``z0`` and ``\rho_{\max}`` are max-normalized on the
-    pooled grid for stable MLP inputs (similar spirit to normalizing ``E_col`` in
-    the legacy 3-scalar path).
-
-    Returns:
-        eta_lum_map: (H, W) = η₀_lum · mod_pix
-        eta_chr_map: (H, W) = η₀_chr · mod_pix
-        mod_pix:     (H, W) ∈ [1e-3, 1], the [0,1]-scale modulation factor
-    """
-    device = kappa_col_grid.device
-    dtype = kappa_col_grid.dtype
-    r_pool = int(pool_radius)
-
-    kappa_p = regional_mean_pool_cells(kappa_col_grid, is_border_grid, r_pool)
-    z0_p = regional_mean_pool_cells(z0_grid, is_border_grid, r_pool)
-    rho_p = regional_mean_pool_cells(rho_max_grid, is_border_grid, r_pool)
-
-    zmax = z0_p.max().clamp_min(eps)
-    z0_n = z0_p / zmax
-    rmax = rho_p.max().clamp_min(eps)
-    rho_n = rho_p / rmax
-
-    feats = torch.stack([kappa_p, z0_n, rho_n], dim=-1).reshape(-1, 3)
-    logits = mlp(feats).reshape(nH, nW)
-    # Cap logits so σ and interp stay finite; floor mod so η never hits 0 (Naka 0/0).
-    mod_grid = torch.sigmoid(logits.clamp(-40.0, 40.0)).clamp(1e-3, 1.0)
-
-    mod_pix = _interp_cell_to_pixel(mod_grid, nH, nW, H, W, S, P).clamp(1e-3, 1.0)
-    eta_lum_map = torch.as_tensor(eta0_lum, device=device, dtype=dtype) * mod_pix
-    eta_chr_map = torch.as_tensor(eta0_chr, device=device, dtype=dtype) * mod_pix
-    return eta_lum_map, eta_chr_map, mod_pix
-
-
-def run_l0_two_pass(
-    ir: torch.Tensor,
-    eta_lum: float,
-    eta_chr: float,
-    gamma: float,
-    offsets: list[tuple[int, int]],
-    kappa_col_grid: torch.Tensor,
-    e_col_grid: torch.Tensor,
-    is_border_grid: torch.Tensor,
-    nH: int, nW: int,
-    S: int, P: int,
-    a: torch.Tensor | float = 2.0,
-    b: torch.Tensor | float = 0.0,
-    c: torch.Tensor | float = 0.0,
-    verbose: bool = True,
-) -> dict:
-    """Run L0 pass 2 with η modulated by collinear coherence from pass 1.
-
-    η(p) = η₀ · σ(a - b·κ̄(p) + c·Ē_col(p))
-
-    Pass 1 is assumed to have already been run (producing the collinear
-    signals).  This function computes the η modulation map and re-runs
-    L0 with spatially-varying η.
-
-    Args:
-        ir: (H, W, 3) RGB image
-        eta_lum, eta_chr: base η values from pass 1
-        gamma: L0 gamma
-        offsets: L0 offsets
-        kappa_col_grid: (nH, nW) from pass-1 collinear recurrence
-        e_col_grid: (nH, nW) raw collinear energy from pass 1
-        is_border_grid: (nH, nW) bool
-        nH, nW, S, P: cell grid geometry
-        a, b, c: learned modulation params (scalar or 0-d tensor)
-        verbose: print diagnostics
-
-    Returns:
-        dict with same keys as run_l0, plus 'eta_lum_map' and 'eta_chr_map'
-    """
-    H, W = ir.shape[:2]
-
-    # Compute per-pixel η maps
-    eta_lum_map, eta_chr_map = compute_eta_modulation(
-        kappa_col_grid, e_col_grid, is_border_grid,
-        nH, nW, H, W, S, P,
-        eta0_lum=eta_lum, eta0_chr=eta_chr,
-        a=a, b=b, c=c,
-    )
-
-    if verbose:
-        print("L0 pass 2 (η-modulated)...")
-        print(f"  η_lum: [{eta_lum_map.min():.4f}, {eta_lum_map.max():.4f}]  "
-              f"(base {eta_lum:.4f})")
-        print(f"  η_chr: [{eta_chr_map.min():.4f}, {eta_chr_map.max():.4f}]  "
-              f"(base {eta_chr:.4f})")
-        a_v = a.item() if isinstance(a, torch.Tensor) else a
-        b_v = b.item() if isinstance(b, torch.Tensor) else b
-        c_v = c.item() if isinstance(c, torch.Tensor) else c
-        print(f"  σ params: a={a_v:.3f}  b={b_v:.3f}  c={c_v:.3f}")
-
-    # Re-run L0 with spatially-varying η
-    result = run_l0(
-        ir,
-        eta_lum=eta_lum_map,
-        eta_chr=eta_chr_map,
-        gamma=gamma,
-        offsets=offsets,
-        verbose=verbose,
-    )
-    result["eta_lum_map"] = eta_lum_map
-    result["eta_chr_map"] = eta_chr_map
-    return result

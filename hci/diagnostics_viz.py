@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from PIL import Image
 
-from params import L0, VIZ
+from params import L0, L2, VIZ
 
 
 def rho_heatmap_cmap():
@@ -81,6 +81,80 @@ def _interior_vmin_vmax(arr: np.ndarray, interior: np.ndarray) -> tuple[float, f
     if vmin == vmax:
         vmax = vmin + max(abs(vmin), 1.0) * 1e-12 + 1e-20
     return vmin, vmax
+
+
+def viz_l1_lambdas_three(
+    lam1: np.ndarray,
+    lam2: np.ndarray,
+    lam3: np.ndarray,
+    is_border: np.ndarray,
+    out_path: str,
+    suptitle: str,
+) -> None:
+
+    cmap = "coolwarm"
+    a1 = apply_border_zero(lam1, is_border)
+    a2 = apply_border_zero(lam2, is_border)
+    a3 = apply_border_zero(lam3, is_border)
+    interior = ~np.asarray(is_border, dtype=bool)
+
+    panels = [
+        (a1, r"$\lambda_1$ (branch 0)"),
+        (a2, r"$\lambda_2$ (branch 1)"),
+        (a3, r"$\lambda_3$ (smallest eigenvalue)"),
+    ]
+
+    fig, axes = plt.subplots(3, 1, figsize=(5.5, 5.2 * 3), facecolor=VIZ.BG)
+    axes_flat = np.atleast_1d(axes).ravel()
+
+    for ax, (arr, title_base) in zip(axes_flat, panels):
+        ax.set_facecolor(VIZ.PANEL_BG)
+        ax.axis("off")
+        vmin, vmax = _interior_vmin_vmax(arr, interior)
+        im = ax.imshow(
+            arr,
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            interpolation="nearest",
+        )
+        ax.set_title(
+            f"{title_base}\ninterior min={vmin:.4g}  max={vmax:.4g}",
+            fontsize=9,
+            color=VIZ.FG,
+            fontfamily="monospace",
+        )
+        cbar = fig.colorbar(
+            im,
+            ax=ax,
+            fraction=0.035,
+            pad=0.02,
+            shrink=0.82,
+        )
+        cbar.outline.set_edgecolor(VIZ.ACCENT)
+        cbar.ax.tick_params(colors=VIZ.FG, labelsize=7)
+
+    fig.suptitle(
+        f"{suptitle}  (each row: own min→max; red=max, blue=min)",
+        fontsize=10,
+        color=VIZ.FG,
+        fontfamily="monospace",
+        y=0.995,
+    )
+    fig.text(
+        0.5,
+        0.008,
+        "Legend: coolwarm on interior cells — blue = minimum, red = maximum "
+        "(separate scale per λ; border cells masked).",
+        ha="center",
+        va="bottom",
+        fontsize=8,
+        color=VIZ.FG,
+        fontfamily="monospace",
+    )
+    fig.tight_layout(rect=[0, 0.04, 1, 0.96])
+    fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
+    plt.close(fig)
 
 
 def viz_rho_branch_grid(
@@ -346,7 +420,7 @@ def viz_hist_cdf_columns(
         ax_c.set_facecolor(VIZ.PANEL_BG)
         n_cells = int(flat.size)
         if n_cells > 0:
-            xs = np.sort(flat.astype(np.float64))
+            xs = np.sort(flat.astype(np.float64, copy=False))
             ys = np.arange(1, n_cells + 1, dtype=np.float64)
             ax_c.plot(xs, ys, color=VIZ.FG, linewidth=1.2)
         ax_c.set_xlim(0.0, 1.0)
@@ -365,428 +439,6 @@ def viz_hist_cdf_columns(
             s.set_color(VIZ.ACCENT)
 
     fig.tight_layout(rect=[0, 0, 1, 0.95])
-    fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
-    plt.close(fig)
-
-
-def viz_infer_rho_map_hist_cdf(
-    rho: np.ndarray,
-    is_border: np.ndarray,
-    out_path: str,
-    *,
-    eta_z: float | None = None,
-    n_bins: int = 50,
-) -> None:
-    """Single cell-grid ρ: heatmap (per-cell max scale) + interior histogram + CDF."""
-    g = apply_border_zero(np.asarray(rho, dtype=np.float64), is_border)
-    ib = np.asarray(is_border, dtype=bool)
-    flat = g.ravel()[~ib.ravel()]
-
-    fig = plt.figure(figsize=(11.5, 6.2), facecolor=VIZ.BG)
-    gs = fig.add_gridspec(
-        2, 2, width_ratios=[1.38, 1.0], height_ratios=[1, 1],
-        wspace=0.30, hspace=0.34,
-    )
-    ax_map = fig.add_subplot(gs[:, 0])
-    ax_hist = fig.add_subplot(gs[0, 1])
-    ax_cdf = fig.add_subplot(gs[1, 1])
-
-    cmap = rho_heatmap_cmap()
-    m_i = max(float(np.max(g)) if g.size else 0.0, VIZ.EPS)
-    scale = m_i
-    ax_map.set_facecolor(VIZ.PANEL_BG)
-    ax_map.imshow(
-        g / scale,
-        cmap=cmap,
-        vmin=0.0,
-        vmax=1.0,
-        interpolation="nearest",
-    )
-    ax_map.set_title(
-        rf"cell $\rho$  (post-GABA; raw max={m_i:.4g})",
-        fontsize=9,
-        color=VIZ.FG,
-        fontfamily="monospace",
-    )
-    ax_map.axis("off")
-
-    ax_hist.set_facecolor(VIZ.PANEL_BG)
-    if flat.size:
-        ax_hist.hist(
-            flat,
-            bins=n_bins,
-            range=(0.0, 1.0),
-            color=VIZ.ACCENT,
-            edgecolor=VIZ.PANEL_BG,
-            linewidth=0.3,
-        )
-    ax_hist.set_xlim(0.0, 1.0)
-    ax_hist.set_title(
-        f"interior ρ vs count  n={flat.size}",
-        fontsize=8,
-        color=VIZ.FG,
-        fontfamily="monospace",
-    )
-    ax_hist.set_ylabel("count", fontsize=8, color=VIZ.FG)
-    ax_hist.tick_params(colors=VIZ.FG, labelsize=7)
-    for s in ax_hist.spines.values():
-        s.set_color(VIZ.ACCENT)
-
-    ax_cdf.set_facecolor(VIZ.PANEL_BG)
-    n_cells = int(flat.size)
-    if n_cells > 0:
-        xs = np.sort(flat.astype(np.float64))
-        ys = np.arange(1, n_cells + 1, dtype=np.float64)
-        ax_cdf.plot(xs, ys, color=VIZ.FG, linewidth=1.2)
-    ax_cdf.set_xlim(0.0, 1.0)
-    ax_cdf.set_ylim(0.0, float(max(n_cells, 1)))
-    ax_cdf.set_xlabel("ρ", fontsize=8, color=VIZ.FG)
-    ax_cdf.set_ylabel("cumulative count", fontsize=8, color=VIZ.FG)
-    ax_cdf.set_title(
-        "empirical CDF (unnormalized y)",
-        fontsize=8,
-        color=VIZ.FG,
-        fontfamily="monospace",
-    )
-    ax_cdf.grid(True, alpha=0.25, color=VIZ.ACCENT)
-    ax_cdf.tick_params(colors=VIZ.FG, labelsize=7)
-    for s in ax_cdf.spines.values():
-        s.set_color(VIZ.ACCENT)
-
-    eta_note = (
-        rf"  $\eta_z$={eta_z:.4g}" if eta_z is not None else ""
-    )
-    fig.suptitle(
-        "Cell ρ — map, histogram (interior), empirical CDF" + eta_note,
-        fontsize=10,
-        color=VIZ.FG,
-        fontfamily="monospace",
-    )
-    fig.tight_layout(rect=[0, 0, 1, 0.93])
-    fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
-    plt.close(fig)
-
-
-def viz_infer_rho_seed_final_dual_maps(
-    rho_seed: np.ndarray,
-    rho_final: np.ndarray,
-    is_border: np.ndarray,
-    out_path: str,
-    *,
-    n_collinear_passes: int,
-) -> None:
-    """Side-by-side cell ρ: same dominant bin after recurrence, raw ``μ`` vs post-GABA.
-
-    ``rho_seed`` / ``rho_final`` are the per-cell scalar channels saved in L1 (not renderer
-    bookkeeping). The dominant bin index is taken **after** collinear recurrence; the left
-    map is **normalized** raw oriented energy ``μ`` at that bin, the right map is ρ at that bin
-    **after** GABA.
-    """
-    gs = apply_border_zero(np.asarray(rho_seed, dtype=np.float64), is_border)
-    gf = apply_border_zero(np.asarray(rho_final, dtype=np.float64), is_border)
-
-    fig, axes = plt.subplots(1, 2, figsize=(13.6, 5.4), facecolor=VIZ.BG)
-    cmap = rho_heatmap_cmap()
-    vmax = max(
-        float(np.max(gs)) if gs.size else 0.0,
-        float(np.max(gf)) if gf.size else 0.0,
-        float(VIZ.EPS),
-    )
-    norm_seed = np.clip(gs / vmax, 0.0, 1.0)
-    norm_fin = np.clip(gf / vmax, 0.0, 1.0)
-    titles = (
-        r"$\rho$ raw $\mu$ at post-recurrence winner bin",
-        r"$\rho$ post-GABA (winner bin, no extra squash)",
-    )
-    for ax, arr, title in zip(axes, (norm_seed, norm_fin), titles):
-        ax.set_facecolor(VIZ.PANEL_BG)
-        ax.imshow(arr, cmap=cmap, vmin=0.0, vmax=1.0, interpolation="nearest")
-        ax.set_title(title, fontsize=9, color=VIZ.FG, fontfamily="monospace")
-        ax.axis("off")
-    fig.suptitle(
-        "cell $\\rho$: same dominant bin after recurrence, "
-        "raw $\\mu$ vs post-GABA "
-        f"(shared color scale, max={vmax:.4g})",
-        fontsize=10,
-        color=VIZ.FG,
-        fontfamily="monospace",
-    )
-    fig.tight_layout(rect=[0, 0, 1, 0.92])
-    fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
-    plt.close(fig)
-
-
-def viz_infer_kappa_pass0_final_dual_maps(
-    kappa_pass0: np.ndarray,
-    kappa_final: np.ndarray,
-    is_border: np.ndarray,
-    out_path: str,
-    *,
-    n_collinear_passes: int,
-    kappa_vmax: float | None = None,
-) -> None:
-    """Per-cell ``κ`` = cosine ``(ρ·S)/(‖ρ‖‖S‖)``: **pre** = first pass with ``ρ=μ``; **post** = last pass.
-
-    Same definition as the η-MLP input before pooling.  Color scale defaults to
-    ``[0,1]`` (override ``kappa_vmax`` for a wider display range).
-    """
-    kmax = float(kappa_vmax if kappa_vmax is not None else 1.0)
-    k0 = apply_border_zero(np.asarray(kappa_pass0, dtype=np.float64), is_border)
-    k1 = apply_border_zero(np.asarray(kappa_final, dtype=np.float64), is_border)
-
-    fig, axes = plt.subplots(1, 2, figsize=(13.6, 6.15), facecolor=VIZ.BG)
-    n_p = int(n_collinear_passes)
-    if n_p <= 0:
-        t_final = "-"
-        pass_note = "0 collinear passes (kappa maps are zeros)"
-    elif n_p == 1:
-        t_final = "0"
-        pass_note = "1 collinear pass (first = final)"
-    else:
-        t_final = str(n_p - 1)
-        pass_note = f"{n_p} collinear passes"
-    titles = (
-        "kappa_pre: first pass (post-seed rho)",
-        f"kappa_post: last pass (t = {t_final})",
-    )
-    ims = []
-    for ax, arr, title in zip(axes, (k0, k1), titles):
-        ax.set_facecolor(VIZ.PANEL_BG)
-        im = ax.imshow(
-            np.clip(arr, 0.0, kmax),
-            cmap="magma",
-            vmin=0.0,
-            vmax=kmax,
-            interpolation="nearest",
-        )
-        ims.append(im)
-        ax.set_title(title, fontsize=9, color=VIZ.FG, fontfamily="monospace")
-        ax.axis("off")
-    fig.suptitle(
-        "kappa = (rho . S) / (||rho|| * ||S||), pre- vs post-divisive NR. "
-        + pass_note,
-        fontsize=10,
-        color=VIZ.FG,
-        fontfamily="monospace",
-    )
-    # Reserve lower figure area for colorbar + label; pad = gap under heatmaps.
-    fig.tight_layout(rect=[0, 0.24, 1, 0.88])
-    cbar = fig.colorbar(
-        ims[0],
-        ax=axes.ravel().tolist(),
-        orientation="horizontal",
-        fraction=0.048,
-        pad=0.26,
-        shrink=0.92,
-        aspect=36,
-    )
-    cbar.set_label(
-        f"kappa clipped to [0, {kmax:g}]",
-        color=VIZ.FG,
-        fontsize=9,
-        fontfamily="monospace",
-    )
-    cbar.ax.tick_params(colors=VIZ.FG, labelsize=8)
-    cbar.ax.xaxis.label.set_color(VIZ.FG)
-    for spine in cbar.ax.spines.values():
-        spine.set_color(VIZ.ACCENT)
-    fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
-    plt.close(fig)
-
-
-def viz_infer_rho_seed_final_hist_cdf(
-    rho_seed: np.ndarray,
-    rho_final: np.ndarray,
-    is_border: np.ndarray,
-    out_path: str,
-    *,
-    n_bins: int = 64,
-) -> None:
-    """Interior histograms + empirical CDFs for L1 raw ``μ`` vs post-GABA ρ (common ρ range)."""
-    ib = np.asarray(is_border, dtype=bool)
-    gs = apply_border_zero(np.asarray(rho_seed, dtype=np.float64), is_border)
-    gf = apply_border_zero(np.asarray(rho_final, dtype=np.float64), is_border)
-    flat_s = gs.ravel()[~ib.ravel()]
-    flat_f = gf.ravel()[~ib.ravel()]
-    mx_s = float(np.max(flat_s)) if flat_s.size else 0.0
-    mx_f = float(np.max(flat_f)) if flat_f.size else 0.0
-    xmax = max(mx_s, mx_f, float(VIZ.EPS))
-
-    fig, axes = plt.subplots(2, 2, figsize=(11.5, 8.2), facecolor=VIZ.BG)
-    fig.suptitle(
-        r"Interior raw $\mu$ vs post-GABA $\rho$ — histograms & CDFs "
-        f"(common range [0, {xmax:.4g}])",
-        fontsize=10,
-        color=VIZ.FG,
-        fontfamily="monospace",
-    )
-
-    rows = (
-        (flat_s, r"raw $\mu$ (post-$\theta$ winner bin)"),
-        (flat_f, r"$\rho$ post-GABA (after recurrence)"),
-    )
-    for row_i, (flat, row_title) in enumerate(rows):
-        ax_h = axes[row_i, 0]
-        ax_c = axes[row_i, 1]
-        ax_h.set_facecolor(VIZ.PANEL_BG)
-        ax_c.set_facecolor(VIZ.PANEL_BG)
-        n = int(flat.size)
-        if n > 0:
-            ax_h.hist(
-                flat,
-                bins=n_bins,
-                range=(0.0, xmax),
-                color=VIZ.ACCENT,
-                edgecolor=VIZ.PANEL_BG,
-                linewidth=0.3,
-            )
-            xs = np.sort(flat.astype(np.float64))
-            ys = np.arange(1, n + 1, dtype=np.float64)
-            ax_c.plot(xs, ys, color=VIZ.FG, linewidth=1.2)
-        ax_h.set_xlim(0.0, xmax)
-        ax_h.set_title(
-            f"{row_title}\nvs count  n={n}",
-            fontsize=8,
-            color=VIZ.FG,
-            fontfamily="monospace",
-        )
-        ax_h.set_ylabel("count", fontsize=8, color=VIZ.FG)
-        ax_h.tick_params(colors=VIZ.FG, labelsize=7)
-        for s in ax_h.spines.values():
-            s.set_color(VIZ.ACCENT)
-
-        ax_c.set_xlim(0.0, xmax)
-        ax_c.set_ylim(0.0, float(max(n, 1)))
-        ax_c.set_xlabel(r"$\rho$", fontsize=8, color=VIZ.FG)
-        ax_c.set_ylabel("cumulative count", fontsize=8, color=VIZ.FG)
-        ax_c.set_title(
-            "empirical CDF (unnormalized y)",
-            fontsize=8,
-            color=VIZ.FG,
-            fontfamily="monospace",
-        )
-        ax_c.grid(True, alpha=0.25, color=VIZ.ACCENT)
-        ax_c.tick_params(colors=VIZ.FG, labelsize=7)
-        for s in ax_c.spines.values():
-            s.set_color(VIZ.ACCENT)
-
-    fig.tight_layout(rect=[0, 0, 1, 0.94])
-    fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
-    plt.close(fig)
-
-
-def viz_infer_rho_post_minus_pre_map_hist_cdf(
-    rho_pre: np.ndarray,
-    rho_post: np.ndarray,
-    is_border: np.ndarray,
-    out_path: str,
-    *,
-    n_bins: int = 64,
-    n_collinear_passes: int | None = None,
-) -> None:
-    """Cell-grid Δρ = ρ_post − μ (post-θ winner bin): map + interior histogram + CDF.
-
-    Uses the same pre/post scalars as ``viz_infer_rho_seed_final_*`` (raw ``μ`` at the bin that
-    dominates after GABA, evaluated before vs after recurrence). Negative Δρ indicates
-    suppression at that bin.
-    """
-    gs = apply_border_zero(np.asarray(rho_pre, dtype=np.float64), is_border)
-    gf = apply_border_zero(np.asarray(rho_post, dtype=np.float64), is_border)
-    delta = gf - gs
-    ib = np.asarray(is_border, dtype=bool)
-    flat = delta.ravel()[~ib.ravel()]
-
-    if flat.size:
-        m = float(np.max(np.abs(flat)))
-        if m < 1e-18:
-            m = 1e-18
-    else:
-        m = 1.0
-
-    pass_note = (
-        f"  ({int(n_collinear_passes)} collinear passes)"
-        if n_collinear_passes is not None
-        else ""
-    )
-    fig = plt.figure(figsize=(11.5, 6.2), facecolor=VIZ.BG)
-    gspec = fig.add_gridspec(
-        2, 2, width_ratios=[1.38, 1.0], height_ratios=[1, 1],
-        wspace=0.30, hspace=0.34,
-    )
-    ax_map = fig.add_subplot(gspec[:, 0])
-    ax_hist = fig.add_subplot(gspec[0, 1])
-    ax_cdf = fig.add_subplot(gspec[1, 1])
-
-    ax_map.set_facecolor(VIZ.PANEL_BG)
-    im = ax_map.imshow(
-        delta,
-        cmap="coolwarm",
-        vmin=-m,
-        vmax=m,
-        interpolation="nearest",
-    )
-    fig.colorbar(im, ax=ax_map, fraction=0.046, pad=0.02)
-    ax_map.set_title(
-        r"cell $\Delta\rho = \rho_{\mathrm{post}} - \rho_{\mathrm{pre}}$",
-        fontsize=9,
-        color=VIZ.FG,
-        fontfamily="monospace",
-    )
-    ax_map.axis("off")
-
-    ax_hist.set_facecolor(VIZ.PANEL_BG)
-    n_cells = int(flat.size)
-    if n_cells > 0:
-        ax_hist.hist(
-            flat,
-            bins=n_bins,
-            range=(-m, m),
-            color=VIZ.ACCENT,
-            edgecolor=VIZ.PANEL_BG,
-            linewidth=0.3,
-        )
-    ax_hist.axvline(0.0, color=VIZ.FG, linewidth=0.8, linestyle="--", alpha=0.6)
-    ax_hist.set_xlim(-m, m)
-    ax_hist.set_title(
-        f"interior Δρ vs count  n={n_cells}  (sym. range ±{m:.4g})",
-        fontsize=8,
-        color=VIZ.FG,
-        fontfamily="monospace",
-    )
-    ax_hist.set_ylabel("count", fontsize=8, color=VIZ.FG)
-    ax_hist.tick_params(colors=VIZ.FG, labelsize=7)
-    for s in ax_hist.spines.values():
-        s.set_color(VIZ.ACCENT)
-
-    ax_cdf.set_facecolor(VIZ.PANEL_BG)
-    if n_cells > 0:
-        xs = np.sort(flat.astype(np.float64, copy=False))
-        ys = np.arange(1, n_cells + 1, dtype=np.float64)
-        ax_cdf.plot(xs, ys, color=VIZ.FG, linewidth=1.2)
-    ax_cdf.axvline(0.0, color=VIZ.ACCENT, linewidth=0.8, linestyle="--", alpha=0.7)
-    ax_cdf.set_xlim(-m, m)
-    ax_cdf.set_ylim(0.0, float(max(n_cells, 1)))
-    ax_cdf.set_xlabel(r"$\Delta\rho$", fontsize=8, color=VIZ.FG)
-    ax_cdf.set_ylabel("cumulative count", fontsize=8, color=VIZ.FG)
-    ax_cdf.set_title(
-        "empirical CDF of interior Δρ (unnormalized y)",
-        fontsize=8,
-        color=VIZ.FG,
-        fontfamily="monospace",
-    )
-    ax_cdf.grid(True, alpha=0.25, color=VIZ.ACCENT)
-    ax_cdf.tick_params(colors=VIZ.FG, labelsize=7)
-    for s in ax_cdf.spines.values():
-        s.set_color(VIZ.ACCENT)
-
-    fig.suptitle(
-        r"L1 recurrence — $\rho_{\mathrm{post}} - \rho_{\mathrm{pre}}$ "
-        r"(post-$\theta$ winner bin; negative ⇒ suppression)" + pass_note,
-        fontsize=10,
-        color=VIZ.FG,
-        fontfamily="monospace",
-    )
-    fig.tight_layout(rect=[0, 0, 1, 0.90])
     fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
     plt.close(fig)
 
@@ -831,6 +483,48 @@ def save_rho_png(pix_proj: np.ndarray, out_path):
     Image.fromarray((rgba[..., :3] * 255).astype(np.uint8), "RGB").save(out_path)
 
 
+def _softmap_panel_rgb(pix_proj: np.ndarray) -> np.ndarray:
+    m = max(float(np.asarray(pix_proj).max()), VIZ.EPS)
+    cmap = rho_heatmap_cmap()
+    rgba = cmap(np.clip(np.asarray(pix_proj, dtype=np.float64) / m, 0.0, 1.0))
+    return (rgba[..., :3] * 255).astype(np.uint8)
+
+
+def viz_infer_iters_snapshot(
+    softmaps: list[np.ndarray],
+    step_labels: list[int],
+    out_path: str,
+) -> None:
+    """Render softmap at evenly spaced L2 steps (one row, shared panel scale)."""
+    maps = [np.asarray(b, dtype=np.float64) for b in softmaps]
+    labels = [int(t) for t in step_labels]
+    if len(maps) != len(labels) or not maps:
+        return
+    m_global = max(max(float(b.max()) for b in maps), VIZ.EPS)
+    n = len(maps)
+    fig, axes = plt.subplots(1, n, figsize=(5.2 * n, 5.0), facecolor=VIZ.BG)
+    axes_flat = np.atleast_1d(axes).ravel()
+    for ax, bmap, t in zip(axes_flat, maps, labels):
+        ax.set_facecolor(VIZ.PANEL_BG)
+        ax.imshow(_softmap_panel_rgb(bmap / m_global))
+        ax.set_title(
+            f"t={t}",
+            fontsize=9,
+            color=VIZ.FG,
+            fontfamily="monospace",
+        )
+        ax.axis("off")
+    fig.suptitle(
+        "Render softmap — L2 iteration snapshots  (shared scale)",
+        fontsize=10,
+        color=VIZ.FG,
+        fontfamily="monospace",
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
+    plt.close(fig)
+
+
 def viz_infer_l0_pinwheel(
     h_np: np.ndarray, img_pinwheel: np.ndarray, out_path: str
 ) -> None:
@@ -838,174 +532,60 @@ def viz_infer_l0_pinwheel(
     viz_l0_pinwheel(h_np, img_pinwheel, out_path)
 
 
-def _pool_grid_pair(
-    first: np.ndarray,
-    last: np.ndarray,
-    is_border: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    ib = np.asarray(is_border, dtype=bool)
-    a0 = np.asarray(first, dtype=np.float64)
-    a1 = np.asarray(last, dtype=np.float64)
-    if ib.ndim == 1 and a0.ndim == 2:
-        ib = ib.reshape(a0.shape)
-    ib = np.asarray(ib, dtype=bool)
-    return apply_border_zero(a0, ib), apply_border_zero(a1, ib), ib
-
-
-def viz_infer_gaba_geometry(
-    scoll_first: np.ndarray,
-    sflank_first: np.ndarray,
-    scross_first: np.ndarray,
-    scoll_last: np.ndarray,
-    sflank_last: np.ndarray,
-    scross_last: np.ndarray,
+def viz_infer_l1_lambdas(
+    lam: np.ndarray,
+    lam3: np.ndarray,
     is_border: np.ndarray,
     out_path: str,
-    *,
-    n_collinear_passes: int | None = None,
 ) -> None:
-    r"""Pool geometry: ``s_coll``, ``s_flank``, ``s_cross`` at pass ``t=0`` and ``t=T-1``."""
-    sc0, scn, ib = _pool_grid_pair(scoll_first, scoll_last, is_border)
-    sf0, sfn, _ = _pool_grid_pair(sflank_first, sflank_last, is_border)
-    sx0, sxn, _ = _pool_grid_pair(scross_first, scross_last, is_border)
-    interior = ~ib
-    t_last = int(n_collinear_passes) - 1 if n_collinear_passes is not None else "n"
 
-    fig = plt.figure(figsize=(8.4, 10.8), facecolor=VIZ.BG)
-    gs = fig.add_gridspec(3, 2, hspace=0.22, wspace=0.12)
-    rows: list[tuple[np.ndarray, np.ndarray, str]] = [
-        (sc0, scn, "s_coll"),
-        (sf0, sfn, "s_flank"),
-        (sx0, sxn, "s_cross"),
-    ]
-    for row, (arr0, arrn, label) in enumerate(rows):
-        for col, (arr, ttag) in enumerate(((arr0, "t=0"), (arrn, f"t={t_last}"))):
-            ax = fig.add_subplot(gs[row, col])
-            ax.set_facecolor(VIZ.PANEL_BG)
-            vmin, vmax = _interior_vmin_vmax(arr, interior)
-            im = ax.imshow(
-                arr,
-                cmap="magma",
-                vmin=vmin,
-                vmax=vmax,
-                interpolation="nearest",
-            )
-            ax.set_title(
-                f"{label} {ttag}\nmax={vmax:.4g}  min={vmin:.4g}",
-                fontsize=9,
-                color=VIZ.FG,
-                fontfamily="monospace",
-            )
-            ax.axis("off")
-            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
-
-    fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
-    plt.close(fig)
-
-
-def viz_infer_gaba_geometry_diff(
-    scoll_first: np.ndarray,
-    sflank_first: np.ndarray,
-    scross_first: np.ndarray,
-    scoll_last: np.ndarray,
-    sflank_last: np.ndarray,
-    scross_last: np.ndarray,
-    is_border: np.ndarray,
-    out_path: str,
-    *,
-    n_collinear_passes: int | None = None,
-    ratio_eps: float = 0.05,
-    n_bins: int = 48,
-) -> None:
-    r"""Ratio of **kernel-normalized** pools ``(ŝ_num + ε)/(ŝ_den + ε)`` with histograms."""
-    sc0, scn, ib = _pool_grid_pair(scoll_first, scoll_last, is_border)
-    sf0, sfn, _ = _pool_grid_pair(sflank_first, sflank_last, is_border)
-    sx0, sxn, _ = _pool_grid_pair(scross_first, scross_last, is_border)
-    interior = ~ib
-    t_last = int(n_collinear_passes) - 1 if n_collinear_passes is not None else "n"
-    eps = max(float(ratio_eps), float(VIZ.EPS))
-
-    def _norm_ratio(num: np.ndarray, den: np.ndarray) -> np.ndarray:
-        return (num + eps) / (den + eps)
-
-    panels: list[tuple[np.ndarray, str]] = [
-        (_norm_ratio(sc0, sf0), f"ŝ_coll/ŝ_flank t=0"),
-        (_norm_ratio(scn, sfn), f"ŝ_coll/ŝ_flank t={t_last}"),
-        (_norm_ratio(sc0, sx0), f"ŝ_coll/ŝ_cross t=0"),
-        (_norm_ratio(scn, sxn), f"ŝ_coll/ŝ_cross t={t_last}"),
-    ]
-
-    fig = plt.figure(figsize=(11.2, 10.4), facecolor=VIZ.BG)
-    gs = fig.add_gridspec(4, 2, width_ratios=[2.3, 1.0], hspace=0.30, wspace=0.14)
-    for i, (arr, label) in enumerate(panels):
-        ax_map = fig.add_subplot(gs[i, 0])
-        ax_hist = fig.add_subplot(gs[i, 1])
-        ax_map.set_facecolor(VIZ.PANEL_BG)
-        ax_hist.set_facecolor(VIZ.PANEL_BG)
-
-        flat = arr[interior].ravel()
-        if flat.size:
-            lo = float(np.percentile(flat, 2))
-            hi = float(np.percentile(flat, 98))
-            if hi <= lo:
-                lo, hi = float(flat.min()), float(flat.max())
-            if hi <= lo:
-                hi = lo + 1.0
-        else:
-            lo, hi = 0.0, 1.0
-
-        im = ax_map.imshow(
-            arr,
-            cmap="magma",
-            vmin=lo,
-            vmax=hi,
-            interpolation="nearest",
-        )
-        ax_map.set_title(
-            f"{label}  (ε={eps:g})\n"
-            f"p2={lo:.3g}  p98={hi:.3g}",
-            fontsize=9,
-            color=VIZ.FG,
-            fontfamily="monospace",
-        )
-        ax_map.axis("off")
-        fig.colorbar(im, ax=ax_map, fraction=0.046, pad=0.02)
-
-        n_cells = int(flat.size)
-        med = float(np.median(flat)) if n_cells else 0.0
-        if n_cells > 0:
-            ax_hist.hist(
-                flat,
-                bins=n_bins,
-                range=(lo, hi),
-                color=VIZ.ACCENT,
-                edgecolor=VIZ.PANEL_BG,
-                linewidth=0.3,
-            )
-            ax_hist.axvline(med, color=VIZ.FG, linewidth=0.8, linestyle="--", alpha=0.7)
-        ax_hist.set_xlim(lo, hi)
-        ax_hist.set_title(
-            f"interior  n={n_cells}  med={med:.3g}"
-            if n_cells
-            else "interior (empty)",
-            fontsize=8,
-            color=VIZ.FG,
-            fontfamily="monospace",
-        )
-        ax_hist.set_ylabel("count", fontsize=7, color=VIZ.FG)
-        ax_hist.tick_params(colors=VIZ.FG, labelsize=6)
-        for sp in ax_hist.spines.values():
-            sp.set_color("#333")
-
-    fig.suptitle(
-        f"Normalized pool ratios  (ŝ = kernel-normalized conv, ε={eps:g} in num & den)",
-        fontsize=10,
-        color=VIZ.FG,
-        fontfamily="monospace",
-        y=0.995,
+    viz_l1_lambdas_three(
+        lam[:, :, 0],
+        lam[:, :, 1],
+        lam3,
+        is_border,
+        out_path,
+        suptitle=r"L1 $\lambda$ (L2 seed: $\rho_{\mathrm{seed}}=\lambda_1/(\lambda_1+\lambda_2+\eta_z)$)",
     )
-    fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
-    plt.close(fig)
+
+
+def viz_infer_cell_rho_maps(
+    rho_seed: np.ndarray,
+    rho_post: np.ndarray,
+    is_border: np.ndarray,
+    out_path: str,
+    *,
+    eta_z: float,
+) -> None:
+
+    viz_rho_branch_grid(
+        [rho_seed, rho_post],
+        [r"seed $\rho^{(0)}$", "post-L2 ρ"],
+        is_border,
+        out_path,
+        suptitle=(
+            r"Cell $\rho$ — single-branch dynamics "
+            r"(seed: $\rho_{\mathrm{seed}}=\lambda_1/(\lambda_1+\lambda_2+\eta_z)$, "
+            rf"$\eta_z$={eta_z:.4g})"
+        ),
+        layout_rows_cols=(1, 2),
+    )
+
+
+def viz_infer_rho_hist_cdf(
+    rho_seed: np.ndarray,
+    rho_post: np.ndarray,
+    is_border: np.ndarray,
+    out_path: str,
+) -> None:
+
+    viz_hist_cdf_columns(
+        [rho_seed, rho_post],
+        [r"seed $\rho^{(0)}$", "post-L2 ρ"],
+        is_border,
+        out_path,
+        suptitle="L2 dynamics — count vs ρ and empirical CDFs (cumulative count)",
+    )
 
 
 def viz_l2_bimodality_per_iter(
@@ -1166,6 +746,51 @@ def viz_infer_l2_suppression_factors(
         out_path,
         suptitle=sig_suptitle,
         layout_rows_cols=layout,
+    )
+    return True
+
+
+def viz_infer_l2_geometry(
+    surface_diags: dict | None,
+    is_border: np.ndarray,
+    out_path: str,
+) -> bool:
+    """NR-squashed geometry pools on the cell grid: t=0 (ρ seed) vs t=last (final ρ)."""
+    if surface_diags is None:
+        return False
+    geom = surface_diags.get("geometry")
+    if not isinstance(geom, dict):
+        return False
+    t0 = geom.get("t0")
+    t_last = geom.get("t_last")
+    if not isinstance(t0, dict) or not isinstance(t_last, dict):
+        return False
+
+    rows = (
+        ("rho_coll", r"$\tilde{\rho}_{\mathrm{coll}}$"),
+        ("c_iso", r"$\tilde{c}_{\mathrm{iso}}$"),
+        ("c_cross", r"$\tilde{c}_{\mathrm{cross}}$"),
+    )
+    panels: list[np.ndarray] = []
+    labels: list[str] = []
+    for key, sym in rows:
+        g0 = t0.get(key)
+        g1 = t_last.get(key)
+        if g0 is None or g1 is None:
+            return False
+        panels.extend([g0, g1])
+        labels.extend([
+            rf"{sym}  $t=0$ (seed $\rho$)",
+            rf"{sym}  $t=T_{{\mathrm{{refine}}}}$ (final $\rho$)",
+        ])
+
+    viz_rho_branch_grid(
+        panels,
+        labels,
+        is_border,
+        out_path,
+        suptitle="L2 cell geometry — NR-squashed collinear / iso / cross pools",
+        layout_rows_cols=(3, 2),
     )
     return True
 

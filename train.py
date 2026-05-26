@@ -1,16 +1,14 @@
-r"""train.py — harmonic-contour-integration: L1 hypercolumns + render.
+r"""train.py — STRIATE training: cell-grid conv dynamics + harmonic render.
 
-Pipeline per image: L0 (partially cached) → **L1 live in the training step**
-(cos² hypercolumns, seed ``η_z`` NR → pass NR recurrence with learned ``η_p``, ``α``,
-dominant θ/ρ/κ) → **renderer** (interp + thinning MLP).  The disk cache stores L0 inputs for L1
-(``h2m``, ``theta_h``, ``border_mask``) plus ``l0_pix``, GT, geometry — **not**
-precomputed ``cells_flat``.
+Pipeline per image: L0 contrast/harmonics → L1 cells (κ from z₁ polarity)
+→ L2 cell-grid ρ refinement (ρ_seed = λ₁/(λ₁+λ₂+η_z); conv pools → NR-squashed drive²/(drive² + b_iso·c̃_iso + b_cross·c̃_cross + η_p²))
+→ bilinear upsample of cell ρ (and θ for NMS) to pixels ($B$ = ρ on the pixel grid).
+Loss combines soft-Dice and per-pixel BCE on the same η± valid band
+(target≥η_pos or target<η_neg), weighted by ``--lam_dice`` and ``--lam_bce``
+(each can be 0).
 
-**Cache:** ``TRAIN.CACHE_VERSION`` gates stored tensors.  ``d_lum``/``d_chr`` may
-still be reused across bumps when ``L0.L0_DIST_CACHE_VERSION`` and the stored
-geometry signature match.
-
-Loss combines soft-Dice and class-balanced per-pixel BCE on the η± valid band.
+Trains on the full train split (no held-out val). Saves `intermediate.pt`
+each epoch and `final.pt` when training completes.
 """
 
 from __future__ import annotations
@@ -28,68 +26,20 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from hci.L0 import (
+    load_image,
     compute_l0_rgb,
     compute_interior,
-    _compute_d_lum_chroma,
 )
-from hci.L1 import (
-    _inv_softplus,
-    pad_for_patch_grid,
-    run_l1_hypercolumn,
-    stride_from_patch_overlap,
-)
-from hci.seed import RhoSeedModule
+from hci.L1 import z_from_l0_harmonics, pad_for_patch_grid, run_l1
+from hci.L2 import TileDynamics
 from hci.renderer import (
     ModulationRenderer,
+    compute_render_features,
     render_boundary_map_torch,
     proj_to_device,
+    upgrade_renderer_state_dict,
 )
-from params import L0, L1, RENDER, SEED, TRAIN, VIZ
-
-
-def _l0_dist_signature(ir_p: np.ndarray, H0: int, W0: int) -> tuple:
-    """Identity for L0 directional-distance tensors (η-independent leg)."""
-    Hp, Wp = int(ir_p.shape[0]), int(ir_p.shape[1])
-    return (
-        tuple((int(a), int(b)) for a, b in L0.OFFSETS),
-        Hp,
-        Wp,
-        int(H0),
-        int(W0),
-        int(L1.PATCH_SIZE),
-        int(L1.PATCH_OVERLAP),
-    )
-
-
-def _can_reuse_l0_dist_tensors(
-    cached: dict | None,
-    sig: tuple,
-    ir_p: np.ndarray,
-) -> bool:
-    if not isinstance(cached, dict):
-        return False
-    if int(cached.get("l0_dist_cache_version", -1)) != int(L0.L0_DIST_CACHE_VERSION):
-        return False
-    if cached.get("l0_dist_signature") != sig:
-        return False
-    for k in ("d_lum", "d_chr", "img"):
-        if k not in cached:
-            return False
-    Hp, Wp = sig[1], sig[2]
-    if ir_p.shape[0] != Hp or ir_p.shape[1] != Wp:
-        return False
-    dl = cached["d_lum"]
-    dc = cached["d_chr"]
-    if not hasattr(dl, "shape") or not hasattr(dc, "shape"):
-        return False
-    if tuple(dl.shape[:2]) != (Hp, Wp) or tuple(dc.shape[:2]) != (Hp, Wp):
-        return False
-    if len(dl.shape) != 3 or len(dc.shape) != 3:
-        return False
-    im = cached["img"]
-    if np.asarray(im).shape[:2] != (Hp, Wp) or np.asarray(im).shape[2] != 3:
-        return False
-    return True
+from params import L0, L1, L2, RENDER, TRAIN, VIZ
 
 
 def build_l0_pix(
@@ -131,104 +81,57 @@ def build_l0_pix(
     return out
 
 
-def _as_torch_cell_field(v, shape: tuple[int, ...], *, dtype=torch.float32):
-    """Convert ``cells`` field from numpy or existing tensor → float/bool tensor."""
-    if isinstance(v, torch.Tensor):
-        t = v
-        if t.dtype == torch.bool:
-            return t.reshape(shape).contiguous()
-        return t.reshape(shape).to(dtype=dtype).contiguous()
-    arr = np.asarray(v)
-    if arr.dtype == bool or arr.dtype == np.bool_:
-        return torch.from_numpy(arr.reshape(shape).astype(np.bool_))
-    return torch.from_numpy(arr.reshape(shape).astype(np.float32))
-
-
 def build_cells_flat(cells: dict) -> dict:
     nH, nW = cells["nH"], cells["nW"]
     N = nH * nW
-    result = {
+    return {
         "nH": nH,
         "nW": nW,
-        "theta": _as_torch_cell_field(cells["theta"], (N, 2)),
-        "q": _as_torch_cell_field(cells["q"], (N, 2)),
-        "kappa": _as_torch_cell_field(cells["kappa"], (N, 2)),
-        "z1_abs_sum": _as_torch_cell_field(cells["z1_abs_sum"], (N,)),
-        "lam": _as_torch_cell_field(cells["lam"], (N, 2)),
-        "lam3": _as_torch_cell_field(cells["lam3"], (N,)),
-        "z0": _as_torch_cell_field(cells["z0"], (N,)),
-        "cx_z2": _as_torch_cell_field(cells["cx_z2"], (N,)),
-        "cy_z2": _as_torch_cell_field(cells["cy_z2"], (N,)),
-        "is_border": _as_torch_cell_field(cells["is_border"], (N,)),
+        "theta": torch.from_numpy(cells["theta"].reshape(N, 2).astype(np.float32)),
+        "q": torch.from_numpy(cells["q"].reshape(N, 2).astype(np.float32)),
+        "kappa": torch.from_numpy(cells["kappa"].reshape(N, 2).astype(np.float32)),
+        "z1_abs_sum": torch.from_numpy(cells["z1_abs_sum"].reshape(N).astype(np.float32)),
+        "lam": torch.from_numpy(cells["lam"].reshape(N, 2).astype(np.float32)),
+        "lam3": torch.from_numpy(cells["lam3"].reshape(N).astype(np.float32)),
+        "z0": torch.from_numpy(cells["z0"].reshape(N).astype(np.float32)),
+        "cx_z2": torch.from_numpy(cells["cx_z2"].reshape(N).astype(np.float32)),
+        "cy_z2": torch.from_numpy(cells["cy_z2"].reshape(N).astype(np.float32)),
+        "is_border": torch.from_numpy(cells["is_border"].reshape(N).astype(np.bool_)),
     }
-    result["kappa_col_cell"] = _as_torch_cell_field(
-        cells["kappa_col_cell"], (nH, nW),
-    )
-    result["e_col_cell"] = _as_torch_cell_field(cells["e_col_cell"], (nH, nW))
-    result["rho_max_cell"] = _as_torch_cell_field(cells["rho_max_cell"], (nH, nW))
-    return result
 
 
-def run_l1_live_cells(
-    model: nn.Module,
-    h2m: torch.Tensor,
-    theta_h: torch.Tensor,
-    border_mask: torch.Tensor,
-    H0: int,
-    W0: int,
-) -> dict[str, torch.Tensor]:
-    """Run L1 with ``model.seed.hc_seed``; tensors stay on ``h2m.device`` for autograd."""
-    cells = run_l1_hypercolumn(
-        h2m,
-        theta_h,
-        border_mask.bool(),
-        model.seed.hc_seed,
-        P=L1.PATCH_SIZE,
-        patch_overlap=L1.PATCH_OVERLAP,
-        border_patch_max_frac=L1.BORDER_PATCH_MAX_FRAC,
-        verbose=False,
-        eps=float(L1.EPS),
-        cells_format="torch",
-    )
-    P = int(cells["P"])
-    nH, nW = int(cells["nH"]), int(cells["nW"])
-    cy_hw = cells["cy"].reshape(nH, nW)
-    cx_hw = cells["cx"].reshape(nH, nW)
-    ib_hw = cells["is_border"].reshape(nH, nW)
-    out_b = ib_hw | (cy_hw + P / 2 > float(H0)) | (cx_hw + P / 2 > float(W0))
-    cells["is_border"] = out_b.reshape(-1)
-    return build_cells_flat(cells)
-
-
-class HarmonicContourE2E(nn.Module):
+class StriateE2E(nn.Module):
     def __init__(
         self,
         r_pool: int,
-        stride: int,
+        K: int,
+        t_refine: int,
         eps: float,
-        eta_z_init: float | None = None,
+        eta_z_init: float = L2.ETA_Z_INIT,
         render_cell_hidden: int = RENDER.CELL_HIDDEN,
         render_pixel_hidden: int = RENDER.PIXEL_HIDDEN,
+        **kw,
     ):
         super().__init__()
-        _ = render_cell_hidden
-        self.seed = RhoSeedModule(
+        _ = kw  # legacy kwargs (e.g. stride) ignored
+        self.dynamics = TileDynamics(
             r_pool=r_pool,
-            stride=stride,
+            K=K,
+            t_refine=t_refine,
             eps=eps,
             eta_z_init=eta_z_init,
+            tbptt_n_segments=TRAIN.L2_SNAPSHOT_MAX,
         )
+        _ = render_cell_hidden
         self.renderer = ModulationRenderer(hidden=render_pixel_hidden)
         self.eps = eps
         self.render_eps = max(float(eps), 1e-6)
 
     def forward_batch(self, meta_list):
-        """Render boundary maps from cached L0 + live L1 ``cells_flat``."""
         bmaps = []
         for m in meta_list:
             cf_flat = m["cells_flat_dev"]
-            rho_out, branch, _, _, _, _, _ = self.seed(cells_flat=cf_flat)
-
+            rho_out, branch, _, _, _, _, _ = self.dynamics(cells_flat=cf_flat)
             bmap = render_boundary_map_torch(
                 rho_out,
                 m["proj_dev"],
@@ -243,58 +146,39 @@ class HarmonicContourE2E(nn.Module):
                 content_h=m["H0"],
                 content_w=m["W0"],
             )
-
             bmaps.append(bmap)
         return bmaps
 
 
-def prepare_batch(items, device, model: nn.Module):
+def prepare_batch(items, device):
     meta = []
     for item in items:
-        (gi, gt, Hp, Wp, Hg, Wg, H0, W0, l0_pix, img, d_lum, d_chr, border_mask,
-         h2m, theta_h) = item
-        h2m_d = h2m.to(device=device, dtype=torch.float32).contiguous()
-        theta_d = theta_h.to(device=device, dtype=torch.float32).contiguous()
-        if border_mask is None:
-            bm_d = torch.zeros(
-                h2m_d.shape[:2], device=device, dtype=torch.bool,
-            )
-        else:
-            bm_d = border_mask.to(device=device).bool()
-        cf_flat = run_l1_live_cells(
-            model, h2m_d, theta_d, bm_d, int(H0), int(W0),
-        )
+        (gi, gt, Hp, Wp, Hg, Wg, H0, W0, cells_flat, l0_pix, img) = item
         cf_dev = {
             k: (v.to(device) if isinstance(v, torch.Tensor) else v)
-            for k, v in cf_flat.items()
+            for k, v in cells_flat.items()
         }
         l0_dev = {
             k: v.to(device) for k, v in l0_pix.items()
         }
         p_dev = proj_to_device(gi, device)
-        m = {
-            "nH": cf_flat["nH"],
-            "nW": cf_flat["nW"],
-            "proj_dev": p_dev,
-            "gt": gt.to(device),
-            "Hp": Hp,
-            "Wp": Wp,
-            "Hg": Hg,
-            "Wg": Wg,
-            "H0": H0,
-            "W0": W0,
-            "cells_flat_dev": cf_dev,
-            "l0_pix": l0_dev,
-            "img": img,
-        }
-        # Pass-2 η modulation data (may be None when absent)
-        if d_lum is not None:
-            m["d_lum"] = d_lum.to(device)
-        if d_chr is not None:
-            m["d_chr"] = d_chr.to(device)
-        if border_mask is not None:
-            m["border_mask"] = border_mask.to(device)
-        meta.append(m)
+        meta.append(
+            {
+                "nH": cells_flat["nH"],
+                "nW": cells_flat["nW"],
+                "proj_dev": p_dev,
+                "gt": gt.to(device),
+                "Hp": Hp,
+                "Wp": Wp,
+                "Hg": Hg,
+                "Wg": Wg,
+                "H0": H0,
+                "W0": W0,
+                "cells_flat_dev": cf_dev,
+                "l0_pix": l0_dev,
+                "img": img,
+            }
+        )
     return meta
 
 
@@ -321,21 +205,13 @@ def _find_gt_path_png(gt_dir, stem):
     return matches[0] if matches else None
 
 
-def precompute_image(img_path, gt_path, gt_format, *, cached: dict | None = None):
+def precompute_image(img_path, gt_path, gt_format):
     ir_np = np.array(Image.open(img_path).convert("RGB")).astype(np.float32) / 255.0
     ir_np = np.clip(ir_np, 0, 1)
     ir_p, H0, W0 = pad_for_patch_grid(ir_np, L1.PATCH_SIZE, L1.PATCH_OVERLAP)
     del ir_np
 
     ir_t = torch.from_numpy(ir_p)
-    sig = _l0_dist_signature(ir_p, H0, W0)
-
-    if _can_reuse_l0_dist_tensors(cached, sig, ir_p):
-        d_lum = cached["d_lum"].to(device=ir_t.device, dtype=torch.float32).contiguous()
-        d_chr = cached["d_chr"].to(device=ir_t.device, dtype=torch.float32).contiguous()
-    else:
-        d_lum, d_chr = _compute_d_lum_chroma(ir_t, L0.OFFSETS)
-
     h, vld, _, _, _, s, h1m, h2m, h2m_lum, h2m_chr = compute_l0_rgb(
         ir_t,
         eta_lum=L0.ETA_LUM,
@@ -345,28 +221,45 @@ def precompute_image(img_path, gt_path, gt_format, *, cached: dict | None = None
     )
     border_mask_t = ~compute_interior(ir_p.shape[0], ir_p.shape[1], ir_t.device)
 
-    theta_h = (0.5 * torch.atan2(s[..., 3], s[..., 2])).to(torch.float32)
-    theta_h = torch.where(border_mask_t, torch.zeros_like(theta_h), theta_h)
+    z1, z2 = z_from_l0_harmonics(s, border_mask_t)
 
     s_np = s.cpu().numpy()
     border_mask_np = border_mask_t.cpu().numpy()
+    z2_image = (s_np[..., 2] + 1j * s_np[..., 3]).astype(np.complex64)
+    z2_image[border_mask_np] = 0.0
+
     l0_pix = build_l0_pix(
         s_np, h1m, h2m, border_mask_np, h2m_lum=h2m_lum, h2m_chr=h2m_chr,
     )
-    del h, vld, s, h1m, h2m_lum, h2m_chr
+    del h, vld, s, h1m, h2m, h2m_lum, h2m_chr
     gc.collect()
 
-    H_p, W_p = int(ir_p.shape[0]), int(ir_p.shape[1])
-    S = stride_from_patch_overlap(L1.PATCH_SIZE, L1.PATCH_OVERLAP)
-    nH = (H_p - L1.PATCH_SIZE) // S + 1 if H_p >= L1.PATCH_SIZE else 0
-    nW = (W_p - L1.PATCH_SIZE) // S + 1 if W_p >= L1.PATCH_SIZE else 0
-    proj_info = {"H": H_p, "W": W_p, "nH": nH, "nW": nW, "n_cells": nH * nW}
+    cells = run_l1(
+        z1,
+        z2,
+        L1.PATCH_SIZE,
+        border_mask=border_mask_t,
+        patch_overlap=L1.PATCH_OVERLAP,
+        border_patch_max_frac=L1.BORDER_PATCH_MAX_FRAC,
+        eps=L1.EPS,
+        verbose=False,
+    )
+    del z1, z2
+    gc.collect()
 
-    h2m_cpu = h2m.detach().cpu().contiguous().float()
-    theta_h_cpu = theta_h.detach().cpu().contiguous().float()
-    border_mask_cpu = border_mask_t.cpu().contiguous()
+    P = cells["P"]
+    cells["is_border"] |= (cells["cy"] + P / 2 > H0) | (cells["cx"] + P / 2 > W0)
 
-    del h2m, theta_h, border_mask_t, ir_t
+    nH, nW = cells["nH"], cells["nW"]
+
+    proj_info = compute_render_features(
+        z2_image,
+        ir_p,
+        cells,
+        border_mask_np,
+        eps=L2.EPS,
+    )
+    del z2_image, border_mask_np
     gc.collect()
 
     if gt_format == "mat":
@@ -374,16 +267,17 @@ def precompute_image(img_path, gt_path, gt_format, *, cached: dict | None = None
     else:
         gt = load_png_gt(gt_path)
 
+    H_p, W_p = ir_p.shape[:2]
     H_gt, W_gt = gt.shape
 
+    cells_flat = build_cells_flat(cells)
+
     img_cached = ir_p.astype(np.float32)
-    del ir_p
+    del cells, ir_p
     gc.collect()
 
     return {
         "cache_version": TRAIN.CACHE_VERSION,
-        "l0_dist_cache_version": int(L0.L0_DIST_CACHE_VERSION),
-        "l0_dist_signature": sig,
         "proj_info": proj_info,
         "gt": torch.from_numpy(gt),
         "H_p": H_p,
@@ -392,21 +286,16 @@ def precompute_image(img_path, gt_path, gt_format, *, cached: dict | None = None
         "W_gt": W_gt,
         "H0": H0,
         "W0": W0,
+        "cells_flat": cells_flat,
         "l0_pix": l0_pix,
         "img": img_cached,
-        "d_lum": d_lum.cpu(),
-        "d_chr": d_chr.cpu(),
-        "border_mask": border_mask_cpu,
-        "h2m": h2m_cpu,
-        "theta_h": theta_h_cpu,
     }
 
 
 def _precompute_one(args):
     img_path, gt_path, gt_format, cache_path = args
-    cached = _load_cache_entry(cache_path) if os.path.exists(cache_path) else None
     try:
-        data = precompute_image(img_path, gt_path, gt_format, cached=cached)
+        data = precompute_image(img_path, gt_path, gt_format)
         torch.save(data, cache_path)
         return os.path.splitext(os.path.basename(img_path))[0]
     except Exception as e:
@@ -424,9 +313,17 @@ def _cache_entry_valid(data: dict) -> bool:
     need_pi = ("H", "W", "n_cells", "nH", "nW")
     if not all(k in pi for k in need_pi):
         return False
-    for key in ("h2m", "theta_h", "border_mask"):
-        t = data.get(key)
-        if not isinstance(t, torch.Tensor):
+    cf = data.get("cells_flat")
+    if not isinstance(cf, dict):
+        return False
+    for key in (
+        "cx_z2",
+        "cy_z2",
+        "z0",
+        "q",
+        "kappa",
+    ):
+        if key not in cf:
             return False
     l0 = data.get("l0_pix")
     if not isinstance(l0, dict):
@@ -530,8 +427,6 @@ class StriateDataset(Dataset):
                 f'Cache for "{stem}" is stale or incomplete '
                 f"(cache_version={data.get('cache_version')!r}, "
                 f"expected {TRAIN.CACHE_VERSION}; "
-                f"l0_dist_cache_version={data.get('l0_dist_cache_version')!r}, "
-                f"expected {L0.L0_DIST_CACHE_VERSION}; "
                 f"proj_info must include render grid keys). "
                 f"Delete {self.cache_dir} and re-run training."
             )
@@ -546,13 +441,9 @@ class StriateDataset(Dataset):
             data["W_gt"],
             H0,
             W0,
+            data["cells_flat"],
             data["l0_pix"],
             data.get("img"),
-            data.get("d_lum"),
-            data.get("d_chr"),
-            data.get("border_mask"),
-            data["h2m"],
-            data["theta_h"],
         )
 
 
@@ -594,11 +485,9 @@ def bce_loss_with_ignore(
     eta_neg: float = 0.5,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Class-balanced mean BCE on non-ignored pixels (same η± edge band as soft Dice).
+    """Mean BCE on non-ignored pixels (same η± edge band as soft Dice).
 
     Valid = (target≥η_pos) ∨ (target<η_neg); label y = 1 on positives, 0 on negatives.
-    Positives are weighted by ``n_neg / n_pos`` so edge and non-edge pixels contribute
-    equal total loss mass (BSDS is ~5–10% edges).
     """
     pred = pred.nan_to_num(0.0).clamp(eps, 1.0 - eps)
     pos_mask = target >= eta_pos
@@ -609,187 +498,20 @@ def bce_loss_with_ignore(
     y = pos_mask.float()
     v = valid.float()
     bce = F.binary_cross_entropy(pred, y, reduction="none")
-    n_pos = (v * y).sum()
-    n_neg = (v * (1.0 - y)).sum()
-    if n_pos < eps or n_neg < eps:
-        weight = v
-    else:
-        weight = v * (y * (n_neg / (n_pos + eps)) + (1.0 - y))
-    return (bce * weight).sum() / weight.sum().clamp_min(eps)
+    return (bce * v).sum() / v.sum().clamp_min(eps)
 
 
-def focal_bce_loss_with_ignore(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    eta_pos: float = 0.5,
-    eta_neg: float = 0.5,
-    gamma: float = 2.0,
-    eps: float = 1e-6,
-) -> torch.Tensor:
-    """HED β-weighted focal BCE on non-ignored pixels (η± edge band).
-
-    Focal modulation ``(1 - p_t)^γ`` down-weights easy pixels; class balance uses
-    ``β = n_neg / (n_pos + n_neg)`` on positives and ``1 - β`` on negatives.
-    """
-    pred = pred.nan_to_num(0.0).clamp(eps, 1.0 - eps)
-    pos_mask = target >= eta_pos
-    neg_mask = target < eta_neg
-    valid = pos_mask | neg_mask
-    if not valid.any():
-        return pred.sum() * 0.0
-    y = pos_mask.float()
-    v = valid.float()
-    n_pos = (v * y).sum()
-    n_neg = (v * (1.0 - y)).sum()
-    beta = n_neg / (n_pos + n_neg + eps)
-    pt = y * pred + (1.0 - y) * (1.0 - pred)
-    focal_weight = (1.0 - pt).pow(gamma)
-    class_weight = y * beta + (1.0 - y) * (1.0 - beta)
-    bce = F.binary_cross_entropy(pred, y, reduction="none")
-    return (bce * v * focal_weight * class_weight).sum() / v.sum().clamp_min(eps)
-
-
-def remap_checkpoint_state_dict(sd: dict) -> dict:
-    """Remap legacy dynamics/eta keys; warm-start new β params when absent.
-
-    ``seed._eta_rho_raw`` / ``dynamics._eta_rho_raw`` are omitted.  Legacy ``eta_mod_*``,
-    ``eta_mlp.*``, Heeger ``_sigma_sat_raw``, and ``_alpha_raw`` are dropped.
-
-    ``η_z``: pass through ``seed.hc_seed._eta_z_raw``; map buffer ``_eta_z_fixed`` or
-    orphan ``dynamics._eta_z_raw`` / ``seed._eta_z_raw`` into ``_eta_z_raw`` when needed.
-    Old ``_eta_pass_raw`` / ``_eta0_raw`` seeds ``η_p`` when ``_eta_p_raw`` is missing.
-    Legacy ``_beta_seed_raw``, ``_beta_coll_raw``, ``_beta_cross_raw`` warm-start new β keys.
-    """
-    skip = frozenset({"seed._eta_rho_raw", "dynamics._eta_rho_raw"})
-    out: dict = {}
-    legacy_eta_pass_raw: torch.Tensor | None = None
-    legacy_eta0_raw: torch.Tensor | None = None
-    legacy_sigma_sat_raw: torch.Tensor | None = None
-    legacy_orphan_eta_z_raw: torch.Tensor | None = None
-    legacy_eta_z_fixed: torch.Tensor | None = None
-    legacy_beta_seed_raw: torch.Tensor | None = None
-    legacy_beta_coll_raw: torch.Tensor | None = None
-    legacy_beta_cross_raw: torch.Tensor | None = None
-    drop_suffixes = (
-        "seed.hc_seed._sigma_sat_raw",
-        "seed.hc_seed._eta0_raw",
-        "seed.hc_seed._alpha_raw",
-        "seed.hc_seed._gaba_alpha_raw",
-    )
-    for k, v in sd.items():
-        if k in skip:
-            continue
-        if k in ("eta_mod_d", "eta_mod_a", "eta_mod_b", "eta_mod_c"):
-            continue
-        if k.startswith("eta_mlp."):
-            continue
-        if k in drop_suffixes:
-            if k == "seed.hc_seed._sigma_sat_raw":
-                legacy_sigma_sat_raw = v
-            if k == "seed.hc_seed._eta0_raw":
-                legacy_eta0_raw = v
-            continue
-        if k == "seed.hc_seed._beta_seed_raw":
-            legacy_beta_seed_raw = v
-            continue
-        if k == "seed.hc_seed._beta_coll_raw":
-            legacy_beta_coll_raw = v
-            continue
-        if k == "seed.hc_seed._beta_cross_raw":
-            legacy_beta_cross_raw = v
-            continue
-        if k in ("seed.hc_seed._tau_raw", "seed.hc_seed._gain_alpha_raw"):
-            continue
-        if k == "seed.hc_seed._heeger_sigma_mean_alpha_raw":
-            continue
-        if k == "seed.hc_seed._eta_pass_raw":
-            legacy_eta_pass_raw = v
-            continue
-        if k == "seed.hc_seed._eta_z_fixed":
-            legacy_eta_z_fixed = v
-            continue
-        if k in ("dynamics._eta_z_raw", "seed._eta_z_raw"):
-            legacy_orphan_eta_z_raw = v
-            continue
-        if k.startswith("dynamics."):
-            continue
-        out[k] = v
-    if "seed.hc_seed._eta_z_raw" not in out:
-        if legacy_eta_z_fixed is not None and legacy_eta_z_fixed.numel() >= 1:
-            ez = float(legacy_eta_z_fixed.reshape(-1)[0].detach().cpu())
-            out["seed.hc_seed._eta_z_raw"] = torch.tensor(
-                [_inv_softplus(max(ez, 1e-6))], dtype=torch.float32
-            )
-        elif legacy_orphan_eta_z_raw is not None and legacy_orphan_eta_z_raw.numel() >= 1:
-            out["seed.hc_seed._eta_z_raw"] = legacy_orphan_eta_z_raw.reshape(-1)[0].clone().float()
-    if "seed.hc_seed._eta_p_raw" not in out:
-        src = legacy_eta_pass_raw
-        if src is None and legacy_eta0_raw is not None:
-            src = legacy_eta0_raw
-        if src is None and legacy_sigma_sat_raw is not None:
-            src = legacy_sigma_sat_raw
-        if src is not None and src.numel() >= 1:
-            out["seed.hc_seed._eta_p_raw"] = src.reshape(-1)[0].clone().float()
-        else:
-            out["seed.hc_seed._eta_p_raw"] = torch.tensor(
-                [_inv_softplus(float(SEED.ETA_P))], dtype=torch.float32
-            )
-    if "seed.hc_seed._beta_seed_raw" not in out:
-        if legacy_beta_seed_raw is not None and legacy_beta_seed_raw.numel() >= 1:
-            out["seed.hc_seed._beta_seed_raw"] = legacy_beta_seed_raw.reshape(-1)[0].clone().float()
-        else:
-            out["seed.hc_seed._beta_seed_raw"] = torch.tensor(
-                [_inv_softplus(float(SEED.BETA_SEED))], dtype=torch.float32
-            )
-    if "seed.hc_seed._beta_c_raw" not in out:
-        if legacy_beta_coll_raw is not None and legacy_beta_coll_raw.numel() >= 1:
-            out["seed.hc_seed._beta_c_raw"] = legacy_beta_coll_raw.reshape(-1)[0].clone().float()
-        else:
-            out["seed.hc_seed._beta_c_raw"] = torch.tensor(
-                [_inv_softplus(float(SEED.BETA_C))], dtype=torch.float32
-            )
-    if "seed.hc_seed._beta_f_raw" not in out:
-        out["seed.hc_seed._beta_f_raw"] = torch.tensor(
-            [_inv_softplus(float(SEED.BETA_F))], dtype=torch.float32
-        )
-    if "seed.hc_seed._beta_x_raw" not in out:
-        if legacy_beta_cross_raw is not None and legacy_beta_cross_raw.numel() >= 1:
-            out["seed.hc_seed._beta_x_raw"] = legacy_beta_cross_raw.reshape(-1)[0].clone().float()
-        else:
-            out["seed.hc_seed._beta_x_raw"] = torch.tensor(
-                [_inv_softplus(float(SEED.BETA_X))], dtype=torch.float32
-            )
-    if "seed.hc_seed._alpha_t_raw" not in out:
-        out["seed.hc_seed._alpha_t_raw"] = torch.tensor(
-            [_inv_softplus(max(float(L1.COL_SIGMA_T) / float(L1.COL_RADIUS), 1e-4))],
-            dtype=torch.float32,
-        )
-    if "seed.hc_seed._alpha_iso_raw" not in out:
-        out["seed.hc_seed._alpha_iso_raw"] = torch.tensor(
-            [_inv_softplus(max(float(L1.COL_SIGMA_ISO) / float(L1.COL_RADIUS), 1e-4))],
-            dtype=torch.float32,
-        )
-    return out
-
-
-def debug_drive_batch(
-    model,
-    meta_list,
-    device,
-    *,
-    lam_dice=1.0,
-    lam_bce=0.0,
-    lam_focal=0.0,
-    focal_gamma=2.0,
-):
-    """One training batch: seed/renderer grads sanity check."""
+def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
+    """One training batch: drive term stats + ∂loss/∂(b_coll, η_iso, …)."""
     model.train()
-    s = model.seed
+    d = model.dynamics
     meta = meta_list[0]
     cf = meta["cells_flat_dev"]
 
     model.zero_grad(set_to_none=True)
-    rho_out, _, _, _, _, cf_out, _ = s(cells_flat=cf)
+    rho_out, _, _, _, _, cf_out, diags = d(
+        cf, return_drive_debug=True,
+    )
     bmap = render_boundary_map_torch(
         rho_out,
         meta["proj_dev"],
@@ -811,55 +533,38 @@ def debug_drive_batch(
         loss = loss + lam_bce * bce_loss_with_ignore(
             bmap[:Hg, :Wg], meta["gt"][:Hg, :Wg],
         )
-    if lam_focal:
-        loss = loss + lam_focal * focal_bce_loss_with_ignore(
-            bmap[:Hg, :Wg], meta["gt"][:Hg, :Wg], gamma=focal_gamma,
-        )
     loss.backward()
 
-    print("\n--- seed + renderer grad debug ---")
+    print("\n--- L2 drive debug (last refine step, interior cells) ---")
+    if diags and "drive_debug" in diags:
+        for k, v in diags["drive_debug"].items():
+            print(f"  {k}: {v:.4f}")
     print("\n  learned (value):")
-    print(
-        f"    η_z={float(s.hc_seed.eta_z.detach()):.4f}  "
-        f"η_p={float(s.hc_seed.eta_p.detach()):.4f}  "
-        f"β_seed={float(s.hc_seed.beta_seed.detach()):.4f}  "
-        f"β_c={float(s.hc_seed.beta_c.detach()):.4f}",
-    )
+    for name in (
+        "b_coll", "b_seed", "b_iso", "b_cross",
+        "eta_coll", "eta_iso", "eta_cross", "eta_p",
+        "eta_z",
+    ):
+        p = getattr(d, name)
+        val = float(p.detach()) if not isinstance(p, torch.Tensor) else float(p.item())
+        print(f"    {name}={val:.4f}")
     print("\n  |grad| on raw params:")
     for raw, label in (
-        ("_eta_z_raw", "η_z"),
-        ("_eta_p_raw", "η_p"),
-        ("_beta_seed_raw", "β_seed"),
-        ("_beta_c_raw", "β_c"),
-        ("_beta_f_raw", "β_f"),
-        ("_beta_x_raw", "β_x"),
+        ("_b_coll_raw", "b_coll"),
+        ("_b_seed_raw", "b_seed"),
+        ("_b_iso_raw", "b_iso"),
+        ("_b_cross_raw", "b_cross"),
+        ("_eta_coll_raw", "eta_coll"),
+        ("_eta_iso_raw", "eta_iso"),
+        ("_eta_cross_raw", "eta_cross"),
+        ("_eta_p_raw", "eta_p"),
+        ("_eta_z_raw", "eta_z"),
     ):
-        t = getattr(s.hc_seed, raw, None)
+        t = getattr(d, raw, None)
         if t is None or t.grad is None:
             print(f"    {label}: grad=None")
         else:
             print(f"    {label}: |grad|={t.grad.abs().mean().item():.2e}")
-    for name, t in model.renderer.thinning.named_parameters():
-        if t.grad is None:
-            print(f"    thinning.{name}: grad=None")
-        else:
-            print(f"    thinning.{name}: |grad|={t.grad.abs().mean().item():.2e}")
-    for raw, label in (("_s_t_raw", "s_t"), ("_s_n_raw", "s_n")):
-        t = getattr(model.renderer, raw, None)
-        if t is None or t.grad is None:
-            print(f"    renderer.{label}: grad=None")
-        else:
-            print(f"    renderer.{label}: |grad|={t.grad.abs().mean().item():.2e}")
-    for raw, label in (
-        ("_alpha_d_raw", "α_d"),
-        ("_alpha_t_raw", "α_t"),
-        ("_alpha_iso_raw", "α_iso"),
-    ):
-        t = getattr(s.hc_seed, raw, None)
-        if t is None or t.grad is None:
-            print(f"    seed.hc_seed.{label}: grad=None")
-        else:
-            print(f"    seed.hc_seed.{label}: |grad|={t.grad.abs().mean().item():.2e}")
     print(f"\n  loss={loss.item():.4f}  requires_grad={loss.requires_grad}\n")
 
 
@@ -872,7 +577,7 @@ def plot_training_curves(history, out_dir):
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 5), facecolor=VIZ.BG)
     fig.suptitle(
-        "harmonic-contour-integration  L1 seed + render",
+        "STRIATE unified dynamics  learned ridge render",
         fontsize=12,
         color=VIZ.FG,
         fontfamily="monospace",
@@ -903,14 +608,6 @@ def plot_training_curves(history, out_dir):
             lw=1.0,
             label="BCE (mean)",
         )
-    if history and "loss_focal" in history[0]:
-        axes[0].plot(
-            epochs,
-            [h["loss_focal"] for h in history],
-            color="#ff88ff",
-            lw=1.0,
-            label="focal BCE (mean)",
-        )
     axes[0].legend(fontsize=7, facecolor="#111", edgecolor="#333", labelcolor=VIZ.FG)
     axes[0].set_title("train loss", fontsize=9, color=VIZ.FG, fontfamily="monospace")
     axes[1].plot(epochs, lrs, color="#ffaa44", lw=1.2)
@@ -923,55 +620,60 @@ def plot_training_curves(history, out_dir):
     print(f"  saved {p}")
 
 
-def format_seed_param_lines(seed: RhoSeedModule, *, indent: str = "  ") -> list[str]:
-    """Learned seed NR + pass NR scalars (infer / train logging)."""
-    hc = seed.hc_seed
-    sig_d, sig_t = hc.collinear_sigmas(float(L1.COL_RADIUS))
-    sig_iso = hc.cross_sigma(float(L1.COL_RADIUS))
+def format_l2_param_lines(d, *, indent: str = "  ") -> list[str]:
+    """Multi-line L2 learned-parameter summary (infer / train logging)."""
+    sub = indent + "  "
     return [
-        f"{indent}tile geometry:  R={seed.R}  stride={seed.stride}",
-        f"{indent}seed η_z:  {hc.eta_z.item():.3f}  |  pass η_p:  {hc.eta_p.item():.4f}",
-        f"{indent}β_seed={hc.beta_seed.item():.3f}  β_c={hc.beta_c.item():.3f}  "
-        f"β_f={hc.beta_f.item():.3f}  β_x={hc.beta_x.item():.3f}",
-        f"{indent}kernel σ:  σ_d={sig_d.item():.3f}  σ_t={sig_t.item():.3f}  "
-        f"σ_iso={sig_iso.item():.3f}  (R={L1.COL_RADIUS})",
+        f"{indent}geometry:  K={d.K}  R={d.R}  T_refine={d.T_refine}",
+        f"{indent}binning:   hard peak θ-bin per cell",
+        f"{indent}drive:",
+        f"{sub}b_coll={d.b_coll.item():.3f}  b_seed={d.b_seed.item():.3f}",
+        f"{indent}inhibition:",
+        f"{sub}b_iso={d.b_iso.item():.3f}  b_cross={d.b_cross.item():.3f}",
+        f"{indent}pool NR (η):",
+        f"{sub}η_coll={d.eta_coll.item():.3f}  η_iso={d.eta_iso.item():.3f}  "
+        f"η_cross={d.eta_cross.item():.3f}  η_p={d.eta_p.item():.3f}",
+        f"{indent}seed:  η_z={d.eta_z.item():.3f}  "
+        f"(ρ_seed = λ₁/(λ₁+λ₂+η_z))",
     ]
 
 
-def format_renderer_param_lines(r: ModulationRenderer, *, indent: str = "  ") -> list[str]:
-    n_th = sum(p.numel() for p in r.thinning.parameters())
-    n_st = 2  # _s_t_raw, _s_n_raw
+def format_renderer_param_lines(r, *, indent: str = "  ") -> list[str]:
+    _ = (r, indent)
     return [
-        f"{indent}readout:  tang/norm h2m stencils (s_t, s_n) + 14-D gate",
-        f"{indent}thinning head:  14→8→1 MLP  ({n_th} params)  + stencil spacings ({n_st})",
-        f"{indent}κ_col:  cosine ρ vs S from L1 (cells_flat; not a recurrence gate)",
+        f"{indent}cell→pixel: bilinear resize (ρ and θ via double-angle); no render params",
     ]
 
 
-def _format_seed_block(model: HarmonicContourE2E) -> str:
-    s = model.seed
+def _format_dynamics_params(model):
+    d = model.dynamics
     parts = [
-        "\n--- L1 seed (NR) ---\n",
-        *[ln + "\n" for ln in format_seed_param_lines(s, indent="")],
-        "\nρ: raw → η_z seed NR (μ→[0,1]) → pass NR: "
-        "drive=ρ_seed·(β_seed+β_c·s_coll); "
-        "ρ←drive²/(drive²+η_p²+β_f·s_flank²+β_x·s_cross²+ε)  "
-        "(η_z, η_p, β_*, σ_d/σ_t/σ_iso learned; pools kernel-normalized) → dominant ρ × tile_interior\n",
+        "\n--- L2 ---\n",
+        *[ln + "\n" for ln in format_l2_param_lines(d, indent="")],
+        "\n--- dynamics ---\n",
+        "drive = b_seed·ρ_seed + b_coll·ρ̃_coll\n",
+        "ρ = drive² / (drive² + b_iso·c̃_iso + b_cross·c̃_cross + η_p² + ε)\n",
+        "  ρ̃_coll = ρ_coll²/(ρ_coll²+η_coll²);  c̃_iso, c̃_cross analogous\n",
+        "conv2d pools on cell grid each step; T_refine iterations\n",
     ]
     return "".join(parts)
 
 
-def format_model_param_counts(model: HarmonicContourE2E):
-    n_seed = sum(p.numel() for p in model.seed.parameters())
+def format_model_param_counts(model):
+    d = model.dynamics
+    n_dyn = sum(p.numel() for p in d.parameters())
     n_renderer = sum(p.numel() for p in model.renderer.parameters())
     n_total = sum(p.numel() for p in model.parameters())
-    return n_total, n_seed, n_renderer
+    return n_total, n_dyn, n_renderer
 
 
-def _format_render_params(model: HarmonicContourE2E):
+def _format_render_params(model):
     r = model.renderer
     n_r = sum(p.numel() for p in r.parameters())
-    return f"renderer={n_r} params  (stencils + thinning 14→8→1)"
+    return (
+        f"renderer={n_r} params  "
+        f"(bilinear ρ / θ upsample; no learned σ)"
+    )
 
 
 def save_checkpoint(model, path):
@@ -1036,18 +738,6 @@ def main():
         help="weight on BCE term (0 disables)",
     )
     ap.add_argument(
-        "--lam_focal",
-        type=float,
-        default=TRAIN.LAM_FOCAL,
-        help="weight on HED β-weighted focal BCE term (0 disables)",
-    )
-    ap.add_argument(
-        "--focal_gamma",
-        type=float,
-        default=TRAIN.FOCAL_GAMMA,
-        help="focal loss γ (modulation exponent; typical 2)",
-    )
-    ap.add_argument(
         "--debug-drive",
         action="store_true",
         help="Run one batch, print drive term stats and param gradients, then exit",
@@ -1067,21 +757,22 @@ def main():
         f"  max_train={mt}"
     )
     print(
-        f"Seed: R={SEED.R_POOL}  stride={SEED.STRIDE}  "
-        f"ρ = raw → η_z NR → pass NR (x²/(x²+η_p²+ε)) → dominant λ  "
-        f"× tile_interior"
+        f"Dynamics: R={L2.R_POOL}  K={L2.K}  "
+        f"T={L2.T_REFINE}  "
+        f"drive²/(drive² + b_iso·c̃_iso + b_cross·c̃_cross + η_p²); "
+        f"ρ_seed = λ₁/(λ₁+λ₂+η_z); "
+        f"  TBPTT: {TRAIN.L2_SNAPSHOT_MAX} segments  "
+        f"window=max(1, T//{TRAIN.L2_SNAPSHOT_MAX})  (full grad per segment)"
     )
     print(
-        f"Render: harmonic-native h2m·gate  "
-        f"(L1 collinear pass NR: R={L1.COL_RADIUS}, K={L1.COL_K_BINS}, passes={L1.COL_PASSES})"
+        f"Render: bilinear cell grid → pixel ρ (and θ); no render MLP / no splat"
     )
     print(
-        f"Loss: λ_dice·soft-Dice + λ_bce·balanced BCE + λ_focal·focal BCE (η± edge band)  "
-        f"λ_dice={args.lam_dice:g}  λ_bce={args.lam_bce:g}  "
-        f"λ_focal={args.lam_focal:g}  γ={args.focal_gamma:g}"
+        f"Loss: λ_dice·soft-Dice + λ_bce·BCE (η± edge band)  "
+        f"λ_dice={args.lam_dice:g}  λ_bce={args.lam_bce:g}"
     )
-    if args.lam_dice == 0.0 and args.lam_bce == 0.0 and args.lam_focal == 0.0:
-        print("  warning: all loss lambdas are 0 — loss is identically zero")
+    if args.lam_dice == 0.0 and args.lam_bce == 0.0:
+        print("  warning: both lambdas are 0 — loss is identically zero")
     print(
         f"L0 (precompute, fixed): η_lum={L0.ETA_LUM}  η_chr={L0.ETA_CHR}  "
         f"γ={L0.GAMMA}  (tune in params.py)"
@@ -1102,11 +793,12 @@ def main():
         return
     print(f"  training on all {len(fit_stems)} images (no held-out val)")
 
-    model = HarmonicContourE2E(
-        r_pool=SEED.R_POOL,
-        stride=SEED.STRIDE,
-        eps=SEED.EPS,
-        eta_z_init=None,
+    model = StriateE2E(
+        r_pool=L2.R_POOL,
+        K=L2.K,
+        t_refine=L2.T_REFINE,
+        eps=L2.EPS,
+        eta_z_init=L2.ETA_Z_INIT,
         render_cell_hidden=RENDER.CELL_HIDDEN,
         render_pixel_hidden=RENDER.PIXEL_HIDDEN,
     ).to(device)
@@ -1117,10 +809,10 @@ def main():
         optimizer, T_max=args.epochs, eta_min=args.lr * 0.1
     )
 
-    n_tot, n_seed, n_r = format_model_param_counts(model)
+    n_tot, n_dyn, n_r = format_model_param_counts(model)
     print(
         f"\nmodel: {n_tot} params total  Adam: {n_tot} "
-        f"(seed {n_seed} + renderer {n_r})"
+        f"(dynamics {n_dyn} + renderer {n_r})"
     )
 
     train_ds = StriateDataset(train_cache, fit_stems)
@@ -1136,20 +828,14 @@ def main():
         batch = next(iter(train_loader))
         moved = []
         for item in batch:
-            (gi, gt, Hp, Wp, Hg, Wg, H0, W0, l0_pix, img, d_lum, d_chr, border_mask,
-             h2m, theta_h) = item
-            moved.append((
-                gi, gt, Hp, Wp, Hg, Wg, H0, W0, l0_pix, img, d_lum, d_chr, border_mask,
-                h2m, theta_h,
-            ))
+            (gi, gt, Hp, Wp, Hg, Wg, H0, W0, cells_flat, l0_pix, img) = item
+            moved.append((gi, gt, Hp, Wp, Hg, Wg, H0, W0, cells_flat, l0_pix, img))
         debug_drive_batch(
             model,
-            prepare_batch(moved, device, model),
+            prepare_batch(moved, device),
             device,
             lam_dice=args.lam_dice,
             lam_bce=args.lam_bce,
-            lam_focal=args.lam_focal,
-            focal_gamma=args.focal_gamma,
         )
         return
 
@@ -1163,7 +849,6 @@ def main():
         ep_loss = 0.0
         ep_soft_dice = 0.0
         ep_bce = 0.0
-        ep_focal = 0.0
         n_img = 0
         n_batch = 0
         t0 = time.time()
@@ -1172,47 +857,32 @@ def main():
         for batch in train_loader:
             moved = []
             for item in batch:
-                (gi, gt, Hp, Wp, Hg, Wg, H0, W0, l0_pix, img, d_lum, d_chr, border_mask,
-                 h2m, theta_h) = item
-                moved.append((
-                    gi, gt, Hp, Wp, Hg, Wg, H0, W0, l0_pix, img, d_lum, d_chr, border_mask,
-                    h2m, theta_h,
-                ))
+                (gi, gt, Hp, Wp, Hg, Wg, H0, W0, cells_flat, l0_pix, img) = item
+                moved.append((gi, gt, Hp, Wp, Hg, Wg, H0, W0, cells_flat, l0_pix, img))
 
-            meta_list = prepare_batch(moved, device, model)
+            meta_list = prepare_batch(moved, device)
             bmaps = model.forward_batch(meta_list)
 
             dice_sum = None
             bce_sum = None
-            focal_sum = None
             for bmap, m in zip(bmaps, meta_list):
                 Hg, Wg = m["Hg"], m["Wg"]
                 bc = bmap[:Hg, :Wg]
                 gc_ = m["gt"][:Hg, :Wg]
                 loss_dice = soft_dice_loss_with_ignore(bc, gc_)
                 loss_bce = bce_loss_with_ignore(bc, gc_)
-                loss_focal = focal_bce_loss_with_ignore(
-                    bc, gc_, gamma=args.focal_gamma,
-                )
                 dice_sum = loss_dice if dice_sum is None else dice_sum + loss_dice
                 bce_sum = loss_bce if bce_sum is None else bce_sum + loss_bce
-                focal_sum = loss_focal if focal_sum is None else focal_sum + loss_focal
             n_bm = len(bmaps)
             mean_dice = dice_sum / n_bm
             mean_bce = bce_sum / n_bm
-            mean_focal = focal_sum / n_bm
-            loss = (
-                args.lam_dice * mean_dice
-                + args.lam_bce * mean_bce
-                + args.lam_focal * mean_focal
-            )
+            loss = args.lam_dice * mean_dice + args.lam_bce * mean_bce
             soft_dice_mean = mean_dice
             bce_mean = mean_bce
-            focal_mean = mean_focal
 
             if not loss.requires_grad:
                 raise RuntimeError(
-                    "loss has no grad_fn — check λ_dice/λ_bce/λ_focal, GT η band, ρ/renderer graph"
+                    "loss has no grad_fn — check λ_dice/λ_bce, GT η band, ρ/renderer graph"
                 )
 
             optimizer.zero_grad()
@@ -1225,7 +895,6 @@ def main():
             ep_loss += loss.item()
             ep_soft_dice += soft_dice_mean.item()
             ep_bce += bce_mean.item()
-            ep_focal += focal_mean.item()
             n_batch += 1
             loss_item = loss.item()
             while n_img >= next_dbg_img:
@@ -1235,7 +904,6 @@ def main():
                     f"  batch {n_batch}  loss(run)={ep_loss / n_batch:.4f}"
                     f"  batch_loss={loss_item:.4f}"
                     f"  dice={soft_dice_mean.item():.4f}  bce={bce_mean.item():.4f}"
-                    f"  focal={focal_mean.item():.4f}"
                     f"  {dt_p:.1f}s elapsed",
                     flush=True,
                 )
@@ -1246,14 +914,12 @@ def main():
         al = ep_loss / max(n_batch, 1)
         al_sdice = ep_soft_dice / max(n_batch, 1)
         al_bce = ep_bce / max(n_batch, 1)
-        al_focal = ep_focal / max(n_batch, 1)
         lr_now = scheduler.get_last_lr()[0]
         dt = time.time() - t0
 
         print(
             f"  epoch {epoch + 1:3d}/{args.epochs}:  "
             f"loss={al:.4f}  dice={al_sdice:.4f}  bce={al_bce:.4f}  "
-            f"focal={al_focal:.4f}  "
             f"lr={lr_now:.2e}  {dt:.1f}s"
         )
         history.append(
@@ -1262,11 +928,8 @@ def main():
                 "loss": al,
                 "loss_soft_dice": al_sdice,
                 "loss_bce": al_bce,
-                "loss_focal": al_focal,
                 "lam_dice": args.lam_dice,
                 "lam_bce": args.lam_bce,
-                "lam_focal": args.lam_focal,
-                "focal_gamma": args.focal_gamma,
                 "lr": lr_now,
                 "time": dt,
             }

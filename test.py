@@ -1,11 +1,11 @@
-r"""test.py — harmonic-contour-integration test-set evaluation (ODS, OIS, AP).
+r"""test.py — STRIATE test-set evaluation (ODS, OIS, AP).
 
-Per image: L0 → L1 eigendecomposition → ``ρ_seed`` (NR pool) → renderer splat.
-Two prediction tracks: ``c_eval`` without ridge NMS; ``s_eval`` with ridge NMS
+Per image: same L0 to L1 to L2 to render path as inference (raw boundary map). Two
+prediction tracks: ``c_eval`` without ridge NMS; ``s_eval`` with ridge NMS
 along dominant theta. BSDS-style matching uses about 0.75% of the image
 diagonal.
 
-Writes predictions under ``output_dir/{c_eval,s_eval}/preds/`` and
+Writes predictions under ``output_dir/{c_eval,s_eval,b_eval}/preds/`` and
 aligned binary GT PNGs under ``output_dir/gt/`` (same stems), matching the
 layout expected by ``eval/eval.py``. Only images with a matching GT file under
 ``--test_gt`` are processed; if more image files are listed than have GT, the
@@ -26,13 +26,9 @@ import torch
 from PIL import Image
 from scipy.ndimage import binary_dilation
 
-from params import L0, L1, RENDER, SEED, TEST
-from hci.L0 import compute_l0_rgb, compute_interior, _compute_d_lum_chroma
-from hci.L1 import (
-    pad_for_patch_grid,
-    run_l1_hypercolumn,
-    z_from_l0_harmonics,
-)
+from params import L0, L1, L2, RENDER, TEST
+from hci.L0 import compute_l0_rgb, compute_interior
+from hci.L1 import z_from_l0_harmonics, pad_for_patch_grid, run_l1
 from hci.renderer import (
     compute_render_features,
     render_boundary_map_torch,
@@ -41,10 +37,9 @@ from hci.renderer import (
     upgrade_renderer_state_dict,
 )
 from train import (
-    HarmonicContourE2E,
+    StriateE2E,
     build_cells_flat,
     build_l0_pix,
-    remap_checkpoint_state_dict,
     report_checkpoint_compatibility,
 )
 
@@ -52,15 +47,16 @@ EVAL_THRESHOLDS = np.linspace(0.01, 0.99, TEST.THRESHOLD_COUNT)
 
 
 def build_model(ckpt, device):
-    m = HarmonicContourE2E(
-        r_pool=SEED.R_POOL,
-        stride=SEED.STRIDE,
-        eps=SEED.EPS,
-        eta_z_init=None,
+    m = StriateE2E(
+        r_pool=L2.R_POOL,
+        K=L2.K,
+        t_refine=L2.T_REFINE,
+        eps=L2.EPS,
+        eta_z_init=L2.ETA_Z_INIT,
         render_cell_hidden=RENDER.CELL_HIDDEN,
         render_pixel_hidden=RENDER.PIXEL_HIDDEN,
     )
-    sd = remap_checkpoint_state_dict(ckpt["model_state"])
+    sd = ckpt["model_state"]
     sd = upgrade_renderer_state_dict(sd, prefix="renderer.")
     incompatible = m.load_state_dict(sd, strict=False)
     report_checkpoint_compatibility(incompatible, context="test build_model")
@@ -141,7 +137,7 @@ def _ap_from_pr(results):
     return float(((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1]).sum())
 
 
-def run_image_inference(model, img_path, device, *, verbose: bool = False):
+def run_image_inference(model, img_path, device):
 
     ir_np = np.array(Image.open(img_path).convert("RGB"), dtype=np.float32) / 255.0
     ir_p, H0, W0 = pad_for_patch_grid(ir_np, L1.PATCH_SIZE, L1.PATCH_OVERLAP)
@@ -149,10 +145,6 @@ def run_image_inference(model, img_path, device, *, verbose: bool = False):
     gc.collect()
 
     ir_t = torch.from_numpy(ir_p).to(device)
-
-    # Compute directional differences (reusable across η values)
-    d_lum, d_chr = _compute_d_lum_chroma(ir_t, L0.OFFSETS)
-
     h, vld, _, _, _, s, h1m, h2m, h2m_lum, h2m_chr = compute_l0_rgb(
         ir_t,
         eta_lum=L0.ETA_LUM,
@@ -162,8 +154,6 @@ def run_image_inference(model, img_path, device, *, verbose: bool = False):
     )
     bm_t = ~compute_interior(ir_p.shape[0], ir_p.shape[1], device)
     z1, z2 = z_from_l0_harmonics(s, bm_t)
-    theta_h = (0.5 * torch.atan2(s[..., 3], s[..., 2])).to(torch.float32)
-    theta_h = torch.where(bm_t, torch.zeros_like(theta_h), theta_h)
 
     s_np = s.cpu().numpy()
     bm_np = bm_t.cpu().numpy()
@@ -172,28 +162,28 @@ def run_image_inference(model, img_path, device, *, verbose: bool = False):
     l0_pix = build_l0_pix(
         s_np, h1m, h2m, bm_np, h2m_lum=h2m_lum, h2m_chr=h2m_chr,
     )
-    del h, vld, s, h1m, h2m_lum, h2m_chr
+    del h, vld, s, h1m, h2m, h2m_lum, h2m_chr
     gc.collect()
 
-    cells = run_l1_hypercolumn(
-        h2m,
-        theta_h,
-        bm_t,
-        model.seed.hc_seed,
-        P=L1.PATCH_SIZE,
+    cells = run_l1(
+        z1,
+        z2,
+        L1.PATCH_SIZE,
+        border_mask=bm_t,
         patch_overlap=L1.PATCH_OVERLAP,
         border_patch_max_frac=L1.BORDER_PATCH_MAX_FRAC,
+        eps=L1.EPS,
+        device=device,
         verbose=False,
-        eps=float(L1.EPS),
     )
-    del z1, z2, h2m, theta_h, bm_t, ir_t
+    del z1, z2, bm_t, ir_t
     gc.collect()
     cells["is_border"] |= (cells["cy"] + cells["P"] / 2 > H0) | (
         cells["cx"] + cells["P"] / 2 > W0
     )
 
     nH, nW = cells["nH"], cells["nW"]
-    proj = compute_render_features(z2_img, ir_p, cells, bm_np, eps=SEED.EPS)
+    proj = compute_render_features(z2_img, ir_p, cells, bm_np, eps=L2.EPS)
     del z2_img, bm_np
     gc.collect()
 
@@ -210,8 +200,7 @@ def run_image_inference(model, img_path, device, *, verbose: bool = False):
     proj_dev = proj_to_device(proj, device)
 
     with torch.no_grad():
-        rho_out, branch, _, _, _, _, _ = model.seed(cells_flat=cf_dev)
-
+        rho_out, branch, _, _, _, _, _ = model.dynamics(cells_flat=cf_dev)
         bmap_t, theta_t = render_boundary_map_torch(
             rho_out,
             proj_dev,
@@ -250,12 +239,6 @@ def main():
         default=None,
         help="Tolerance factor for precision matching radius: max_dist = tol * diagonal "
         "(default: 0.0075).",
-    )
-    ap.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Print η-modulation coefficients and per-image η map ranges when pass-2 runs.",
     )
     args = ap.parse_args()
 
@@ -308,7 +291,7 @@ def main():
         f"paired={len(pairs)}/{n_img} images-with-GT{cap}"
     )
 
-    eval_modes = ("c_eval", "s_eval")
+    eval_modes = ("c_eval", "s_eval", "b_eval")
     pred_dirs = {
         m: os.path.join(args.output_dir, m, "preds") for m in eval_modes
     }
@@ -328,14 +311,22 @@ def main():
             "ois_n_pred_sum": 0,
             "ois_n_gt_sum": 0,
         }
-        for m in eval_modes
+        for m in ("c_eval", "s_eval")
+    }
+    # b_eval uses a single fixed threshold — no sweep, separate accumulators
+    state["b_eval"] = {
+        "per_image": [],
+        "agg_tp_p": 0,
+        "agg_tp_r": 0,
+        "agg_n_pred": 0,
+        "agg_n_gt": 0,
     }
     t_total = time.perf_counter()
 
     for idx, (stem, img_path, gt_path) in enumerate(pairs):
         t0 = time.perf_counter()
         bmap_c, theta, H0, W0 = run_image_inference(
-            model, img_path, device, verbose=args.verbose,
+            model, img_path, device,
         )
         bmap_s = ridge_nms(bmap_c, theta=theta)
         gt = _load_gt(gt_path, gt_format)
@@ -343,24 +334,30 @@ def main():
         H = min(bmap_c.shape[0], gt.shape[0])
         W = min(bmap_c.shape[1], gt.shape[1])
         bmaps = {"c_eval": bmap_c[:H, :W], "s_eval": bmap_s[:H, :W]}
+        bmap_b = (bmap_s[:H, :W] >= TEST.BISTABLE_THRESHOLD).astype(np.float32)
+        bmaps["b_eval"] = bmap_b
         gt = gt[:H, :W]
 
         eval_max_dist = precision_max_dist(H, W, tol=args.tol)
 
         # Save predictions as 8-bit PNGs.
-        for m in eval_modes:
+        for m in ("c_eval", "s_eval"):
             png = np.clip(bmaps[m], 0.0, 1.0)
             png = (png * 255.0 + 0.5).astype(np.uint8)
             Image.fromarray(png, mode="L").save(
                 os.path.join(pred_dirs[m], f"{stem}.png")
             )
+        # b_eval: binary PNG (0 or 255)
+        Image.fromarray((bmap_b * 255).astype(np.uint8), mode="L").save(
+            os.path.join(pred_dirs["b_eval"], f"{stem}.png")
+        )
 
         # Aligned GT (binary), same crop as preds — for eval/eval.py and archives.
         gt_png = ((gt >= 0.5).astype(np.uint8)) * 255
         Image.fromarray(gt_png, mode="L").save(os.path.join(gt_dir, f"{stem}.png"))
 
         line_parts = [f"  [{idx + 1}/{len(pairs)}] {stem}"]
-        for m in eval_modes:
+        for m in ("c_eval", "s_eval"):
             results = _eval_at_thresholds(bmaps[m], gt, EVAL_THRESHOLDS, eval_max_dist)
             st = state[m]
 
@@ -393,6 +390,27 @@ def main():
                 f"{tag}: OIS={best_per_img['F1']:.3f}@{best_per_img['t']:.2f} "
                 f"AP={ap_i:.3f}"
             )
+
+        # b_eval: single fixed threshold, no sweep
+        b_results = _eval_at_thresholds(
+            bmaps["b_eval"], gt, [TEST.BISTABLE_THRESHOLD], eval_max_dist,
+        )[0]
+        b_st = state["b_eval"]
+        b_st["agg_tp_p"] += b_results["tp_p"]
+        b_st["agg_tp_r"] += b_results["tp_r"]
+        b_st["agg_n_pred"] += b_results["n_pred"]
+        b_st["agg_n_gt"] += b_results["n_gt"]
+        b_st["per_image"].append(
+            {
+                "stem": stem,
+                "F1": b_results["F1"],
+                "P": b_results["P"],
+                "R": b_results["R"],
+            }
+        )
+        line_parts.append(
+            f"B: F1={b_results['F1']:.3f} P={b_results['P']:.3f} R={b_results['R']:.3f}"
+        )
 
         dt = time.perf_counter() - t0
         line_parts.append(f"{dt:.2f}s")
@@ -458,7 +476,7 @@ def main():
         return summary, out_path
 
     print(f"\n{'=' * 50}")
-    for mode in eval_modes:
+    for mode in ("c_eval", "s_eval"):
         summary, out_path = _finalize(mode)
         label = "C_EVAL (raw)" if mode == "c_eval" else "S_EVAL (NMS-thinned)"
         print(f"[{label}]")
@@ -476,6 +494,40 @@ def main():
 
     print(f"[GT (aligned to preds, binary PNG)]")
     print(f"  gt    -> {gt_dir}  ({len(pairs)} files)")
+
+    # b_eval: fixed-threshold binary output — deployment metric
+    b_st = state["b_eval"]
+    b_prec = b_st["agg_tp_p"] / max(b_st["agg_n_pred"], 1)
+    b_rec = b_st["agg_tp_r"] / max(b_st["agg_n_gt"], 1)
+    b_f1 = 2 * b_prec * b_rec / max(b_prec + b_rec, 1e-15)
+    b_f1_macro = float(np.mean([r["F1"] for r in b_st["per_image"]]))
+
+    b_summary = {
+        "mode": "b_eval",
+        "threshold": TEST.BISTABLE_THRESHOLD,
+        "F1": b_f1,
+        "P": b_prec,
+        "R": b_rec,
+        "F1_macro": b_f1_macro,
+        "n_images": len(pairs),
+        "time": dt_total,
+        "max_images": args.max_images,
+        "images_dir": args.images,
+        "model": args.model,
+        "preds_dir": pred_dirs["b_eval"],
+        "gt_dir": gt_dir,
+        "per_image": b_st["per_image"],
+    }
+    b_out_path = os.path.join(args.output_dir, "b_eval", "results.json")
+    os.makedirs(os.path.dirname(b_out_path), exist_ok=True)
+    with open(b_out_path, "w") as f:
+        json.dump(b_summary, f, indent=2)
+
+    print(f"[B_EVAL (bistable, t={TEST.BISTABLE_THRESHOLD})]")
+    print(f"  F1={b_f1:.4f}  P={b_prec:.4f}  R={b_rec:.4f}  (fixed threshold, no tuning)")
+    print(f"  F1_macro={b_f1_macro:.4f}")
+    print(f"  preds -> {pred_dirs['b_eval']}")
+    print(f"  json  -> {b_out_path}")
 
     print(f"{'=' * 50}")
     print(f"{len(pairs)} images  {dt_total:.1f}s total")
