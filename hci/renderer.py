@@ -4,7 +4,7 @@ r"""Renderer — harmonic contour readout (interp → tang/norm stencils → gat
 κ_col from L1 — diagnostic peakedness for the readout), then a 14-D feature stack
 ``[h2m_lum, h2m_chr, ρ̄, κ̄_col, tang₅, norm₅]``.  Tangential / normal ``h2m`` samples
 use learned ``s_t``, ``s_n``.
-``B̂ = (h2m_lum+h2m_chr)·ρ̄·σ(MLP(F))``.  GABA recurrence lives in ``hci.L1``.
+``B̂ = (h2m_lum+h2m_chr)·σ(MLP(F))`` with ``ρ̄`` in ``F`` only (not multiplied out).  GABA recurrence lives in ``hci.L1``.
 """
 
 from __future__ import annotations
@@ -149,7 +149,9 @@ class ThinningHead(nn.Module):
 # ═══════════════════════════════════════════════════════════════
 
 class ModulationRenderer(nn.Module):
-    """Contour renderer: ``(h2m_lum+h2m_chr)·ρ̄·gate`` with 14→8→1 ThinningHead.
+    """Contour renderer: ``(h2m_lum+h2m_chr)·gate`` with 14→8→1 ThinningHead.
+
+    ``ρ̄`` is an MLP input (feature index 2), not a multiplicative factor on ``B̂``.
 
     Learned tangential / normal stencil spacings ``s_t``, ``s_n`` (softplus).
     Cell-grid κ_col comes from L1 (``cells_flat``).
@@ -450,7 +452,7 @@ def render_boundary_map_torch(
     tang_stack = torch.stack(tang_parts, dim=-1)
     norm_stack = torch.stack(norm_parts, dim=-1)
 
-    theta_pix = theta_geom  # geometric; grad through ρ̄, h2m, gate, stencils
+    theta_pix = theta_geom  # geometric; grad through MLP (incl. ρ̄), h2m, gate, stencils
 
     fdim = int(renderer.thinning.in_dim)
     features = torch.cat([
@@ -468,7 +470,7 @@ def render_boundary_map_torch(
         )
     feat_flat = features.reshape(H * W, fdim)
     gate = renderer.thinning(feat_flat).reshape(H, W)
-    bmap = h2m_combined * rho_pix * gate
+    bmap = h2m_combined * gate
 
     # ── Crop ─────────────────────────────────────────────────
     ch = Hp if content_h is None else content_h

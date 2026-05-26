@@ -7,7 +7,7 @@ then **pass NR** steps: ``drive = ρ_seed·(β_seed + β_c·s_coll)``,
 ``s_{\\mathrm{coll}}``, ``s_{\\mathrm{flank}}``, ``s_{\\mathrm{cross}}`` from **kernel-normalized**
 depthwise convs (oriented cos²/sin² / sin²-weighted cross mix × isotropic).
 ``κ`` is cosine alignment ``(ρ·S)/(‖ρ‖‖S‖)`` for diagnostics / readout.
-The renderer interpolates ρ, θ, κ and applies ``h2m·ρ̄·gate`` (14-D readout, no η_mod).
+The renderer interpolates ρ, θ, κ and applies ``h2m·gate`` (14-D readout; ``ρ̄`` in features only).
 
 Training disk cache: ``TRAIN.CACHE_VERSION`` invalidates stored L0 tensors used
 for **live** L1 each step (``h2m``, ``theta_h``, masks, etc.); it does not cache
