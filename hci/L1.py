@@ -165,7 +165,15 @@ def _build_flank_kernels(
     device: torch.device,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Precompute K depthwise kernels ``G_k = \\mathrm{gauss}(r,σ_d,σ_t)\\sin^2(\\phi-\\theta_k)``."""
+    """Precompute K depthwise kernels ``G_k = \\mathrm{gauss}(r,σ_d,σ_t)\\sin^2(\\phi-\\theta_k)``.
+
+    Flank pooling is *across* the contour: keep neighbors on the normal axis,
+    suppress those along the tangent.  The envelope therefore attenuates
+    displacement along the tangent direction
+    ``d_\\mathrm{tangent} = -d_i\\sin\\theta_k + d_j\\cos\\theta_k`` (e.g. ``θ_k=0``
+    → ``d_\\mathrm{tangent}=d_j``, kills left/right, keeps above/below where the
+    ``sin^2(\\phi-\\theta_k)`` lobe peaks).
+    """
     w_d, di, dj = _radial_gaussian_disk(R, sigma_d, device, dtype)
     sigma_t = sigma_t.to(device=device, dtype=dtype).clamp_min(
         torch.tensor(1e-4, device=device, dtype=dtype)
@@ -174,7 +182,8 @@ def _build_flank_kernels(
     kernels = torch.zeros(K, 2 * R + 1, 2 * R + 1, device=device, dtype=dtype)
     for k in range(K):
         theta_k = k * math.pi / K
-        w_env = _oriented_gaussian_envelope(w_d, di, dj, sigma_t, theta_k)
+        d_tangent = -di * math.sin(theta_k) + dj * math.cos(theta_k)
+        w_env = w_d * torch.exp(-d_tangent * d_tangent / (2.0 * sigma_t * sigma_t))
         kernels[k] = w_env * torch.sin(phi - theta_k).pow(2)
     return kernels.unsqueeze(1)
 
