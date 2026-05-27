@@ -26,7 +26,7 @@ L1 = SimpleNamespace(
     BORDER_PATCH_MAX_FRAC=0.2,
     EPS=1e-15,
     N_BRANCHES=2,
-    K=24,
+    K=12,
     COL_COS_POWER=2,
 )
 
@@ -34,7 +34,7 @@ L1 = SimpleNamespace(
 L2 = SimpleNamespace(
     R_FAC_POOL=5,   # collinear (facilitation) pool radius
     R_SUP_POOL=10,   # iso / cross (suppression) pool radius
-    K=24,
+    K=12,
     T_REFINE=5,
     EPS=1e-9,
     ETA_Z_INIT=2.0,  # seed: ρ_seed = ρ_peak / (ρ_total + η_z)
@@ -44,9 +44,6 @@ L2 = SimpleNamespace(
     B_COLL_INIT=1.0,
     B_ISO_INIT=0.3,
     B_CROSS_INIT=0.3,
-    ETA_COLL_INIT=0.3,   # NR half-sat on ρ_coll (raw ~0.5)
-    ETA_ISO_INIT=0.3,    # NR half-sat on lateral ρ² numerator (stable, O(1–20))
-    ETA_CROSS_INIT=0.3,  # NR half-sat on cross-bin ρ² sum (no count norm)
     ETA_P_INIT=0.1,  # NR floor η_p² in ρ update denominator
 )
 
@@ -77,8 +74,8 @@ TRAIN = SimpleNamespace(
     BATCH_SIZE=4,
     GRAD_CLIP=1.0,
     NUM_WORKERS=2,
-    LAM_DICE=0.0,
-    LAM_BCE=1.0,
+    LAM_DICE=1.0,
+    LAM_BCE=0.0,
     CACHE_VERSION=43,
     L2_SNAPSHOT_MAX=5,
 )

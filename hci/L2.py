@@ -7,17 +7,15 @@ Seed (once, fixed in drive):
   cells_flat["lam"][...,0] and cells_flat["z0"].
 
   Per iteration t (ρ⁽⁰⁾ = ρ_seed for pooling; ρ_seed fixed in drive):
-       ρ̃_coll = ρ_coll²/(ρ_coll² + η_coll²),  c̃_iso = c_iso²/(c_iso² + η_iso²),
-       c̃_cross = c_cross²/(c_cross² + η_cross²)
-       drive = b_seed·ρ_seed + b_coll·ρ̃_coll
-       ρ⁽ᵗ⁺¹⁾ = drive² / (drive² + b_iso·c̃_iso + b_cross·c̃_cross + η_p² + ε)
+       drive = b_seed·ρ_seed + b_coll·ρ_coll
+       ρ⁽ᵗ⁺¹⁾ = drive² / (drive² + b_iso·c_iso + b_cross·c_cross + η_p² + ε)
 
   Geometric pools (ρ_coll, c_iso, c_cross): grouped conv2d over (2R+1)² neighborhoods
   (collinear R_fac; iso/cross R_sup); per-cell hard θ-bin gather; coll and iso count-normalized;
   cross = (m₀_total − m₀_own)/m₀_total.
 
-Learned: b_coll, b_seed, b_iso, b_cross, η_coll, η_iso, η_cross, η_p, η_z
-         — **9** nonnegative scalars (softplus).
+Learned: b_coll, b_seed, b_iso, b_cross, η_p, η_z
+         — **6** nonnegative scalars (softplus).
   L1 κ is not used by the renderer.
 """
 
@@ -164,13 +162,6 @@ def _inv_softplus(x):
     return math.log(math.expm1(max(float(x), 1e-8)))
 
 
-def _nr_squash(x: torch.Tensor, eta: torch.Tensor) -> torch.Tensor:
-    """x²/(x² + η²) — bounded [0,1) drive/inhibition signal."""
-    x_sq = x * x
-    eta_sq = eta * eta
-    return x_sq / (x_sq + eta_sq)
-
-
 def rho_seed_from_lam1_z0(
     lam1: torch.Tensor,
     z0: torch.Tensor,
@@ -244,15 +235,6 @@ class TileDynamics(nn.Module):
         self._b_seed_raw = nn.Parameter(torch.tensor(_inv_softplus(L2.B_SEED_INIT)))
         self._b_iso_raw = nn.Parameter(torch.tensor(_inv_softplus(L2.B_ISO_INIT)))
         self._b_cross_raw = nn.Parameter(torch.tensor(_inv_softplus(L2.B_CROSS_INIT)))
-        self._eta_coll_raw = nn.Parameter(
-            torch.tensor(_inv_softplus(float(L2.ETA_COLL_INIT)), dtype=torch.float32)
-        )
-        self._eta_iso_raw = nn.Parameter(
-            torch.tensor(_inv_softplus(float(L2.ETA_ISO_INIT)), dtype=torch.float32)
-        )
-        self._eta_cross_raw = nn.Parameter(
-            torch.tensor(_inv_softplus(float(L2.ETA_CROSS_INIT)), dtype=torch.float32)
-        )
         self._eta_p_raw = nn.Parameter(
             torch.tensor(_inv_softplus(float(L2.ETA_P_INIT)), dtype=torch.float32)
         )
@@ -278,12 +260,6 @@ class TileDynamics(nn.Module):
     @property
     def b_cross(self): return Fn.softplus(self._b_cross_raw)
     @property
-    def eta_coll(self): return Fn.softplus(self._eta_coll_raw)
-    @property
-    def eta_iso(self): return Fn.softplus(self._eta_iso_raw)
-    @property
-    def eta_cross(self): return Fn.softplus(self._eta_cross_raw)
-    @property
     def eta_p(self): return Fn.softplus(self._eta_p_raw)
 
     @property
@@ -298,13 +274,13 @@ class TileDynamics(nn.Module):
         c_iso: torch.Tensor,
         c_cross: torch.Tensor,
     ) -> None:
-        """Record NR-squashed pools (same signals that enter the drive)."""
+        """Record raw geometry pools (same signals that enter the drive)."""
         store[tag] = {
             k: v.detach().cpu().numpy().astype(np.float64)
             for k, v in (
-                ("rho_coll", _nr_squash(rho_coll, self.eta_coll)),
-                ("c_iso", _nr_squash(c_iso, self.eta_iso)),
-                ("c_cross", _nr_squash(c_cross, self.eta_cross)),
+                ("rho_coll", rho_coll),
+                ("c_iso", c_iso),
+                ("c_cross", c_cross),
             )
         }
 
@@ -317,13 +293,10 @@ class TileDynamics(nn.Module):
         ok_map,
         return_drive_terms: bool = False,
     ):
-        rho_coll_t = _nr_squash(rho_coll, self.eta_coll)
-        c_iso_t = _nr_squash(c_iso, self.eta_iso)
-        c_cross_t = _nr_squash(c_cross, self.eta_cross)
-        drive = self.b_seed * rho_seed + self.b_coll * rho_coll_t
+        drive = self.b_seed * rho_seed + self.b_coll * rho_coll
         drive_sq = drive * drive
         eta_p_sq = self.eta_p * self.eta_p
-        inhib = self.b_iso * c_iso_t + self.b_cross * c_cross_t + eta_p_sq
+        inhib = self.b_iso * c_iso + self.b_cross * c_cross + eta_p_sq
         rho_next = (drive_sq / (drive_sq + inhib + self.eps)) * ok_map
 
         if return_drive_terms:
@@ -338,20 +311,14 @@ class TileDynamics(nn.Module):
                     "rho_coll_mean": _stat(rho_coll)[0],
                     "c_iso_mean": _stat(c_iso)[0],
                     "c_cross_mean": _stat(c_cross)[0],
-                    "rho_coll_t_mean": _stat(rho_coll_t)[0],
-                    "c_iso_t_mean": _stat(c_iso_t)[0],
-                    "c_cross_t_mean": _stat(c_cross_t)[0],
                     "drive_mean": _stat(drive)[0],
                     "drive_sq_mean": _stat(drive_sq)[0],
                     "inhib_mean": _stat(inhib)[0],
                     "rho_next_mean": _stat(rho_next)[0],
                     "term_seed_mean": _stat(self.b_seed * rho_seed)[0],
-                    "term_coll_mean": _stat(self.b_coll * rho_coll_t)[0],
-                    "term_iso_mean": _stat(self.b_iso * c_iso_t)[0],
-                    "term_cross_mean": _stat(self.b_cross * c_cross_t)[0],
-                    "eta_coll": float(self.eta_coll.detach()),
-                    "eta_iso": float(self.eta_iso.detach()),
-                    "eta_cross": float(self.eta_cross.detach()),
+                    "term_coll_mean": _stat(self.b_coll * rho_coll)[0],
+                    "term_iso_mean": _stat(self.b_iso * c_iso)[0],
+                    "term_cross_mean": _stat(self.b_cross * c_cross)[0],
                     "eta_p": float(self.eta_p.detach()),
                 }
         return rho_next

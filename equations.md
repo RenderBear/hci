@@ -8,7 +8,7 @@ This file records the **notation and equations implemented in this repository**:
 
 1. **L0** — RGB → split luminance / chrominance directional differences; per-direction min subtraction; independent Naka–Rushton per channel with **fixed** scalars $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ (`L0.ETA_LUM`, `L0.ETA_CHR`) and gain $\gamma$ (`L0.GAMMA`). Produces harmonic stack $s$, magnitudes $h_{1m}, h_{2m}$, and split $h_{2m}^{\mathrm{lum}}, h_{2m}^{\mathrm{chr}}$. Complex fields $z_1, z_2$ are read from $s$ (`z_from_l0_harmonics`). L0 is **precomputed and cached** for training; it is not updated during training.
 2. **L1** — Pixel $K$-bin $\cos^p$ projection of $h_{2m}$ (`L1.K`, `L1.COL_COS_POWER`); sum-pool over $P\times P$ patches → per-cell $\rho_{\mathrm{raw}}^{(k)}$, dominant $\theta$, polarity $q$, anisotropy $\delta$, optional $\kappa$, and $h_{2m}$-weighted splat anchors. **Precomputed and cached** with L0.
-3. **L2** (`TileDynamics`) — Seed $\rho_{\mathrm{seed}} = \rho_{\mathrm{peak}}/(\rho_{\mathrm{total}}+\eta_z)$; then $T_{\mathrm{refine}}$ recurrent steps with grouped `conv2d` collinear / iso / cross pools, NR-squashed drive terms, and divisive $\rho$ update. Runs **live each training step** so gradients reach the nine learned L2 scalars.
+3. **L2** (`TileDynamics`) — Seed $\rho_{\mathrm{seed}} = \rho_{\mathrm{peak}}/(\rho_{\mathrm{total}}+\eta_z)$; then $T_{\mathrm{refine}}$ recurrent steps with grouped `conv2d` collinear / iso / cross pools and divisive $\rho$ update. Runs **live each training step** so gradients reach the six learned L2 scalars.
 4. **Renderer** (`ModulationRenderer`) — Cell-grid $\theta$ combing and $\rho$-gated anchor smoothing; **Gaussian-line splat** of refined $\rho$ to pixels; coherence map; tangential / normal **stencils on $\bar\rho$**; **12→8→1** thinning MLP gate:
    $$\hat B(p) = \bar\rho(p)\,\mathrm{gate}(p).$$
 
@@ -147,11 +147,10 @@ with $\rho_{\mathrm{peak}} = \texttt{lam[...,0]}$ and $\rho_{\mathrm{total}} = \
 ### Learned scalars (softplus of raw parameters)
 
 $$
-\eta_z,\; b_{\mathrm{seed}},\; b_{\mathrm{coll}},\; b_{\mathrm{iso}},\; b_{\mathrm{cross}},\;
-\eta_{\mathrm{coll}},\; \eta_{\mathrm{iso}},\; \eta_{\mathrm{cross}},\; \eta_p .
+\eta_z,\; b_{\mathrm{seed}},\; b_{\mathrm{coll}},\; b_{\mathrm{iso}},\; b_{\mathrm{cross}},\; \eta_p .
 $$
 
-Defaults in `params.L2`: `ETA_Z_INIT`, `B_SEED_INIT`, `B_COLL_INIT`, `B_ISO_INIT`, `B_CROSS_INIT`, `ETA_COLL_INIT`, `ETA_ISO_INIT`, `ETA_CROSS_INIT`, `ETA_P_INIT`.
+Defaults in `params.L2`: `ETA_Z_INIT`, `B_SEED_INIT`, `B_COLL_INIT`, `B_ISO_INIT`, `B_CROSS_INIT`, `ETA_P_INIT`.
 
 ### Fixed conv kernels (buffers, no gradients)
 
@@ -194,33 +193,25 @@ $$
 c_{\mathrm{cross}}(c) = \frac{m_0^{\mathrm{tot}}(c) - m_0^{\mathrm{own}}(c)}{m_0^{\mathrm{tot}}(c) + \varepsilon},
 $$
 
-where $m_0^{\mathrm{tot}}$ is the isotropic conv sum over all bins and $m_0^{\mathrm{own}}$ the own-bin contribution. All pools are masked by $\mathrm{ok}(c)$.
-
-**NR squash** (bounded drive / inhibition signals):
-
-$$
-\tilde x = \frac{x^2}{x^2 + \eta^2}.
-$$
-
-Apply with $(x,\eta) \in \{(\rho_{\mathrm{coll}}, \eta_{\mathrm{coll}}), (c_{\mathrm{iso}}, \eta_{\mathrm{iso}}), (c_{\mathrm{cross}}, \eta_{\mathrm{cross}})\}$.
+where $m_0^{\mathrm{tot}}$ is the isotropic conv sum over all bins and $m_0^{\mathrm{own}}$ the own-bin contribution. All pools are masked by $\mathrm{ok}(c)$. Raw pool values enter the recurrence directly (no per-pool NR squash).
 
 ### Pass update ($t = 0,\ldots,T_{\mathrm{refine}}-1$, `L2.T_REFINE`)
 
 $$
-\mathrm{drive}^{(t)}(c) = b_{\mathrm{seed}}\,\rho_{\mathrm{seed}}(c) + b_{\mathrm{coll}}\,\tilde\rho_{\mathrm{coll}}^{(t)}(c),
+\mathrm{drive}^{(t)}(c) = b_{\mathrm{seed}}\,\rho_{\mathrm{seed}}(c) + b_{\mathrm{coll}}\,\rho_{\mathrm{coll}}^{(t)}(c),
 $$
 $$
 \rho^{(t+1)}(c) = \mathrm{ok}(c)\cdot
 \frac{\bigl(\mathrm{drive}^{(t)}(c)\bigr)^2}
 {\bigl(\mathrm{drive}^{(t)}(c)\bigr)^2
-+ b_{\mathrm{iso}}\,\tilde c_{\mathrm{iso}}^{(t)}(c)
-+ b_{\mathrm{cross}}\,\tilde c_{\mathrm{cross}}^{(t)}(c)
++ b_{\mathrm{iso}}\,c_{\mathrm{iso}}^{(t)}(c)
++ b_{\mathrm{cross}}\,c_{\mathrm{cross}}^{(t)}(c)
 + \eta_p^2 + \varepsilon}.
 $$
 
 **TBPTT**: during training, $\rho$ is detached every `grad_window = max(1, T_{\mathrm{refine}} // \texttt{TRAIN.L2\_SNAPSHOT\_MAX})` steps to limit BPTT depth.
 
-**Diagnostics** (`return_surface_diags`): NR-squashed pool snapshots at $t{=}0$ and $t{=}$last; optional bimodality $\sum_c \rho(1-\rho)$ per snapshot step.
+**Diagnostics** (`return_surface_diags`): raw pool snapshots at $t{=}0$ and $t{=}$last; optional bimodality $\sum_c \rho(1-\rho)$ per snapshot step.
 
 ---
 
@@ -297,11 +288,10 @@ Checkpoints store `{"model_state": state_dict}` (`intermediate.pt`, `final.pt`).
 
 | Block | Count | Notes |
 |------:|------:|------|
-| $\tilde\eta_z, \tilde b_{\mathrm{seed}}, \tilde b_{\mathrm{coll}}, \tilde b_{\mathrm{iso}}, \tilde b_{\mathrm{cross}}$ | 5 | Seed + drive / inhibition gains |
-| $\tilde\eta_{\mathrm{coll}}, \tilde\eta_{\mathrm{iso}}, \tilde\eta_{\mathrm{cross}}, \tilde\eta_p$ | 4 | NR half-sats + pass floor |
+| $\tilde\eta_z, \tilde b_{\mathrm{seed}}, \tilde b_{\mathrm{coll}}, \tilde b_{\mathrm{iso}}, \tilde b_{\mathrm{cross}}, \tilde\eta_p$ | 6 | Seed + drive / inhibition + pass NR floor |
 | $\tilde\sigma_\perp, s_t, s_n$ | 3 | Splat width + stencil spacings |
 | $\mathrm{MLP}_{\mathrm{thin}}$ (12→8→1) | 113 | $12\cdot 8 + 8 + 8 + 1$ |
-| **Total (`StriateE2E`)** | **125** | 9 L2 + 116 renderer |
+| **Total (`StriateE2E`)** | **122** | 6 L2 + 116 renderer |
 
 L0 $\eta$ and L1 geometry are **not** learned. Legacy checkpoints from older K-bin / 14-feature renderer architectures may load with missing/unexpected keys; use `upgrade_renderer_state_dict` and `load_state_dict(..., strict=False)` with `report_checkpoint_compatibility`.
 
@@ -323,4 +313,4 @@ L0 $\eta$ and L1 geometry are **not** learned. Legacy checkpoints from older K-b
 
 ## 9. Revision note
 
-This document matches the **STRIATE** stack: L1 **K-bin projection** (§3), L2 **`TileDynamics`** (§4), **Gaussian-line splat** renderer (§5), **`StriateE2E`** (125 learned scalars).
+This document matches the **STRIATE** stack: L1 **K-bin projection** (§3), L2 **`TileDynamics`** (§4), **Gaussian-line splat** renderer (§5), **`StriateE2E`** (122 learned scalars).

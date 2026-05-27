@@ -1,7 +1,7 @@
 r"""train.py — STRIATE training: cell-grid conv dynamics + harmonic render.
 
 Pipeline per image: L0 contrast/harmonics → L1 K-bin projection (ρ_raw from h₂m)
-→ L2 cell-grid ρ refinement (ρ_seed = ρ_peak/(ρ_total+η_z); conv pools → NR-squashed drive²/(drive² + b_iso·c̃_iso + b_cross·c̃_cross + η_p²))
+→ L2 cell-grid ρ refinement (ρ_seed = ρ_peak/(ρ_total+η_z); conv pools → drive²/(drive² + b_iso·c_iso + b_cross·c_cross + η_p²))
 → splat renderer ($\hat B = \bar\rho \cdot \mathrm{gate}$).
 Loss combines soft-Dice and per-pixel BCE on the same η± valid band
 (target≥η_pos or target<η_neg), weighted by ``--lam_dice`` and ``--lam_bce``
@@ -547,8 +547,7 @@ def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
     print("\n  learned (value):")
     for name in (
         "b_coll", "b_seed", "b_iso", "b_cross",
-        "eta_coll", "eta_iso", "eta_cross", "eta_p",
-        "eta_z",
+        "eta_p", "eta_z",
     ):
         p = getattr(d, name)
         val = float(p.detach()) if not isinstance(p, torch.Tensor) else float(p.item())
@@ -559,9 +558,6 @@ def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
         ("_b_seed_raw", "b_seed"),
         ("_b_iso_raw", "b_iso"),
         ("_b_cross_raw", "b_cross"),
-        ("_eta_coll_raw", "eta_coll"),
-        ("_eta_iso_raw", "eta_iso"),
-        ("_eta_cross_raw", "eta_cross"),
         ("_eta_p_raw", "eta_p"),
         ("_eta_z_raw", "eta_z"),
     ):
@@ -634,10 +630,8 @@ def format_l2_param_lines(d, *, indent: str = "  ") -> list[str]:
         f"{indent}drive:",
         f"{sub}b_coll={d.b_coll.item():.3f}  b_seed={d.b_seed.item():.3f}",
         f"{indent}inhibition:",
-        f"{sub}b_iso={d.b_iso.item():.3f}  b_cross={d.b_cross.item():.3f}",
-        f"{indent}pool NR (η):",
-        f"{sub}η_coll={d.eta_coll.item():.3f}  η_iso={d.eta_iso.item():.3f}  "
-        f"η_cross={d.eta_cross.item():.3f}  η_p={d.eta_p.item():.3f}",
+        f"{sub}b_iso={d.b_iso.item():.3f}  b_cross={d.b_cross.item():.3f}  "
+        f"η_p={d.eta_p.item():.3f}",
         f"{indent}seed:  η_z={d.eta_z.item():.3f}  "
         f"(ρ_seed = ρ_peak/(ρ_total+η_z))",
     ]
@@ -656,9 +650,8 @@ def _format_dynamics_params(model):
         "\n--- L2 ---\n",
         *[ln + "\n" for ln in format_l2_param_lines(d, indent="")],
         "\n--- dynamics ---\n",
-        "drive = b_seed·ρ_seed + b_coll·ρ̃_coll\n",
-        "ρ = drive² / (drive² + b_iso·c̃_iso + b_cross·c̃_cross + η_p² + ε)\n",
-        "  ρ̃_coll = ρ_coll²/(ρ_coll²+η_coll²);  c̃_iso, c̃_cross analogous\n",
+        "drive = b_seed·ρ_seed + b_coll·ρ_coll\n",
+        "ρ = drive² / (drive² + b_iso·c_iso + b_cross·c_cross + η_p² + ε)\n",
         "conv2d pools on cell grid each step; T_refine iterations\n",
     ]
     return "".join(parts)
@@ -764,7 +757,7 @@ def main():
     print(
         f"Dynamics: R_fac={L2.R_FAC_POOL}  R_sup={L2.R_SUP_POOL}  K={L2.K}  "
         f"T={L2.T_REFINE}  "
-        f"drive²/(drive² + b_iso·c̃_iso + b_cross·c̃_cross + η_p²); "
+        f"drive²/(drive² + b_iso·c_iso + b_cross·c_cross + η_p²); "
         f"ρ_seed = ρ_peak/(ρ_total+η_z); "
         f"  TBPTT: {TRAIN.L2_SNAPSHOT_MAX} segments  "
         f"window=max(1, T//{TRAIN.L2_SNAPSHOT_MAX})  (full grad per segment)"

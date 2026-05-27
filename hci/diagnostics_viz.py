@@ -755,7 +755,7 @@ def viz_infer_l2_geometry(
     is_border: np.ndarray,
     out_path: str,
 ) -> bool:
-    """NR-squashed geometry pools on the cell grid: t=0 (ρ seed) vs t=last (final ρ)."""
+    """Raw geometry pools on the cell grid: t=0 (ρ seed) vs t=last (final ρ)."""
     if surface_diags is None:
         return False
     geom = surface_diags.get("geometry")
@@ -789,7 +789,7 @@ def viz_infer_l2_geometry(
         labels,
         is_border,
         out_path,
-        suptitle="L2 cell geometry — NR-squashed collinear / iso / cross pools",
+        suptitle="L2 cell geometry — collinear / iso / cross pools",
         layout_rows_cols=(3, 2),
     )
     return True
