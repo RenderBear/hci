@@ -1,6 +1,6 @@
 r"""train.py — STRIATE training: cell-grid conv dynamics + harmonic render.
 
-Pipeline per image: L0 contrast/harmonics → L1 K-bin projection (ρ_raw from h₂m)
+Pipeline per image: L0 contrast/harmonics (cached) → L1 K-bin projection live each step
 → L2 cell-grid ρ refinement (ρ_seed = ρ_peak/(ρ_total+η_z); conv pools → drive²/(drive² + b_iso·c_iso + b_cross·c_cross + η_p²))
 → splat renderer ($\hat B = \bar\rho \cdot \mathrm{gate}$).
 Loss combines soft-Dice and per-pixel BCE on the same η± valid band
@@ -30,11 +30,15 @@ from hci.L0 import (
     compute_l0_rgb,
     compute_interior,
 )
-from hci.L1 import z_from_l0_harmonics, pad_for_patch_grid, run_l1
+from hci.L1 import (
+    stride_from_patch_overlap,
+    z_from_l0_harmonics,
+    pad_for_patch_grid,
+    run_l1,
+)
 from hci.L2 import TileDynamics
 from hci.renderer import (
     ModulationRenderer,
-    compute_render_features,
     render_boundary_map_torch,
     proj_to_device,
     upgrade_renderer_state_dict,
@@ -81,18 +85,66 @@ def build_l0_pix(
     return out
 
 
+def proj_info_from_grid(H: int, W: int, P: int, patch_overlap: int) -> dict:
+    """Render/L2 grid metadata without running L1."""
+    S = stride_from_patch_overlap(P, patch_overlap)
+    nH = (H - P) // S + 1 if H >= P else 0
+    nW = (W - P) // S + 1 if W >= P else 0
+    return {"H": H, "W": W, "n_cells": nH * nW, "nH": nH, "nW": nW}
+
+
+def run_l1_cells_flat(
+    l0_pix: dict[str, torch.Tensor],
+    border_mask: torch.Tensor,
+    H0: int,
+    W0: int,
+    device: torch.device,
+) -> dict:
+    """Live L1 from cached L0 tensors (ρ / cells depend on current ``L1.*`` params)."""
+    h2m = l0_pix["h2m"].to(device=device, dtype=torch.float32)
+    z1 = torch.complex(
+        l0_pix["z1_re"].to(device=device, dtype=torch.float32),
+        l0_pix["z1_im"].to(device=device, dtype=torch.float32),
+    )
+    z2 = torch.complex(
+        l0_pix["z2_re"].to(device=device, dtype=torch.float32),
+        l0_pix["z2_im"].to(device=device, dtype=torch.float32),
+    )
+    bm = border_mask.to(device=device).bool()
+    cells = run_l1(
+        h2m,
+        z1,
+        z2,
+        L1.PATCH_SIZE,
+        border_mask=bm,
+        patch_overlap=L1.PATCH_OVERLAP,
+        border_patch_max_frac=L1.BORDER_PATCH_MAX_FRAC,
+        eps=L1.EPS,
+        K=L1.K,
+        bin_tuning=L1.COL_BIN_TUNING,
+        cos_power=L1.COL_COS_POWER,
+        von_mises_kappa=L1.COL_VON_MISES_KAPPA,
+        device=device,
+        verbose=False,
+    )
+    P = int(cells["P"])
+    cells["is_border"] |= (
+        (cells["cy"] + P / 2 > H0) | (cells["cx"] + P / 2 > W0)
+    )
+    return build_cells_flat(cells)
+
+
 def build_cells_flat(cells: dict) -> dict:
     nH, nW = cells["nH"], cells["nW"]
     N = nH * nW
     return {
         "nH": nH,
         "nW": nW,
-        "theta": torch.from_numpy(cells["theta"].reshape(N, 2).astype(np.float32)),
-        "q": torch.from_numpy(cells["q"].reshape(N, 2).astype(np.float32)),
-        "kappa": torch.from_numpy(cells["kappa"].reshape(N, 2).astype(np.float32)),
+        "theta": torch.from_numpy(cells["theta"].reshape(N, 1).astype(np.float32)),
+        "q": torch.from_numpy(cells["q"].reshape(N, 1).astype(np.float32)),
+        "kappa": torch.from_numpy(cells["kappa"].reshape(N, 1).astype(np.float32)),
         "z1_abs_sum": torch.from_numpy(cells["z1_abs_sum"].reshape(N).astype(np.float32)),
-        "lam": torch.from_numpy(cells["lam"].reshape(N, 2).astype(np.float32)),
-        "lam3": torch.from_numpy(cells["lam3"].reshape(N).astype(np.float32)),
+        "rho_peak": torch.from_numpy(cells["rho_peak"].reshape(N).astype(np.float32)),
         "z0": torch.from_numpy(cells["z0"].reshape(N).astype(np.float32)),
         "cx_z2": torch.from_numpy(cells["cx_z2"].reshape(N).astype(np.float32)),
         "cy_z2": torch.from_numpy(cells["cy_z2"].reshape(N).astype(np.float32)),
@@ -155,10 +207,10 @@ class StriateE2E(nn.Module):
 def prepare_batch(items, device):
     meta = []
     for item in items:
-        (gi, gt, Hp, Wp, Hg, Wg, H0, W0, cells_flat, l0_pix, img) = item
+        (gi, gt, Hp, Wp, Hg, Wg, H0, W0, l0_pix, border_mask, img) = item
         cf_dev = {
             k: (v.to(device) if isinstance(v, torch.Tensor) else v)
-            for k, v in cells_flat.items()
+            for k, v in run_l1_cells_flat(l0_pix, border_mask, H0, W0, device).items()
         }
         l0_dev = {
             k: v.to(device) for k, v in l0_pix.items()
@@ -166,8 +218,8 @@ def prepare_batch(items, device):
         p_dev = proj_to_device(gi, device)
         meta.append(
             {
-                "nH": cells_flat["nH"],
-                "nW": cells_flat["nW"],
+                "nH": cf_dev["nH"],
+                "nW": cf_dev["nW"],
                 "proj_dev": p_dev,
                 "gt": gt.to(device),
                 "Hp": Hp,
@@ -223,66 +275,33 @@ def precompute_image(img_path, gt_path, gt_format):
     )
     border_mask_t = ~compute_interior(ir_p.shape[0], ir_p.shape[1], ir_t.device)
 
-    z1, z2 = z_from_l0_harmonics(s, border_mask_t)
-
     s_np = s.cpu().numpy()
     border_mask_np = border_mask_t.cpu().numpy()
-    z2_image = (s_np[..., 2] + 1j * s_np[..., 3]).astype(np.complex64)
-    z2_image[border_mask_np] = 0.0
 
     l0_pix = build_l0_pix(
         s_np, h1m, h2m, border_mask_np, h2m_lum=h2m_lum, h2m_chr=h2m_chr,
     )
-    del h, vld, s, h1m, h2m_lum, h2m_chr
+    del h, vld, s, h1m, h2m, h2m_lum, h2m_chr, border_mask_t
     gc.collect()
 
-    cells = run_l1(
-        h2m,
-        z1,
-        z2,
-        L1.PATCH_SIZE,
-        border_mask=border_mask_t,
-        patch_overlap=L1.PATCH_OVERLAP,
-        border_patch_max_frac=L1.BORDER_PATCH_MAX_FRAC,
-        eps=L1.EPS,
-        K=L1.K,
-        cos_power=L1.COL_COS_POWER,
-        verbose=False,
+    H_p, W_p = ir_p.shape[:2]
+    proj_info = proj_info_from_grid(
+        H_p, W_p, L1.PATCH_SIZE, L1.PATCH_OVERLAP,
     )
-    del h2m, z1, z2, border_mask_t
-    gc.collect()
-
-    P = cells["P"]
-    cells["is_border"] |= (cells["cy"] + P / 2 > H0) | (cells["cx"] + P / 2 > W0)
-
-    nH, nW = cells["nH"], cells["nW"]
-
-    proj_info = compute_render_features(
-        z2_image,
-        ir_p,
-        cells,
-        border_mask_np,
-        eps=L2.EPS,
-    )
-    del z2_image, border_mask_np
-    gc.collect()
 
     if gt_format == "mat":
         gt = load_bsds_gt(gt_path)
     else:
         gt = load_png_gt(gt_path)
 
-    H_p, W_p = ir_p.shape[:2]
     H_gt, W_gt = gt.shape
 
-    cells_flat = build_cells_flat(cells)
-
     img_cached = ir_p.astype(np.float32)
-    del cells, ir_p
+    del ir_p
     gc.collect()
 
     return {
-        "cache_version": TRAIN.CACHE_VERSION,
+        "l0_cache_version": TRAIN.L0_CACHE_VERSION,
         "proj_info": proj_info,
         "gt": torch.from_numpy(gt),
         "H_p": H_p,
@@ -291,7 +310,7 @@ def precompute_image(img_path, gt_path, gt_format):
         "W_gt": W_gt,
         "H0": H0,
         "W0": W0,
-        "cells_flat": cells_flat,
+        "border_mask": torch.from_numpy(border_mask_np),
         "l0_pix": l0_pix,
         "img": img_cached,
     }
@@ -310,7 +329,7 @@ def _precompute_one(args):
 
 
 def _cache_entry_valid(data: dict) -> bool:
-    if data.get("cache_version") != TRAIN.CACHE_VERSION:
+    if data.get("l0_cache_version") != TRAIN.L0_CACHE_VERSION:
         return False
     pi = data.get("proj_info")
     if not isinstance(pi, dict):
@@ -318,18 +337,9 @@ def _cache_entry_valid(data: dict) -> bool:
     need_pi = ("H", "W", "n_cells", "nH", "nW")
     if not all(k in pi for k in need_pi):
         return False
-    cf = data.get("cells_flat")
-    if not isinstance(cf, dict):
+    bm = data.get("border_mask")
+    if not isinstance(bm, torch.Tensor):
         return False
-    for key in (
-        "cx_z2",
-        "cy_z2",
-        "z0",
-        "q",
-        "kappa",
-    ):
-        if key not in cf:
-            return False
     l0 = data.get("l0_pix")
     if not isinstance(l0, dict):
         return False
@@ -430,9 +440,9 @@ class StriateDataset(Dataset):
         if not _cache_entry_valid(data):
             raise RuntimeError(
                 f'Cache for "{stem}" is stale or incomplete '
-                f"(cache_version={data.get('cache_version')!r}, "
-                f"expected {TRAIN.CACHE_VERSION}; "
-                f"proj_info must include render grid keys). "
+                f"(l0_cache_version={data.get('l0_cache_version')!r}, "
+                f"expected {TRAIN.L0_CACHE_VERSION}; "
+                f"need l0_pix + border_mask + proj_info). "
                 f"Delete {self.cache_dir} and re-run training."
             )
         H0 = data.get("H0", data["H_gt"])
@@ -446,8 +456,8 @@ class StriateDataset(Dataset):
             data["W_gt"],
             H0,
             W0,
-            data["cells_flat"],
             data["l0_pix"],
+            data["border_mask"],
             data.get("img"),
         )
 
@@ -827,8 +837,8 @@ def main():
         batch = next(iter(train_loader))
         moved = []
         for item in batch:
-            (gi, gt, Hp, Wp, Hg, Wg, H0, W0, cells_flat, l0_pix, img) = item
-            moved.append((gi, gt, Hp, Wp, Hg, Wg, H0, W0, cells_flat, l0_pix, img))
+            (gi, gt, Hp, Wp, Hg, Wg, H0, W0, l0_pix, border_mask, img) = item
+            moved.append((gi, gt, Hp, Wp, Hg, Wg, H0, W0, l0_pix, border_mask, img))
         debug_drive_batch(
             model,
             prepare_batch(moved, device),
@@ -856,8 +866,8 @@ def main():
         for batch in train_loader:
             moved = []
             for item in batch:
-                (gi, gt, Hp, Wp, Hg, Wg, H0, W0, cells_flat, l0_pix, img) = item
-                moved.append((gi, gt, Hp, Wp, Hg, Wg, H0, W0, cells_flat, l0_pix, img))
+                (gi, gt, Hp, Wp, Hg, Wg, H0, W0, l0_pix, border_mask, img) = item
+                moved.append((gi, gt, Hp, Wp, Hg, Wg, H0, W0, l0_pix, border_mask, img))
 
             meta_list = prepare_batch(moved, device)
             bmaps = model.forward_batch(meta_list)

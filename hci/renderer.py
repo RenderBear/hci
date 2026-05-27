@@ -407,6 +407,8 @@ def proj_to_device(proj: dict, device: torch.device) -> dict:
 
 
 def _theta_on_branch(theta, branch_pick, n_cells, device):
+    if theta.dim() == 1:
+        return theta.to(device=device)
     if branch_pick is not None:
         b = branch_pick.to(device=device, dtype=torch.long).view(-1)
         idx_n = torch.arange(n_cells, device=device, dtype=torch.long)

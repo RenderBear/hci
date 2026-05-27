@@ -1,8 +1,8 @@
-r"""L1 — pixel K-bin cos² projection → cell grid (GPU-native).
+r"""L1 — pixel K-bin orientation projection → cell grid (GPU-native).
 
-Per pixel: e_k = h_{2m} · cos^p(θ_{2m} − kπ/K).  Average-pool each bin channel
-over P×P patches (stride S) → ρ_raw^{(k)}(c).  Dominant θ from argmax_k; seed
-inputs peak / total mass exported as lam[...,0] and z0 for L2.
+Per pixel (default von Mises): e_k = h_{2m} · exp(κ cos(2(θ_{2m} − kπ/K))).
+Alternate: e_k = h_{2m} · cos^p(θ_{2m} − kπ/K).  Sum-pool over P×P patches →
+ρ_raw^{(k)}(c).  Dominant θ from argmax_k; ρ_peak / ρ_total → z0 for L2 seed.
 """
 
 from __future__ import annotations
@@ -76,6 +76,8 @@ def _patch_orientation_kappa(
 ) -> torch.Tensor:
     """Per-cell orientation confidence κ ∈ [0, 1] from z₁ polarity agreement."""
     n, _ = z1_patches.shape
+    theta = theta.reshape(n, 1)
+    q = q.reshape(n, 1)
     device = z1_patches.device
     half = (P - 1) / 2.0
     ys = torch.arange(P, device=device, dtype=torch.float64) - half
@@ -97,7 +99,7 @@ def _patch_orientation_kappa(
     proj = nx.unsqueeze(-1) * zr.unsqueeze(1) + ny.unsqueeze(-1) * zi.unsqueeze(1)
     signed_mean = proj.mean(dim=-1)
     abs_mean = proj.abs().mean(dim=-1).clamp_min(eps)
-    return (signed_mean.abs() / abs_mean).clamp(0.0, 1.0).to(torch.float32)
+    return (signed_mean.abs() / abs_mean).clamp(0.0, 1.0).to(torch.float32).reshape(n)
 
 
 def _sum_pool2d(field: torch.Tensor, P: int, S: int) -> torch.Tensor:
@@ -113,11 +115,31 @@ def _sum_pool_bins(e: torch.Tensor, P: int, S: int) -> torch.Tensor:
     return pooled.squeeze(0).permute(1, 2, 0)
 
 
+def _bin_tuning_weight(
+    diff: torch.Tensor,
+    *,
+    mode: str,
+    cos_power: int,
+    von_mises_kappa: float,
+) -> torch.Tensor:
+    """Orientation weight per bin; ``diff`` is ``θ_{2m} − bar_θ_k`` (period π)."""
+    m = str(mode).lower().strip()
+    if m == "von_mises":
+        kappa = float(von_mises_kappa)
+        return torch.exp(kappa * torch.cos(2.0 * diff))
+    if m in ("cos_pow", "cos", "cos2"):
+        return torch.cos(diff).pow(max(int(cos_power), 1))
+    raise ValueError(f"unknown COL_BIN_TUNING mode {mode!r}; use 'von_mises' or 'cos_pow'")
+
+
 def _pixel_bin_energy(
     h2m: torch.Tensor,
     z2: torch.Tensor,
     K: int,
-    cos_power: int,
+    *,
+    bin_tuning: str = "von_mises",
+    cos_power: int = 2,
+    von_mises_kappa: float = 4.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return e (H,W,K) and bar_theta (K,)."""
     device = h2m.device
@@ -125,7 +147,12 @@ def _pixel_bin_energy(
     theta_2m = (0.5 * torch.angle(z2)).to(dtype)
     bar_theta = torch.linspace(0, math.pi, K + 1, device=device, dtype=dtype)[:-1]
     diff = theta_2m.unsqueeze(-1) - bar_theta
-    tuning = torch.cos(diff).pow(int(cos_power))
+    tuning = _bin_tuning_weight(
+        diff,
+        mode=bin_tuning,
+        cos_power=cos_power,
+        von_mises_kappa=von_mises_kappa,
+    )
     e = h2m.unsqueeze(-1) * tuning
     return e, bar_theta
 
@@ -140,7 +167,9 @@ def run_l1(
     border_patch_max_frac: float,
     eps: float,
     K: int | None = None,
+    bin_tuning: str | None = None,
     cos_power: int | None = None,
+    von_mises_kappa: float | None = None,
     device: torch.device | str | None = None,
     verbose: bool = True,
 ) -> dict:
@@ -151,7 +180,13 @@ def run_l1(
     border_mask = border_mask.to(dev)
 
     K = int(L1.K if K is None else K)
+    tuning = str(
+        L1.COL_BIN_TUNING if bin_tuning is None else bin_tuning
+    )
     cos_power = int(L1.COL_COS_POWER if cos_power is None else cos_power)
+    kappa = float(
+        L1.COL_VON_MISES_KAPPA if von_mises_kappa is None else von_mises_kappa
+    )
 
     H, W = h2m.shape
     S = stride_from_patch_overlap(P, patch_overlap)
@@ -161,10 +196,17 @@ def run_l1(
 
     if verbose:
         print(
-            f"  grid {nH}x{nW} = {n} cells, K={K} bins, cos^{cos_power} projection"
+            f"  grid {nH}x{nW} = {n} cells, K={K} bins, "
+            f"{tuning} projection"
+            + (f" (κ={kappa:g})" if tuning == "von_mises" else f" (cos^{cos_power})")
         )
 
-    e, bar_theta = _pixel_bin_energy(h2m, z2, K, cos_power)
+    e, bar_theta = _pixel_bin_energy(
+        h2m, z2, K,
+        bin_tuning=tuning,
+        cos_power=cos_power,
+        von_mises_kappa=kappa,
+    )
     rho_bins = _sum_pool_bins(e, P, S)
     del e
 
@@ -176,10 +218,6 @@ def run_l1(
     rho_peak, k_star = rho_bins.max(dim=-1)
     theta_2d = bar_theta[k_star]
     theta_flat = theta_2d.reshape(-1)
-
-    rho_sorted, _ = torch.sort(rho_bins, dim=-1, descending=True)
-    rho_second = rho_sorted[..., 1] if K > 1 else torch.zeros_like(rho_peak)
-    rho_offpeak = (rho_total - rho_peak).clamp_min(0.0)
 
     delta_2d = (rho_peak / (rho_total + eps)).clamp(0.0, 1.0)
     delta_flat = delta_2d.reshape(-1)
@@ -193,22 +231,14 @@ def run_l1(
     )
     q_flat = (Z1_sum.conj() * exp_ith).real.to(torch.float32)
 
-    kappa_br = _patch_orientation_kappa(
+    kappa_flat = _patch_orientation_kappa(
         z1_patches,
-        theta_flat.unsqueeze(-1),
-        q_flat.unsqueeze(-1),
+        theta_flat,
+        q_flat,
         P,
         eps,
     )
     del z1_patches
-    if L1.N_BRANCHES > 1:
-        kappa_flat = torch.cat(
-            [kappa_br, torch.zeros(n, L1.N_BRANCHES - 1, device=dev, dtype=kappa_br.dtype)],
-            dim=-1,
-        )
-    else:
-        kappa_flat = kappa_br
-    kappa_b0 = kappa_br[:, 0]
 
     n_pix_patch_f = float(P * P)
     z1_bar = Z1_sum / n_pix_patch_f
@@ -217,26 +247,16 @@ def run_l1(
 
     rho_peak_flat = rho_peak.reshape(-1)
     rho_total_flat = rho_total.reshape(-1)
-    rho_second_flat = rho_second.reshape(-1)
-    rho_offpeak_flat = rho_offpeak.reshape(-1)
-
     theta_flat = torch.where(is_border_flat, torch.zeros_like(theta_flat), theta_flat)
     q_flat = torch.where(is_border_flat, torch.zeros_like(q_flat), q_flat)
     delta_flat = torch.where(is_border_flat, torch.zeros_like(delta_flat), delta_flat)
     rho_peak_flat = torch.where(is_border_flat, torch.zeros_like(rho_peak_flat), rho_peak_flat)
     rho_total_flat = torch.where(is_border_flat, torch.zeros_like(rho_total_flat), rho_total_flat)
-    rho_second_flat = torch.where(is_border_flat, torch.zeros_like(rho_second_flat), rho_second_flat)
-    rho_offpeak_flat = torch.where(is_border_flat, torch.zeros_like(rho_offpeak_flat), rho_offpeak_flat)
-    kappa_flat[is_border_flat] = 0.0
+    kappa_flat = kappa_flat.masked_fill(is_border_flat, 0.0)
     z1_bar_abs_flat = torch.where(
         is_border_flat, torch.zeros_like(z1_bar_abs_flat), z1_bar_abs_flat,
     )
     phi_z1_flat = torch.where(is_border_flat, torch.zeros_like(phi_z1_flat), phi_z1_flat)
-
-    lam_flat = torch.stack([rho_peak_flat, rho_second_flat], dim=-1)
-    theta_br = torch.stack([theta_flat, torch.zeros_like(theta_flat)], dim=-1)
-    q_br = torch.stack([q_flat, torch.zeros_like(q_flat)], dim=-1)
-    delta_br = torch.stack([delta_flat, torch.zeros_like(delta_flat)], dim=-1)
 
     pis = torch.arange(nH, device=dev).repeat_interleave(nW)
     pjs = torch.arange(nW, device=dev).repeat(nH)
@@ -266,7 +286,7 @@ def run_l1(
         print(f"  rho_total: mean={rt.mean():.2f} max={rt.max():.2f}")
         print(f"  delta (peak/total): mean={float(delta_flat.mean()):.3f}")
         print(f"  |q|: mean={float(q_flat.abs().mean()):.3f}")
-        print(f"  kappa: mean={float(kappa_b0.mean()):.3f}")
+        print(f"  kappa: mean={float(kappa_flat.mean()):.3f}")
 
     def _to_np(t):
         return t.cpu().numpy()
@@ -277,15 +297,12 @@ def run_l1(
         "S": S,
         "P": P,
         "K": K,
-        "theta": _to_np(theta_br.reshape(nH, nW, L1.N_BRANCHES)),
-        "q": _to_np(q_br.reshape(nH, nW, L1.N_BRANCHES)),
-        "delta": _to_np(delta_br.reshape(nH, nW, L1.N_BRANCHES)),
-        "kappa": _to_np(kappa_flat.reshape(nH, nW, L1.N_BRANCHES)),
-        "lam": _to_np(lam_flat.reshape(nH, nW, L1.N_BRANCHES)),
-        "lam3": _to_np(rho_offpeak_flat.reshape(nH, nW)),
+        "theta": _to_np(theta_flat.reshape(nH, nW)),
+        "q": _to_np(q_flat.reshape(nH, nW)),
+        "delta": _to_np(delta_flat.reshape(nH, nW)),
+        "kappa": _to_np(kappa_flat.reshape(nH, nW)),
+        "rho_peak": _to_np(rho_peak_flat.reshape(nH, nW)),
         "z0": _to_np(rho_total_flat.reshape(nH, nW)),
-        "rho_bins": _to_np(rho_bins),
-        "lam_bar": _to_np((rho_total_flat / max(K, 1)).reshape(nH, nW)),
         "cx": _to_np(cx_grid),
         "cy": _to_np(cy_grid),
         "cx_z2": _to_np(cx_anchor),

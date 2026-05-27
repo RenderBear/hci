@@ -4,15 +4,15 @@ Seed (once, fixed in drive):
        ρ_seed = ρ_peak / (ρ_total + η_z + ε)
 
   L1 exports ρ_peak = max_k ρ_raw^{(k)} and ρ_total = Σ_k ρ_raw^{(k)} as
-  cells_flat["lam"][...,0] and cells_flat["z0"].
+  cells_flat["rho_peak"] and cells_flat["z0"].
 
   Per iteration t (ρ⁽⁰⁾ = ρ_seed for pooling; ρ_seed fixed in drive):
        drive = b_seed·ρ_seed + b_coll·ρ_coll
        ρ⁽ᵗ⁺¹⁾ = drive² / (drive² + b_iso·c_iso + b_cross·c_cross + η_p² + ε)
 
   Geometric pools (ρ_coll, c_iso, c_cross): grouped conv2d over (2R+1)² neighborhoods
-  (collinear R_fac; iso/cross R_sup); per-cell hard θ-bin gather; coll and iso count-normalized;
-  cross = (m₀_total − m₀_own)/m₀_total.
+  (collinear R_fac; iso/cross R_sup); ρ scattered into K channels by hard θ-bin before conv;
+  per-cell gather at own bin; coll/iso count-normalized; cross = mean ρ² in other bins locally.
 
 Learned: b_coll, b_seed, b_iso, b_cross, η_p, η_z
          — **6** nonnegative scalars (softplus).
@@ -106,7 +106,7 @@ def _pool_cell_geometry(
     R_sup: int,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Convolve ρ / ρ² on the cell grid; gather own θ-bin; return normalized (nH, nW) pools."""
+    """Scatter ρ into K θ-bin channels, grouped conv, gather own bin; (nH, nW) pools."""
     nH, nW = ok_map.shape
     K = W_cross.shape[0]
     dtype = rho.dtype
@@ -122,18 +122,6 @@ def _pool_cell_geometry(
     W_count_coll = W_count_coll.to(device=dev, dtype=dtype)
     W_count = W_count.to(device=dev, dtype=dtype)
 
-    coll_all = Fn.conv2d(rho_2d, W_coll, padding=R_fac)
-    iso_all = Fn.conv2d(rho_sq_2d, W_iso, padding=R_sup)
-    count_coll = Fn.conv2d(ok_2d, W_count_coll, padding=R_fac)
-    count_all = Fn.conv2d(ok_2d, W_count, padding=R_sup)
-
-    b = bin_map.to(device=dev).view(1, 1, nH, nW)
-    own_count_coll = count_coll.gather(1, b).squeeze(0).squeeze(0)
-    own_count = count_all.gather(1, b).squeeze(0).squeeze(0)
-
-    rho_coll = coll_all.gather(1, b).squeeze(0).squeeze(0) / (own_count_coll + eps)
-    c_iso = iso_all.gather(1, b).squeeze(0).squeeze(0) / (own_count + eps)
-
     bin_onehot = (
         Fn.one_hot(bin_map.reshape(-1).long(), K)
         .to(dtype=dtype, device=dev)
@@ -141,11 +129,28 @@ def _pool_cell_geometry(
         .permute(2, 0, 1)
         .unsqueeze(0)
     )
+    rho_bins = bin_onehot * rho_2d
     rho_sq_bins = bin_onehot * rho_sq_2d
+    ok_bins = bin_onehot * ok_2d
+
+    coll_bins = Fn.conv2d(rho_bins, W_coll, padding=R_fac, groups=K)
+    iso_bins = Fn.conv2d(rho_sq_bins, W_iso, padding=R_sup, groups=K)
+    count_coll_bins = Fn.conv2d(ok_bins, W_count_coll, padding=R_fac, groups=K)
+    count_bins = Fn.conv2d(ok_bins, W_count, padding=R_sup, groups=K)
+
+    b = bin_map.to(device=dev).view(1, 1, nH, nW)
+    own_count_coll = count_coll_bins.gather(1, b).squeeze(0).squeeze(0)
+    own_count = count_bins.gather(1, b).squeeze(0).squeeze(0)
+
+    rho_coll = coll_bins.gather(1, b).squeeze(0).squeeze(0) / (own_count_coll + eps)
+    c_iso = iso_bins.gather(1, b).squeeze(0).squeeze(0) / (own_count + eps)
+
     m0_bins = Fn.conv2d(rho_sq_bins, W_cross, padding=R_sup, groups=K)
     m0_total = m0_bins.sum(dim=1).squeeze(0)
+    count_total = count_bins.sum(dim=1).squeeze(0)
     own_m0 = m0_bins.gather(1, b).squeeze(0).squeeze(0)
-    c_cross = (m0_total - own_m0) / (m0_total + eps)
+    count_own = count_bins.gather(1, b).squeeze(0).squeeze(0)
+    c_cross = (m0_total - own_m0) / (count_total - count_own + eps)
 
     ok_f = ok_map.to(dtype=dtype, device=dev)
     rho_coll = rho_coll * ok_f
@@ -162,16 +167,16 @@ def _inv_softplus(x):
     return math.log(math.expm1(max(float(x), 1e-8)))
 
 
-def rho_seed_from_lam1_z0(
-    lam1: torch.Tensor,
+def rho_seed_from_peak_z0(
+    rho_peak: torch.Tensor,
     z0: torch.Tensor,
     eta_z: torch.Tensor,
     is_border: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    """ρ_seed = ρ_peak / (ρ_total + η_z + ε); lam1=peak bin mass, z0=total bin mass."""
+    """ρ_seed = ρ_peak / (ρ_total + η_z + ε)."""
     denom = z0 + eta_z + eps
-    rho = lam1 / denom.clamp_min(eps)
+    rho = rho_peak / denom.clamp_min(eps)
     return torch.where(is_border, torch.zeros_like(rho), rho)
 
 
@@ -329,14 +334,15 @@ class TileDynamics(nn.Module):
         N = nH * nW
 
         theta_full = cells_flat["theta"].to(device)
-        lam_full = cells_flat["lam"].to(device)
+        rho_peak = cells_flat["rho_peak"].to(device)
         z0 = cells_flat["z0"].to(device)
         is_border = cells_flat["is_border"].to(device)
-        theta_flat = theta_full[:, 0].reshape(-1)
+        theta_flat = theta_full.reshape(-1) if theta_full.dim() == 2 else theta_full
+        if theta_flat.dim() == 2:
+            theta_flat = theta_flat[:, 0]
 
-        lam1 = lam_full[..., 0]
-        rho_seed = rho_seed_from_lam1_z0(
-            lam1, z0, self.eta_z, is_border, self.eps,
+        rho_seed = rho_seed_from_peak_z0(
+            rho_peak, z0, self.eta_z, is_border, self.eps,
         )
 
         ok_map = (~is_border).reshape(nH, nW)

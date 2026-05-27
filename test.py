@@ -176,7 +176,9 @@ def run_image_inference(model, img_path, device):
         border_patch_max_frac=L1.BORDER_PATCH_MAX_FRAC,
         eps=L1.EPS,
         K=L1.K,
+        bin_tuning=L1.COL_BIN_TUNING,
         cos_power=L1.COL_COS_POWER,
+        von_mises_kappa=L1.COL_VON_MISES_KAPPA,
         device=device,
         verbose=False,
     )

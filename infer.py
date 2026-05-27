@@ -29,7 +29,7 @@ from hci.renderer import (
 )
 from hci.diagnostics_viz import (
     viz_infer_l0_pinwheel,
-    viz_infer_l1_lambdas,
+    viz_infer_l1_rho_masses,
     viz_infer_cell_rho_maps,
     viz_infer_rho_hist_cdf,
     viz_l2_bimodality_per_iter,
@@ -44,7 +44,7 @@ from hci.diagnostics_viz import (
 )
 from hci.L2 import (
     l2_snapshot_steps,
-    rho_seed_from_lam1_z0,
+    rho_seed_from_peak_z0,
 )
 from train import (
     StriateE2E,
@@ -68,11 +68,11 @@ def _rho_out_seed_only(
     d = model.dynamics
     nH, nW = int(cf_dev["nH"]), int(cf_dev["nW"])
     N = nH * nW
-    lam1 = cf_dev["lam"][..., 0].to(device)
+    rho_peak = cf_dev["rho_peak"].to(device)
     z0 = cf_dev["z0"].to(device)
     is_border = cf_dev["is_border"].to(device)
-    rho_seed = rho_seed_from_lam1_z0(
-        lam1, z0, d.eta_z, is_border, d.eps,
+    rho_seed = rho_seed_from_peak_z0(
+        rho_peak, z0, d.eta_z, is_border, d.eps,
     )
 
     interior = (~is_border).to(dtype=rho_seed.dtype)
@@ -170,7 +170,9 @@ def run_l0_l1(img_path, device):
         border_patch_max_frac=L1.BORDER_PATCH_MAX_FRAC,
         eps=L1.EPS,
         K=L1.K,
+        bin_tuning=L1.COL_BIN_TUNING,
         cos_power=L1.COL_COS_POWER,
+        von_mises_kappa=L1.COL_VON_MISES_KAPPA,
         device=device,
         verbose=False,
     )
@@ -191,8 +193,7 @@ def run_l0_l1(img_path, device):
     N = nH * nW
     cells_flat = build_cells_flat(cells)
 
-    lam_grid = cells["lam"].astype(np.float64, copy=True)
-    lam3_grid = cells["lam3"].astype(np.float64, copy=True)
+    rho_peak_grid = cells["rho_peak"].astype(np.float64, copy=True)
     z0_grid = cells["z0"].astype(np.float64, copy=True)
     is_border_grid = cells["is_border"].copy()
     Hp, Wp = ir_p.shape[:2]
@@ -211,8 +212,7 @@ def run_l0_l1(img_path, device):
         "W0": W0,
         "nH": nH,
         "nW": nW,
-        "lam_grid": lam_grid,
-        "lam3_grid": lam3_grid,
+        "rho_peak_grid": rho_peak_grid,
         "z0_grid": z0_grid,
         "is_border_grid": is_border_grid,
         "h_np": h_np,
@@ -460,7 +460,7 @@ def main():
         "-d",
         "--diagnostics",
         action="store_true",
-        help="Save additional diagnostics: base, l0_pinwheel, l1_lambdas, geometry, "
+        help="Save additional diagnostics: base, l0_pinwheel, l1_rho_masses, geometry, "
         "l2_rho_seed_post, l2_rho_hist_cdf, l2_bimodality_per_iter, l2_facilitation_factors, "
         "l2_suppression_factors, l2_bin_dynamics, render_softmap, "
         f"iters_snapshot (up to {TRAIN.L2_SNAPSHOT_MAX} softmaps evenly spaced over L2 steps; "
@@ -526,14 +526,14 @@ def main():
         model.dynamics.T_refine = t_refine_ckpt
 
     d = model.dynamics
-    lam_np = prep["lam_grid"]
+    rho_peak_np = prep["rho_peak_grid"]
     z0_np = prep["z0_grid"]
     nH, nW = int(prep["nH"]), int(prep["nW"])
-    lam_t = torch.from_numpy(lam_np[..., 0].astype(np.float32)).to(device)
+    rho_peak_t = torch.from_numpy(rho_peak_np.astype(np.float32)).to(device)
     z0_t = torch.from_numpy(z0_np.astype(np.float32)).to(device)
     ib_t = torch.from_numpy(np.asarray(is_border, dtype=np.bool_)).to(device)
     rho_seed_vis = (
-        rho_seed_from_lam1_z0(lam_t, z0_t, d.eta_z, ib_t, float(d.eps))
+        rho_seed_from_peak_z0(rho_peak_t, z0_t, d.eta_z, ib_t, float(d.eps))
         .detach()
         .cpu()
         .numpy()
@@ -610,9 +610,11 @@ def main():
         viz_infer_l0_pinwheel(prep["h_np"], prep["img_pinwheel"], p_pin)
         saved_files.append(p_pin)
 
-        p_lam = os.path.join(od, f"{stem}_l1_lambdas.png")
-        viz_infer_l1_lambdas(prep["lam_grid"], prep["lam3_grid"], is_border, p_lam)
-        saved_files.append(p_lam)
+        p_rho = os.path.join(od, f"{stem}_l1_rho_masses.png")
+        viz_infer_l1_rho_masses(
+            prep["rho_peak_grid"], prep["z0_grid"], is_border, p_rho,
+        )
+        saved_files.append(p_rho)
 
         p_maps = os.path.join(od, f"{stem}_l2_rho_seed_post.png")
         viz_infer_cell_rho_maps(

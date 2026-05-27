@@ -7,7 +7,7 @@ This file records the **notation and equations implemented in this repository**:
 ## 1. End-to-end pipeline
 
 1. **L0** — RGB → split luminance / chrominance directional differences; per-direction min subtraction; independent Naka–Rushton per channel with **fixed** scalars $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ (`L0.ETA_LUM`, `L0.ETA_CHR`) and gain $\gamma$ (`L0.GAMMA`). Produces harmonic stack $s$, magnitudes $h_{1m}, h_{2m}$, and split $h_{2m}^{\mathrm{lum}}, h_{2m}^{\mathrm{chr}}$. Complex fields $z_1, z_2$ are read from $s$ (`z_from_l0_harmonics`). L0 is **precomputed and cached** for training; it is not updated during training.
-2. **L1** — Pixel $K$-bin $\cos^p$ projection of $h_{2m}$ (`L1.K`, `L1.COL_COS_POWER`); sum-pool over $P\times P$ patches → per-cell $\rho_{\mathrm{raw}}^{(k)}$, dominant $\theta$, polarity $q$, anisotropy $\delta$, optional $\kappa$, and $h_{2m}$-weighted splat anchors. **Precomputed and cached** with L0.
+2. **L1** — Pixel $K$-bin von Mises (or $\cos^p$) projection of $h_{2m}$ (`L1.K`, `L1.COL_VON_MISES_KAPPA`); sum-pool over $P\times P$ patches → per-cell $\rho_{\mathrm{raw}}^{(k)}$, dominant $\theta$, polarity $q$, anisotropy $\delta$, optional $\kappa$, and $h_{2m}$-weighted splat anchors. **Precomputed and cached** with L0.
 3. **L2** (`TileDynamics`) — Seed $\rho_{\mathrm{seed}} = \rho_{\mathrm{peak}}/(\rho_{\mathrm{total}}+\eta_z)$; then $T_{\mathrm{refine}}$ recurrent steps with grouped `conv2d` collinear / iso / cross pools and divisive $\rho$ update. Runs **live each training step** so gradients reach the six learned L2 scalars.
 4. **Renderer** (`ModulationRenderer`) — Cell-grid $\theta$ combing and $\rho$-gated anchor smoothing; **Gaussian-line splat** of refined $\rho$ to pixels; coherence map; tangential / normal **stencils on $\bar\rho$**; **12→8→1** thinning MLP gate:
    $$\hat B(p) = \bar\rho(p)\,\mathrm{gate}(p).$$
@@ -71,11 +71,20 @@ $$
 \theta_{2m}(p) = \tfrac12 \arg z_2(p).
 $$
 
-**Pixel-level bin channels** ($p = \texttt{L1.COL\_COS\_POWER}$, default 4):
+**Pixel-level bin channels** (default: von Mises, `L1.COL_BIN_TUNING`, `L1.COL_VON_MISES_KAPPA` $= 4$):
 
 $$
-e_k(p) = h_{2m}(p)\,\cos^{p}\!\bigl(\theta_{2m}(p) - \bar\theta_k\bigr), \qquad k = 0,\ldots,K-1.
+e_k(p) = h_{2m}(p)\,\exp\!\Bigl(\kappa\,\cos\bigl(2(\theta_{2m}(p) - \bar\theta_k)\bigr)\Bigr),
+\qquad \kappa = \texttt{COL\_VON\_MISES\_KAPPA}.
 $$
+
+Alternate (`COL_BIN_TUNING` = `cos_pow`, `COL_COS_POWER` $= p$):
+
+$$
+e_k(p) = h_{2m}(p)\,\cos^{p}\!\bigl(\theta_{2m}(p) - \bar\theta_k\bigr).
+$$
+
+At $\kappa{=}0$ the von Mises factor is flat across bins; at $\kappa{=}4$ it is much sharper than $\cos^2$ tuning. Mass is **not** normalized across $k$ at the pixel (contrast comes from pooling and L2).
 
 **Per-cell raw bin mass** (sum over patch; implemented as sum-pool / `avg_pool2d` × $P^2$):
 
@@ -113,17 +122,14 @@ c_x(c) = \frac{\sum_{p \in \mathrm{patch}(c)} h_{2m}(p)\, x(p)}{\sum_{p \in \mat
 c_y(c) \text{ analogously}.
 $$
 
-**Cache / L2-facing fields** (legacy key names preserved):
+**L2-facing fields** (`cells_flat`):
 
 | Key | Value |
 |-----|--------|
-| `lam[...,0]` | $\rho_{\mathrm{peak}}$ |
-| `lam[...,1]` | second-largest bin mass |
-| `z0` | $\rho_{\mathrm{total}}$ |
-| `lam3` | $\rho_{\mathrm{total}} - \rho_{\mathrm{peak}}$ (off-peak mass) |
-| `rho_bins` | full $(n_H, n_W, K)$ tensor |
+| `rho_peak` | $\rho_{\mathrm{peak}}$ (max bin mass) |
+| `z0` | $\rho_{\mathrm{total}}$ (sum over bins) |
 
-Border cells zero $\theta, q, \delta, \rho_{\mathrm{raw}}, \kappa$. L2 uses **branch 0 only** ($\theta = \theta_0$); `branch_pick` from `TileDynamics` is always zero.
+Border cells zero $\theta, q, \delta, \kappa, \rho_{\mathrm{peak}}, \rho_{\mathrm{total}}$.
 
 ---
 
@@ -142,7 +148,7 @@ $$
 \eta_z = \mathrm{softplus}(\tilde\eta_z),
 $$
 
-with $\rho_{\mathrm{peak}} = \texttt{lam[...,0]}$ and $\rho_{\mathrm{total}} = \texttt{z0}$ from L1 (§3). Border cells: $\rho_{\mathrm{seed}} = 0$. With $T_{\mathrm{refine}}=0$ (`infer --no-dynamics`), $\rho$ stays at $\rho_{\mathrm{seed}}$ on interior cells.
+with $\rho_{\mathrm{peak}}$ and $\rho_{\mathrm{total}} = \texttt{z0}$ from L1 (§3). Border cells: $\rho_{\mathrm{seed}} = 0$. With $T_{\mathrm{refine}}=0$ (`infer --no-dynamics`), $\rho$ stays at $\rho_{\mathrm{seed}}$ on interior cells.
 
 ### Learned scalars (softplus of raw parameters)
 
@@ -178,22 +184,26 @@ $$
 
 Let $\rho^{(t)}$ be the scalar $\rho$ field at pass start ($\rho^{(0)} = \rho_{\mathrm{seed}}$). Pools use $\rho^{(t)}$; $\rho_{\mathrm{seed}}$ is **fixed** in the drive.
 
-Gather at each cell's hard bin $b(c)$ after grouped `conv2d`:
+**Per-bin scatter** (hard bin $b(c)$ from $\theta$): $\rho^{(t)}$ and $\rho^{(t)\,2}$ are placed only in channel $b(c)$ (one-hot), then **grouped** `conv2d` with $K$ kernels so collinear/iso/cross only aggregate mass from cells assigned to each orientation bin.
+
+Gather at own bin $b(c)$ after count normalization:
 
 $$
-\rho_{\mathrm{coll}}(c) = \frac{(W^{\mathrm{coll}}_{b(c)} * \rho^{(t)})(c)}{(W^{\mathrm{coll}}_{b(c)} * \mathbf{1})(c) + \varepsilon},
+\rho_{\mathrm{coll}}(c) = \frac{(W^{\mathrm{coll}}_{b(c)} * \rho^{(t)}_{b(c)})(c)}{(W^{\mathrm{coll}}_{b(c)} * \mathbf{1}_{b(c)})(c) + \varepsilon},
 $$
 $$
-c_{\mathrm{iso}}(c) = \frac{(W^{\mathrm{iso}}_{b(c)} * (\rho^{(t)})^2)(c)}{(W^{\mathrm{iso}}_{b(c)} * \mathbf{1})(c) + \varepsilon},
-$$
-
-Cross pool mixes $\rho^2$ across bins before isotropic convolution; own-bin mass is subtracted:
-
-$$
-c_{\mathrm{cross}}(c) = \frac{m_0^{\mathrm{tot}}(c) - m_0^{\mathrm{own}}(c)}{m_0^{\mathrm{tot}}(c) + \varepsilon},
+c_{\mathrm{iso}}(c) = \frac{(W^{\mathrm{iso}}_{b(c)} * (\rho^{(t)}_{b(c)})^2)(c)}{(W^{\mathrm{iso}}_{b(c)} * \mathbf{1}_{b(c)})(c) + \varepsilon},
 $$
 
-where $m_0^{\mathrm{tot}}$ is the isotropic conv sum over all bins and $m_0^{\mathrm{own}}$ the own-bin contribution. All pools are masked by $\mathrm{ok}(c)$. Raw pool values enter the recurrence directly (no per-pool NR squash).
+where $\rho^{(t)}_{k}(p) = \rho^{(t)}(p)$ if $b(p)=k$ else $0$ (same for $\mathbf{1}_k$).
+
+**Cross** — local mean $\rho^2$ in **other** bins (not normalized by total mass, which is $\approx (K{-}1)/K$ everywhere):
+
+$$
+c_{\mathrm{cross}}(c) = \frac{m_0^{\mathrm{tot}}(c) - m_0^{\mathrm{own}}(c)}{(N^{\mathrm{tot}}(c) - N^{\mathrm{own}}(c)) + \varepsilon},
+$$
+
+with $m_0^{\mathrm{tot}} = \sum_k (W^{\mathrm{cross}} * \rho^{(t)\,2}_k)$, $m_0^{\mathrm{own}}$ the $b(c)$ channel, and $N^{\mathrm{tot}}, N^{\mathrm{own}}$ the analogous neighbor counts from $W^{\mathrm{cross}}$ on $\mathbf{1}_k$. All pools are masked by $\mathrm{ok}(c)$. Raw pool values enter the recurrence directly (no per-pool NR squash).
 
 ### Pass update ($t = 0,\ldots,T_{\mathrm{refine}}-1$, `L2.T_REFINE`)
 
@@ -275,8 +285,8 @@ $\mathrm{MLP}$: **12 → 8 → 1**. Output is cropped to original content size $
 
 ## 6. Training (`train.py`)
 
-- **Disk cache** (`precompute_image`): L0 + L1 + `cells_flat`, `l0_pix`, GT, projection metadata — **not** L2 $\rho$ or renderer output. Invalidation: `TRAIN.CACHE_VERSION`.
-- **Each step** (`prepare_batch` → `StriateE2E.forward_batch`): L2 runs live on cached `cells_flat`; renderer consumes the same cached L0 tensors (passed through for API compat; splat stencils use $\bar\rho$, not $h_{2m}$).
+- **Disk cache** (`precompute_image`): L0 only — padded RGB, `l0_pix` ($h_{2m}$, $z_1$, $z_2$ channels), `border_mask`, GT, `proj_info` grid dims. **No** L1 $\rho$/cells. Invalidation: `TRAIN.L0_CACHE_VERSION` (bump when L0/pad/`l0_pix` change, **not** von Mises / L1 tuning).
+- **Each step** (`prepare_batch`): **live L1** from cached L0 → `cells_flat_dev`, then L2 + renderer. Changing `L1.COL_BIN_TUNING`, `COL_VON_MISES_KAPPA`, etc. does not require rebuilding the cache.
 
 **Loss** (defaults `TRAIN.LAM_DICE=0`, `TRAIN.LAM_BCE=1`): weighted sum of soft-Dice and/or BCE on the **η± edge band** — valid pixels where $\mathrm{GT} \ge \eta_{\mathrm{pos}}$ or $\mathrm{GT} < \eta_{\mathrm{neg}}$ (default $\eta_{\mathrm{pos}} = \eta_{\mathrm{neg}} = 0.5$). Positive label on $\mathrm{GT} \ge \eta_{\mathrm{pos}}$.
 

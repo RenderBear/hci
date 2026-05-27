@@ -83,28 +83,25 @@ def _interior_vmin_vmax(arr: np.ndarray, interior: np.ndarray) -> tuple[float, f
     return vmin, vmax
 
 
-def viz_l1_lambdas_three(
-    lam1: np.ndarray,
-    lam2: np.ndarray,
-    lam3: np.ndarray,
+def viz_l1_rho_masses(
+    rho_peak: np.ndarray,
+    rho_total: np.ndarray,
     is_border: np.ndarray,
     out_path: str,
     suptitle: str,
 ) -> None:
 
     cmap = "coolwarm"
-    a1 = apply_border_zero(lam1, is_border)
-    a2 = apply_border_zero(lam2, is_border)
-    a3 = apply_border_zero(lam3, is_border)
+    a1 = apply_border_zero(rho_peak, is_border)
+    a2 = apply_border_zero(rho_total, is_border)
     interior = ~np.asarray(is_border, dtype=bool)
 
     panels = [
         (a1, r"$\rho_{\mathrm{peak}}$ (max bin)"),
-        (a2, r"$\rho_{\mathrm{2nd}}$ (2nd bin)"),
-        (a3, r"$\rho_{\mathrm{off}}$ (total − peak)"),
+        (a2, r"$\rho_{\mathrm{total}}$ (sum over bins)"),
     ]
 
-    fig, axes = plt.subplots(3, 1, figsize=(5.5, 5.2 * 3), facecolor=VIZ.BG)
+    fig, axes = plt.subplots(2, 1, figsize=(5.5, 5.2 * 2), facecolor=VIZ.BG)
     axes_flat = np.atleast_1d(axes).ravel()
 
     for ax, (arr, title_base) in zip(axes_flat, panels):
@@ -145,7 +142,7 @@ def viz_l1_lambdas_three(
         0.5,
         0.008,
         "Legend: coolwarm on interior cells — blue = minimum, red = maximum "
-        "(separate scale per λ; border cells masked).",
+        "(separate scale per panel; border cells masked).",
         ha="center",
         va="bottom",
         fontsize=8,
@@ -532,17 +529,16 @@ def viz_infer_l0_pinwheel(
     viz_l0_pinwheel(h_np, img_pinwheel, out_path)
 
 
-def viz_infer_l1_lambdas(
-    lam: np.ndarray,
-    lam3: np.ndarray,
+def viz_infer_l1_rho_masses(
+    rho_peak: np.ndarray,
+    rho_total: np.ndarray,
     is_border: np.ndarray,
     out_path: str,
 ) -> None:
 
-    viz_l1_lambdas_three(
-        lam[:, :, 0],
-        lam[:, :, 1],
-        lam3,
+    viz_l1_rho_masses(
+        rho_peak,
+        rho_total,
         is_border,
         out_path,
         suptitle=r"L1 bin masses (L2 seed: $\rho_{\mathrm{seed}}=\rho_{\mathrm{peak}}/(\rho_{\mathrm{total}}+\eta_z)$)",
