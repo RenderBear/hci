@@ -30,7 +30,8 @@ L1 = SimpleNamespace(
 
 # ── L2: cell-grid conv dynamics (ρ refinement) ───────────────────────────────
 L2 = SimpleNamespace(
-    R_POOL=10,
+    R_FAC_POOL=5,   # collinear (facilitation) pool radius
+    R_SUP_POOL=10,   # iso / cross (suppression) pool radius
     K=24,
     T_REFINE=5,
     EPS=1e-9,

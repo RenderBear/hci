@@ -9,8 +9,9 @@ Seed (once, fixed in drive):
        drive = b_seed·ρ_seed + b_coll·ρ̃_coll
        ρ⁽ᵗ⁺¹⁾ = drive² / (drive² + b_iso·c̃_iso + b_cross·c̃_cross + η_p² + ε)
 
-  Geometric pools (ρ_coll, c_iso, c_cross): grouped conv2d over (2R+1)² neighborhoods,
-  per-cell hard θ-bin gather; coll and iso count-normalized; cross = (m₀_total − m₀_own)/m₀_total.
+  Geometric pools (ρ_coll, c_iso, c_cross): grouped conv2d over (2R+1)² neighborhoods
+  (collinear R_fac; iso/cross R_sup); per-cell hard θ-bin gather; coll and iso count-normalized;
+  cross = (m₀_total − m₀_own)/m₀_total.
 
 Learned: b_coll, b_seed, b_iso, b_cross, η_coll, η_iso, η_cross, η_p, η_z
          — **9** nonnegative scalars (softplus).
@@ -34,40 +35,50 @@ from params import L2, TRAIN
 # ═══════════════════════════════════════════════════════════════
 
 def _build_conv_kernels(
-    R: int,
+    R_fac: int,
+    R_sup: int,
     K: int,
     device: torch.device | None = None,
     dtype: torch.dtype = torch.float32,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """W_coll, W_iso, W_cross, W_count — each (K, 1, 2R+1, 2R+1); center = 0."""
-    patch = 2 * R + 1
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """W_coll, W_iso, W_cross, W_count_coll, W_count — center = 0; coll uses R_fac, rest use R_sup."""
+    patch_fac = 2 * R_fac + 1
+    patch_sup = 2 * R_sup + 1
     dev = device if device is not None else torch.device("cpu")
 
     bc = torch.linspace(0, math.pi, K + 1, device=dev, dtype=dtype)[:-1]
     cos_b = torch.cos(bc)
     sin_b = torch.sin(bc)
 
-    off = torch.arange(-R, R + 1, device=dev, dtype=dtype)
+    off_fac = torch.arange(-R_fac, R_fac + 1, device=dev, dtype=dtype)
+    di_f, dj_f = torch.meshgrid(off_fac, off_fac, indexing="ij")
+    rd_f = (di_f.pow(2) + dj_f.pow(2)).sqrt().clamp_min(1e-12)
+    d_i_f = di_f / rd_f
+    d_j_f = dj_f / rd_f
+
+    t_dot_d = cos_b[:, None, None] * d_i_f + sin_b[:, None, None] * d_j_f
+    W_coll = t_dot_d.abs().unsqueeze(1)
+    W_coll[:, :, R_fac, R_fac] = 0.0
+
+    off = torch.arange(-R_sup, R_sup + 1, device=dev, dtype=dtype)
     di, dj = torch.meshgrid(off, off, indexing="ij")
     rd = (di.pow(2) + dj.pow(2)).sqrt().clamp_min(1e-12)
     d_i = di / rd
     d_j = dj / rd
 
-    t_dot_d = cos_b[:, None, None] * d_i + sin_b[:, None, None] * d_j
-    W_coll = t_dot_d.abs().unsqueeze(1)
-
     n_dot_d = -sin_b[:, None, None] * d_i + cos_b[:, None, None] * d_j
     W_iso = (n_dot_d * n_dot_d).unsqueeze(1)
 
-    W_cross = torch.ones(K, 1, patch, patch, device=dev, dtype=dtype)
-    W_count = torch.ones(K, 1, patch, patch, device=dev, dtype=dtype)
+    W_cross = torch.ones(K, 1, patch_sup, patch_sup, device=dev, dtype=dtype)
+    W_count_coll = torch.ones(K, 1, patch_fac, patch_fac, device=dev, dtype=dtype)
+    W_count = torch.ones(K, 1, patch_sup, patch_sup, device=dev, dtype=dtype)
 
-    W_coll[:, :, R, R] = 0.0
-    W_iso[:, :, R, R] = 0.0
-    W_cross[:, :, R, R] = 0.0
-    W_count[:, :, R, R] = 0.0
+    W_iso[:, :, R_sup, R_sup] = 0.0
+    W_cross[:, :, R_sup, R_sup] = 0.0
+    W_count_coll[:, :, R_fac, R_fac] = 0.0
+    W_count[:, :, R_sup, R_sup] = 0.0
 
-    return W_coll, W_iso, W_cross, W_count
+    return W_coll, W_iso, W_cross, W_count_coll, W_count
 
 
 def _hard_bin_map(theta_flat: torch.Tensor, K: int, nH: int, nW: int) -> torch.Tensor:
@@ -88,8 +99,10 @@ def _pool_cell_geometry(
     W_coll: torch.Tensor,
     W_iso: torch.Tensor,
     W_cross: torch.Tensor,
+    W_count_coll: torch.Tensor,
     W_count: torch.Tensor,
-    R: int,
+    R_fac: int,
+    R_sup: int,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Convolve ρ / ρ² on the cell grid; gather own θ-bin; return normalized (nH, nW) pools."""
@@ -105,16 +118,19 @@ def _pool_cell_geometry(
     W_coll = W_coll.to(device=dev, dtype=dtype)
     W_iso = W_iso.to(device=dev, dtype=dtype)
     W_cross = W_cross.to(device=dev, dtype=dtype)
+    W_count_coll = W_count_coll.to(device=dev, dtype=dtype)
     W_count = W_count.to(device=dev, dtype=dtype)
 
-    coll_all = Fn.conv2d(rho_2d, W_coll, padding=R)
-    iso_all = Fn.conv2d(rho_sq_2d, W_iso, padding=R)
-    count_all = Fn.conv2d(ok_2d, W_count, padding=R)
+    coll_all = Fn.conv2d(rho_2d, W_coll, padding=R_fac)
+    iso_all = Fn.conv2d(rho_sq_2d, W_iso, padding=R_sup)
+    count_coll = Fn.conv2d(ok_2d, W_count_coll, padding=R_fac)
+    count_all = Fn.conv2d(ok_2d, W_count, padding=R_sup)
 
     b = bin_map.to(device=dev).view(1, 1, nH, nW)
+    own_count_coll = count_coll.gather(1, b).squeeze(0).squeeze(0)
     own_count = count_all.gather(1, b).squeeze(0).squeeze(0)
 
-    rho_coll = coll_all.gather(1, b).squeeze(0).squeeze(0) / (own_count + eps)
+    rho_coll = coll_all.gather(1, b).squeeze(0).squeeze(0) / (own_count_coll + eps)
     c_iso = iso_all.gather(1, b).squeeze(0).squeeze(0) / (own_count + eps)
 
     bin_onehot = (
@@ -125,7 +141,7 @@ def _pool_cell_geometry(
         .unsqueeze(0)
     )
     rho_sq_bins = bin_onehot * rho_sq_2d
-    m0_bins = Fn.conv2d(rho_sq_bins, W_cross, padding=R, groups=K)
+    m0_bins = Fn.conv2d(rho_sq_bins, W_cross, padding=R_sup, groups=K)
     m0_total = m0_bins.sum(dim=1).squeeze(0)
     own_m0 = m0_bins.gather(1, b).squeeze(0).squeeze(0)
     c_cross = (m0_total - own_m0) / (m0_total + eps)
@@ -204,7 +220,8 @@ def l2_snapshot_steps(
 class TileDynamics(nn.Module):
     def __init__(
         self,
-        r_pool=L2.R_POOL,
+        r_fac_pool=L2.R_FAC_POOL,
+        r_sup_pool=L2.R_SUP_POOL,
         K=L2.K,
         t_refine=L2.T_REFINE,
         eps=L2.EPS,
@@ -214,7 +231,7 @@ class TileDynamics(nn.Module):
     ):
         super().__init__()
         _ = kw
-        self.R, self.K = r_pool, K
+        self.R_fac, self.R_sup, self.K = r_fac_pool, r_sup_pool, K
         self.T_refine, self.eps = t_refine, eps
         self.tbptt_n_segments = max(1, int(tbptt_n_segments))
 
@@ -237,10 +254,13 @@ class TileDynamics(nn.Module):
             torch.tensor(_inv_softplus(float(L2.ETA_P_INIT)), dtype=torch.float32)
         )
 
-        W_coll, W_iso, W_cross, W_count = _build_conv_kernels(r_pool, K)
+        W_coll, W_iso, W_cross, W_count_coll, W_count = _build_conv_kernels(
+            self.R_fac, self.R_sup, K,
+        )
         self.register_buffer("W_coll", W_coll)
         self.register_buffer("W_iso", W_iso)
         self.register_buffer("W_cross", W_cross)
+        self.register_buffer("W_count_coll", W_count_coll)
         self.register_buffer("W_count", W_count)
 
     @property
@@ -376,8 +396,9 @@ class TileDynamics(nn.Module):
         def _pool(r: torch.Tensor):
             return _pool_cell_geometry(
                 r, ok_map, bin_map,
-                self.W_coll, self.W_iso, self.W_cross, self.W_count,
-                self.R, self.eps,
+                self.W_coll, self.W_iso, self.W_cross,
+                self.W_count_coll, self.W_count,
+                self.R_fac, self.R_sup, self.eps,
             )
 
         if return_surface_diags:

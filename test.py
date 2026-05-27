@@ -48,7 +48,8 @@ EVAL_THRESHOLDS = np.linspace(0.01, 0.99, TEST.THRESHOLD_COUNT)
 
 def build_model(ckpt, device):
     m = StriateE2E(
-        r_pool=L2.R_POOL,
+        r_fac_pool=L2.R_FAC_POOL,
+        r_sup_pool=L2.R_SUP_POOL,
         K=L2.K,
         t_refine=L2.T_REFINE,
         eps=L2.EPS,

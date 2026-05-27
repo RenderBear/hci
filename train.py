@@ -103,7 +103,8 @@ def build_cells_flat(cells: dict) -> dict:
 class StriateE2E(nn.Module):
     def __init__(
         self,
-        r_pool: int,
+        r_fac_pool: int,
+        r_sup_pool: int,
         K: int,
         t_refine: int,
         eps: float,
@@ -113,9 +114,10 @@ class StriateE2E(nn.Module):
         **kw,
     ):
         super().__init__()
-        _ = kw  # legacy kwargs (e.g. stride) ignored
+        _ = kw  # legacy kwargs (e.g. stride, r_pool) ignored
         self.dynamics = TileDynamics(
-            r_pool=r_pool,
+            r_fac_pool=r_fac_pool,
+            r_sup_pool=r_sup_pool,
             K=K,
             t_refine=t_refine,
             eps=eps,
@@ -757,7 +759,7 @@ def main():
         f"  max_train={mt}"
     )
     print(
-        f"Dynamics: R={L2.R_POOL}  K={L2.K}  "
+        f"Dynamics: R_fac={L2.R_FAC_POOL}  R_sup={L2.R_SUP_POOL}  K={L2.K}  "
         f"T={L2.T_REFINE}  "
         f"drive²/(drive² + b_iso·c̃_iso + b_cross·c̃_cross + η_p²); "
         f"ρ_seed = λ₁/(λ₁+λ₂+η_z); "
@@ -794,7 +796,8 @@ def main():
     print(f"  training on all {len(fit_stems)} images (no held-out val)")
 
     model = StriateE2E(
-        r_pool=L2.R_POOL,
+        r_fac_pool=L2.R_FAC_POOL,
+        r_sup_pool=L2.R_SUP_POOL,
         K=L2.K,
         t_refine=L2.T_REFINE,
         eps=L2.EPS,
