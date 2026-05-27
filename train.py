@@ -1,7 +1,7 @@
 r"""train.py — STRIATE training: cell-grid conv dynamics + harmonic render.
 
 Pipeline per image: L0 contrast/harmonics (cached) → L1 K-bin projection live each step
-→ L2 cell-grid ρ refinement (ρ_seed = ρ_peak/(ρ_total+η_z); conv pools → drive²/(drive² + b_iso·c_iso + b_cross·c_cross + η_p²))
+→ L2 cell-grid ρ refinement (per-bin NR seed; conv pools + dynamic cross → drive²/(drive² + b_iso·c_iso + b_cross·cross + η_p²))
 → splat renderer ($\hat B = \bar\rho \cdot \mathrm{gate}$).
 Loss combines soft-Dice and per-pixel BCE on the same η± valid band
 (target≥η_pos or target<η_neg), weighted by ``--lam_dice`` and ``--lam_bce``
@@ -106,6 +106,7 @@ def build_cells_flat_torch(cells: dict) -> dict:
         "kappa": cells["kappa"].reshape(N, 1),
         "z1_abs_sum": cells["z1_abs_sum"].reshape(N),
         "rho_peak": cells["rho_peak"].reshape(N),
+        "rho_bins": cells["rho_bins"].reshape(N, -1),
         "z0": cells["z0"].reshape(N),
         "cx_z2": cells["cx_z2"].reshape(N),
         "cy_z2": cells["cy_z2"].reshape(N),
@@ -169,6 +170,7 @@ def build_cells_flat(cells: dict) -> dict:
         "kappa": torch.from_numpy(cells["kappa"].reshape(N, 1).astype(np.float32)),
         "z1_abs_sum": torch.from_numpy(cells["z1_abs_sum"].reshape(N).astype(np.float32)),
         "rho_peak": torch.from_numpy(cells["rho_peak"].reshape(N).astype(np.float32)),
+        "rho_bins": torch.from_numpy(cells["rho_bins"].reshape(N, -1).astype(np.float32)),
         "z0": torch.from_numpy(cells["z0"].reshape(N).astype(np.float32)),
         "cx_z2": torch.from_numpy(cells["cx_z2"].reshape(N).astype(np.float32)),
         "cy_z2": torch.from_numpy(cells["cy_z2"].reshape(N).astype(np.float32)),
@@ -219,12 +221,12 @@ class StriateE2E(nn.Module):
         bmaps = []
         for m in meta_list:
             cf_flat = m["cells_flat_dev"]
-            rho_out, branch, _, _, _, _, _ = self.dynamics(cells_flat=cf_flat)
+            rho_out, branch, _, _, _, cf_out, _ = self.dynamics(cells_flat=cf_flat)
             bmap = render_boundary_map_torch(
                 rho_out,
                 m["proj_dev"],
                 self.renderer,
-                cf_flat,
+                cf_out,
                 m["Hp"],
                 m["Wp"],
                 m["l0_pix"],
@@ -682,14 +684,14 @@ def format_l2_param_lines(d, *, indent: str = "  ") -> list[str]:
     sub = indent + "  "
     return [
         f"{indent}geometry:  K={d.K}  R_fac={d.R_fac}  R_sup={d.R_sup}  T_refine={d.T_refine}",
-        f"{indent}binning:   hard peak θ-bin per cell",
+        f"{indent}binning:   K-channel ρ state (per-orientation hypotheses)",
         f"{indent}drive:",
         f"{sub}b_coll={d.b_coll.item():.3f}  b_seed={d.b_seed.item():.3f}",
         f"{indent}inhibition:",
         f"{sub}b_iso={d.b_iso.item():.3f}  b_cross={d.b_cross.item():.3f}  "
         f"η_p={d.eta_p.item():.3f}",
-        f"{indent}seed:  η_z={d.eta_z.item():.3f}  "
-        f"(ρ_seed = ρ_peak/(ρ_total+η_z))",
+        f"{indent}seed:  η_z={d.eta_z.item():.4g}  "
+        f"(ρ_seed^(k) = (ρ_bins^(k))²/((ρ_bins^(k))²+η_z²); cross^(k) = (ρ_tot−ρ^(k))/(K−1))",
     ]
 
 
@@ -706,9 +708,9 @@ def _format_dynamics_params(model):
         "\n--- L2 ---\n",
         *[ln + "\n" for ln in format_l2_param_lines(d, indent="")],
         "\n--- dynamics ---\n",
-        "drive = b_seed·ρ_seed + b_coll·ρ_coll\n",
-        "ρ = drive² / (drive² + b_iso·c_iso + b_cross·c_cross + η_p² + ε)\n",
-        "conv2d pools on cell grid each step; T_refine iterations\n",
+        "drive = b_seed·ρ_seed^(k) + b_coll·ρ_coll^(k)\n",
+        "ρ^(k) = drive² / (drive² + b_iso·c_iso^(k) + b_cross·(ρ_tot−ρ^(k))/(K−1) + η_p² + ε)\n",
+        "grouped conv2d pools on K-channel ρ each step; T_refine iterations\n",
     ]
     return "".join(parts)
 
@@ -822,8 +824,9 @@ def main():
     print(
         f"Dynamics: R_fac={L2.R_FAC_POOL}  R_sup={L2.R_SUP_POOL}  K={L2.K}  "
         f"T={L2.T_REFINE}  "
-        f"drive²/(drive² + b_iso·c_iso + b_cross·c_cross + η_p²); "
-        f"ρ_seed = ρ_peak/(ρ_total+η_z); "
+        f"drive²/(drive² + b_iso·c_iso^(k) + b_cross·(ρ_tot−ρ^(k))/(K−1) + η_p²); "
+        f"ρ_seed^(k) = (ρ_bins^(k))²/((ρ_bins^(k))²+η_z²); "
+        f"cross^(k) = (ρ_tot−ρ^(k))/(K−1); "
         f"  TBPTT: {TRAIN.L2_SNAPSHOT_MAX} segments  "
         f"window=max(1, T//{TRAIN.L2_SNAPSHOT_MAX})  (full grad per segment)"
     )

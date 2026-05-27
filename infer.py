@@ -44,7 +44,8 @@ from hci.diagnostics_viz import (
 )
 from hci.L2 import (
     l2_snapshot_steps,
-    rho_seed_from_peak_z0,
+    rho_seed_from_bins,
+    collapse_rho_bins,
 )
 from train import (
     StriateE2E,
@@ -65,19 +66,27 @@ def _rho_out_seed_only(
     *,
     collect_diags: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict | None]:
-    """Match TileDynamics output with T=0: ρ_seed on interior cells (no L2 refine)."""
+    """Match TileDynamics output with T=0: per-bin ρ_seed collapsed to scalar (no L2 refine)."""
     d = model.dynamics
     nH, nW = int(cf_dev["nH"]), int(cf_dev["nW"])
     N = nH * nW
-    rho_peak = cf_dev["rho_peak"].to(device)
-    z0 = cf_dev["z0"].to(device)
+    K = d.K
+    rho_bins = cf_dev["rho_bins"].to(device).reshape(N, K)
     is_border = cf_dev["is_border"].to(device)
-    rho_seed = rho_seed_from_peak_z0(
-        rho_peak, z0, d.eta_z, is_border, d.eps,
+    rho_seed = rho_seed_from_bins(
+        rho_bins, d.eta_z, is_border, d.eps,
+    )
+    rho_seed_3d = rho_seed.reshape(nH, nW, K)
+    rho_scalar, theta_out, k_star_out = collapse_rho_bins(
+        rho_seed_3d, K, d.eps, device=device,
     )
 
-    interior = (~is_border).to(dtype=rho_seed.dtype)
-    rho_out = rho_seed * interior
+    interior = (~is_border).to(dtype=rho_scalar.dtype)
+    rho_out = rho_scalar.reshape(N) * interior
+
+    cf_out = dict(cf_dev)
+    cf_out["theta"] = theta_out.reshape(N, 1)
+    cf_out["k_star"] = k_star_out.reshape(N)
 
     branch = torch.zeros(N, device=device, dtype=torch.long)
     z1 = torch.zeros(N, 1, device=device, dtype=rho_out.dtype)
@@ -96,7 +105,7 @@ def _rho_out_seed_only(
             }],
             "no_dynamics": True,
         }
-    return rho_out, branch, z1, surface_diags
+    return rho_out, branch, z1, cf_out, surface_diags
 
 
 def build_model(ckpt, device):
@@ -253,7 +262,7 @@ def _infer_l2_and_render(
             _sync(device)
             t0 = time.perf_counter()
         with torch.no_grad():
-            rho_out, branch, supp_nb, surface_diags = _rho_out_seed_only(
+            rho_out, branch, supp_nb, cf_out, surface_diags = _rho_out_seed_only(
                 model, cf_dev, device, collect_diags=collect_diags,
             )
         if timings is not None:
@@ -265,7 +274,7 @@ def _infer_l2_and_render(
                 rho_out,
                 proj_dev,
                 model.renderer,
-                cf_dev,
+                cf_out,
                 Hp,
                 Wp,
                 l0_dev,
@@ -287,7 +296,7 @@ def _infer_l2_and_render(
                 if timings is not None:
                     _sync(device)
                     t0 = time.perf_counter()
-                rho_out, branch, _, _, supp_nb, _, surface_diags = (
+                rho_out, branch, _, _, supp_nb, cf_out, surface_diags = (
                     model.dynamics(
                         cells_flat=cf_dev,
                         return_surface_diags=collect_diags,
@@ -302,7 +311,7 @@ def _infer_l2_and_render(
                     rho_out,
                     proj_dev,
                     model.renderer,
-                    cf_dev,
+                    cf_out,
                     Hp,
                     Wp,
                     l0_dev,
@@ -535,14 +544,16 @@ def main():
         model.dynamics.T_refine = t_refine_ckpt
 
     d = model.dynamics
-    rho_peak_np = prep["rho_peak_grid"]
-    z0_np = prep["z0_grid"]
+    cf = prep["cells_flat"]
     nH, nW = int(prep["nH"]), int(prep["nW"])
-    rho_peak_t = torch.from_numpy(rho_peak_np.astype(np.float32)).to(device)
-    z0_t = torch.from_numpy(z0_np.astype(np.float32)).to(device)
-    ib_t = torch.from_numpy(np.asarray(is_border, dtype=np.bool_)).to(device)
+    N = nH * nW
+    K = d.K
+    rho_bins_t = cf["rho_bins"].to(device).float().reshape(N, K)
+    ib_t = cf["is_border"].to(device).reshape(N)
     rho_seed_vis = (
-        rho_seed_from_peak_z0(rho_peak_t, z0_t, d.eta_z, ib_t, float(d.eps))
+        rho_seed_from_bins(rho_bins_t, d.eta_z, ib_t, float(d.eps))
+        .max(dim=-1)
+        .values
         .detach()
         .cpu()
         .numpy()

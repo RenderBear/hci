@@ -541,7 +541,10 @@ def viz_infer_l1_rho_masses(
         rho_total,
         is_border,
         out_path,
-        suptitle=r"L1 bin masses (L2 seed: $\rho_{\mathrm{seed}}=\rho_{\mathrm{peak}}/(\rho_{\mathrm{total}}+\eta_z)$)",
+        suptitle=(
+            r"L1 bin masses (L2 seed: "
+            r"$\rho_{\mathrm{seed}}^{(k)}=(\rho_{\mathrm{bins}}^{(k)})^2/((\rho_{\mathrm{bins}}^{(k)})^2+\eta_z^2)$)"
+        ),
     )
 
 
@@ -561,8 +564,8 @@ def viz_infer_cell_rho_maps(
         out_path,
         suptitle=(
             r"Cell $\rho$ — single-branch dynamics "
-            r"(seed: $\rho_{\mathrm{seed}}=\rho_{\mathrm{peak}}/(\rho_{\mathrm{total}}+\eta_z)$, "
-            rf"$\eta_z$={eta_z:.4g})"
+            r"(per-bin NR seed; half-saturation $\eta_z$="
+            rf"{eta_z:.4g} in $\rho_{{\mathrm{{bins}}}}$ units)"
         ),
         layout_rows_cols=(1, 2),
     )
@@ -724,7 +727,7 @@ def viz_infer_l2_suppression_factors(
         labels.append(r"iso pool $I$ (same θ-bin, cell avg)")
     if cross_pool_nb is not None:
         panels.append(cross_pool_nb)
-        labels.append(r"cross pool $C$ (other θ-bins, cell avg)")
+        labels.append(r"cross pool $C$ (mean other-bin $\rho$)")
 
     if not panels:
         return False
@@ -733,7 +736,7 @@ def viz_infer_l2_suppression_factors(
     layout = (1, n) if n <= 2 else (1, 3)
 
     sig_suptitle = (
-        r"L2 suppression factors — iso pool $I$ and cross pool $C$ (first refine)"
+        r"L2 suppression — iso pool $I$ and cross (mean other-bin $\rho$)"
     )
     viz_rho_branch_grid(
         panels,
@@ -763,9 +766,10 @@ def viz_infer_l2_geometry(
         return False
 
     rows = (
-        ("rho_coll", r"$\tilde{\rho}_{\mathrm{coll}}$"),
-        ("c_iso", r"$\tilde{c}_{\mathrm{iso}}$"),
-        ("c_cross", r"$\tilde{c}_{\mathrm{cross}}$"),
+        ("rho_coll", r"$\max_k\,\tilde{\rho}_{\mathrm{coll}}^{(k)}$"),
+        ("c_iso", r"$\max_k\,\tilde{c}_{\mathrm{iso}}^{(k)}$"),
+        ("c_cross", r"$(\rho_{\mathrm{tot}}-\rho_{\mathrm{peak}})/(K{-}1)$"),
+        ("rho_peak", r"$\max_k\,\rho^{(k)}$ (renderer)"),
     )
     panels: list[np.ndarray] = []
     labels: list[str] = []
@@ -785,8 +789,8 @@ def viz_infer_l2_geometry(
         labels,
         is_border,
         out_path,
-        suptitle="L2 cell geometry — collinear / iso / cross pools",
-        layout_rows_cols=(3, 2),
+        suptitle="L2 cell geometry — coll / iso / peak cross / peak ρ",
+        layout_rows_cols=(4, 2),
     )
     return True
 

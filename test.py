@@ -206,12 +206,12 @@ def run_image_inference(model, img_path, device):
     proj_dev = proj_to_device(proj, device)
 
     with torch.no_grad():
-        rho_out, branch, _, _, _, _, _ = model.dynamics(cells_flat=cf_dev)
+        rho_out, branch, _, _, _, cf_out, _ = model.dynamics(cells_flat=cf_dev)
         bmap_t, theta_t = render_boundary_map_torch(
             rho_out,
             proj_dev,
             model.renderer,
-            cf_dev,
+            cf_out,
             Hp,
             Wp,
             l0_dev,

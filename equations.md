@@ -8,7 +8,7 @@ This file records the **notation and equations implemented in this repository**:
 
 1. **L0** — RGB → split luminance / chrominance directional differences; per-direction min subtraction; independent Naka–Rushton per channel with **fixed** scalars $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ (`L0.ETA_LUM`, `L0.ETA_CHR`) and gain $\gamma$ (`L0.GAMMA`). Produces harmonic stack $s$, magnitudes $h_{1m}, h_{2m}$, and split $h_{2m}^{\mathrm{lum}}, h_{2m}^{\mathrm{chr}}$. Complex fields $z_1, z_2$ are read from $s$ (`z_from_l0_harmonics`). L0 is **precomputed and cached** for training; it is not updated during training.
 2. **L1** — Pixel $K$-bin von Mises (or $\cos^p$) projection of $h_{2m}$ (`L1.K`; von Mises $\kappa$ is **learned**, softplus, init `L1.COL_VON_MISES_KAPPA`$=8$); sum-pool over $P\times P$ patches → per-cell $\rho_{\mathrm{raw}}^{(k)}$, dominant $\theta$, polarity $q$, anisotropy $\delta$, optional $\kappa$, and $h_{2m}$-weighted splat anchors. **Precomputed and cached** with L0.
-3. **L2** (`TileDynamics`) — Seed $\rho_{\mathrm{seed}} = \rho_{\mathrm{peak}}/(\rho_{\mathrm{total}}+\eta_z)$; then $T_{\mathrm{refine}}$ recurrent steps with grouped `conv2d` collinear / iso / cross pools and divisive $\rho$ update. Runs **live each training step** so gradients reach the six learned L2 scalars.
+3. **L2** (`TileDynamics`) — Per-bin NR seed from L1 $\rho_{\mathrm{bins}}^{(k)}$; then $T_{\mathrm{refine}}$ recurrent steps with grouped `conv2d` collinear / iso pools, dynamic cross (mean other-bin $\rho$), and divisive $\rho$ update. Runs **live each training step** so gradients reach the six learned L2 scalars.
 4. **Renderer** (`ModulationRenderer`) — Cell-grid $\theta$ combing and $\rho$-gated anchor smoothing; **Gaussian-line splat** of refined $\rho$ to pixels; coherence map; tangential / normal **stencils on $\bar\rho$**; **12→8→1** thinning MLP gate:
    $$\hat B(p) = \bar\rho(p)\,\mathrm{gate}(p).$$
 
@@ -143,12 +143,14 @@ $$
 
 ### Seed (once, fixed in drive)
 
+Per-bin Naka–Rushton on L1 raw masses (no across-bin normalization; preserves magnitude):
+
 $$
-\rho_{\mathrm{seed}}(c) = \frac{\rho_{\mathrm{peak}}(c)}{\rho_{\mathrm{total}}(c) + \eta_z + \varepsilon}, \qquad
-\eta_z = \mathrm{softplus}(\tilde\eta_z),
+\rho_{\mathrm{seed}}^{(k)}(c) = \frac{\bigl(\rho_{\mathrm{bins}}^{(k)}(c)\bigr)^2}{\bigl(\rho_{\mathrm{bins}}^{(k)}(c)\bigr)^2 + \eta_z^2 + \varepsilon}, \qquad
+\eta_z = \mathrm{softplus}(\tilde\eta_z).
 $$
 
-with $\rho_{\mathrm{peak}}$ and $\rho_{\mathrm{total}} = \texttt{z0}$ from L1 (§3). Border cells: $\rho_{\mathrm{seed}} = 0$. With $T_{\mathrm{refine}}=0$ (`infer --no-dynamics`), $\rho$ stays at $\rho_{\mathrm{seed}}$ on interior cells.
+Border cells: $\rho_{\mathrm{seed}}^{(k)} = 0$. $\eta_z$ is the half-saturation in L1 mass units (default `ETA_Z_INIT = 10^4`, order of typical edge/texture bin energies). With $T_{\mathrm{refine}}=0$ (`infer --no-dynamics`), $\rho^{(k)}$ stays at $\rho_{\mathrm{seed}}^{(k)}$ on interior cells.
 
 ### Learned scalars (softplus of raw parameters)
 
@@ -174,48 +176,35 @@ $$
 W^{\mathrm{iso}}_k(d) = (\hat n_k \cdot \hat d)^2.
 $$
 
-**Cross-orientation** (same $R_{\mathrm{sup}}$, isotropic):
-
-$$
-W^{\mathrm{cross}}(d) = 1 \quad \text{(disk patch, centre omitted)}.
-$$
-
 ### Pools on the cell grid
 
-Let $\rho^{(t)}$ be the scalar $\rho$ field at pass start ($\rho^{(0)} = \rho_{\mathrm{seed}}$). Pools use $\rho^{(t)}$; $\rho_{\mathrm{seed}}$ is **fixed** in the drive.
-
-**Per-bin scatter** (hard bin $b(c)$ from $\theta$): $\rho^{(t)}$ and $\rho^{(t)\,2}$ are placed only in channel $b(c)$ (one-hot), then **grouped** `conv2d` with $K$ kernels so collinear/iso/cross only aggregate mass from cells assigned to each orientation bin.
-
-Gather at own bin $b(c)$ after count normalization:
+State $\rho^{(t)}(c,k)$ has $K$ channels per cell. **Coll/iso** pool the evolving $\rho^{(t)}$ via grouped `conv2d` (count-normalized per $k$). $\rho_{\mathrm{seed}}^{(k)}$ is **fixed** in the drive.
 
 $$
-\rho_{\mathrm{coll}}(c) = \frac{(W^{\mathrm{coll}}_{b(c)} * \rho^{(t)}_{b(c)})(c)}{(W^{\mathrm{coll}}_{b(c)} * \mathbf{1}_{b(c)})(c) + \varepsilon},
-$$
-$$
-c_{\mathrm{iso}}(c) = \frac{(W^{\mathrm{iso}}_{b(c)} * (\rho^{(t)}_{b(c)})^2)(c)}{(W^{\mathrm{iso}}_{b(c)} * \mathbf{1}_{b(c)})(c) + \varepsilon},
+\rho_{\mathrm{coll}}^{(k)} = \frac{W^{\mathrm{coll}}_k * \rho^{(t)}_k}{W^{\mathrm{coll}}_k * \mathbf{1} + \varepsilon}, \qquad
+c_{\mathrm{iso}}^{(k)} = \frac{W^{\mathrm{iso}}_k * (\rho^{(t)}_k)^2}{W^{\mathrm{iso}}_k * \mathbf{1} + \varepsilon}.
 $$
 
-where $\rho^{(t)}_{k}(p) = \rho^{(t)}(p)$ if $b(p)=k$ else $0$ (same for $\mathbf{1}_k$).
-
-**Cross** — local mean $\rho^2$ in **other** bins (not normalized by total mass, which is $\approx (K{-}1)/K$ everywhere):
+**Cross** — mean other-bin mass from **evolving** $\rho^{(t)}$ (per $k$; enters inhibition as $b_{\mathrm{cross}}\,c_{\mathrm{cross}}^{(k,t)}$):
 
 $$
-c_{\mathrm{cross}}(c) = \frac{m_0^{\mathrm{tot}}(c) - m_0^{\mathrm{own}}(c)}{(N^{\mathrm{tot}}(c) - N^{\mathrm{own}}(c)) + \varepsilon},
+\rho_{\mathrm{tot}}^{(t)}(c) = \sum_k \rho^{(k,t)}(c), \qquad
+c_{\mathrm{cross}}^{(k,t)}(c) = \mathrm{ok}(c)\cdot\frac{\rho_{\mathrm{tot}}^{(t)}(c) - \rho^{(k,t)}(c)}{K - 1}.
 $$
 
-with $m_0^{\mathrm{tot}} = \sum_k (W^{\mathrm{cross}} * \rho^{(t)\,2}_k)$, $m_0^{\mathrm{own}}$ the $b(c)$ channel, and $N^{\mathrm{tot}}, N^{\mathrm{own}}$ the analogous neighbor counts from $W^{\mathrm{cross}}$ on $\mathbf{1}_k$. All pools are masked by $\mathrm{ok}(c)$. Raw pool values enter the recurrence directly (no per-pool NR squash).
+Texture (many similar bins): $c_{\mathrm{cross}}^{(k)} \approx \bar\rho$ high for all $k$. Clean edge (one dominant bin): $c_{\mathrm{cross}}^{(k^\star)} \approx 0$ at the peak. Diagnostics plot $(\rho_{\mathrm{tot}} - \rho_{\mathrm{peak}})/(K-1)$ and $\max_k \rho^{(k)}$ (renderer scalar).
 
 ### Pass update ($t = 0,\ldots,T_{\mathrm{refine}}-1$, `L2.T_REFINE`)
 
 $$
-\mathrm{drive}^{(t)}(c) = b_{\mathrm{seed}}\,\rho_{\mathrm{seed}}(c) + b_{\mathrm{coll}}\,\rho_{\mathrm{coll}}^{(t)}(c),
+\mathrm{drive}^{(t)}(c,k) = b_{\mathrm{seed}}\,\rho_{\mathrm{seed}}^{(k)}(c) + b_{\mathrm{coll}}\,\rho_{\mathrm{coll}}^{(k,t)}(c),
 $$
 $$
-\rho^{(t+1)}(c) = \mathrm{ok}(c)\cdot
-\frac{\bigl(\mathrm{drive}^{(t)}(c)\bigr)^2}
-{\bigl(\mathrm{drive}^{(t)}(c)\bigr)^2
-+ b_{\mathrm{iso}}\,c_{\mathrm{iso}}^{(t)}(c)
-+ b_{\mathrm{cross}}\,c_{\mathrm{cross}}^{(t)}(c)
+\rho^{(k,t+1)}(c) = \mathrm{ok}(c)\cdot
+\frac{\bigl(\mathrm{drive}^{(t)}(c,k)\bigr)^2}
+{\bigl(\mathrm{drive}^{(t)}(c,k)\bigr)^2
++ b_{\mathrm{iso}}\,c_{\mathrm{iso}}^{(k,t)}(c)
++ b_{\mathrm{cross}}\,c_{\mathrm{cross}}^{(k,t)}(c)
 + \eta_p^2 + \varepsilon}.
 $$
 

@@ -264,6 +264,10 @@ def run_l1(
     delta_flat = torch.where(is_border_flat, torch.zeros_like(delta_flat), delta_flat)
     rho_peak_flat = torch.where(is_border_flat, torch.zeros_like(rho_peak_flat), rho_peak_flat)
     rho_total_flat = torch.where(is_border_flat, torch.zeros_like(rho_total_flat), rho_total_flat)
+    ib_grid = is_border_flat.reshape(nH, nW)
+    rho_bins = torch.where(
+        ib_grid.unsqueeze(-1), torch.zeros_like(rho_bins), rho_bins,
+    )
     kappa_flat = kappa_flat.masked_fill(is_border_flat, 0.0)
     z1_bar_abs_flat = torch.where(
         is_border_flat, torch.zeros_like(z1_bar_abs_flat), z1_bar_abs_flat,
@@ -285,7 +289,6 @@ def run_l1(
     has_mass = mass_2d > eps
     cx_anchor = torch.where(has_mass, cx_num / mass_2d.clamp_min(eps), cx_grid)
     cy_anchor = torch.where(has_mass, cy_num / mass_2d.clamp_min(eps), cy_grid)
-    ib_grid = is_border_flat.reshape(nH, nW)
     cx_anchor = torch.where(ib_grid, cx_grid, cx_anchor)
     cy_anchor = torch.where(ib_grid, cy_grid, cy_anchor)
 
@@ -317,6 +320,7 @@ def run_l1(
             "delta": delta_flat.reshape(nH, nW),
             "kappa": kappa_flat.reshape(nH, nW),
             "rho_peak": rho_peak_flat.reshape(nH, nW),
+            "rho_bins": rho_bins,
             "z0": rho_total_flat.reshape(nH, nW),
             "cx": cx_grid,
             "cy": cy_grid,
@@ -344,6 +348,7 @@ def run_l1(
         "delta": _to_np(delta_flat.reshape(nH, nW)),
         "kappa": _to_np(kappa_flat.reshape(nH, nW)),
         "rho_peak": _to_np(rho_peak_flat.reshape(nH, nW)),
+        "rho_bins": _to_np(rho_bins),
         "z0": _to_np(rho_total_flat.reshape(nH, nW)),
         "cx": _to_np(cx_grid),
         "cy": _to_np(cy_grid),
