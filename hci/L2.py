@@ -346,7 +346,11 @@ class TileDynamics(nn.Module):
         )
 
         ok_map = (~is_border).reshape(nH, nW)
-        bin_map = _hard_bin_map(theta_flat, self.K, nH, nW)
+        k_star_flat = cells_flat.get("k_star")
+        if k_star_flat is not None:
+            bin_map = k_star_flat.to(device).reshape(nH, nW).long().clamp(0, self.K - 1)
+        else:
+            bin_map = _hard_bin_map(theta_flat, self.K, nH, nW)
         rho_seed_2d = rho_seed.reshape(nH, nW)
 
         rho = rho_seed.clone()

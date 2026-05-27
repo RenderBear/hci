@@ -36,7 +36,7 @@ from hci.L1 import (
     pad_for_patch_grid,
     run_l1,
 )
-from hci.L2 import TileDynamics
+from hci.L2 import TileDynamics, _inv_softplus
 from hci.renderer import (
     ModulationRenderer,
     render_boundary_map_torch,
@@ -93,14 +93,36 @@ def proj_info_from_grid(H: int, W: int, P: int, patch_overlap: int) -> dict:
     return {"H": H, "W": W, "n_cells": nH * nW, "nH": nH, "nW": nW}
 
 
+def build_cells_flat_torch(cells: dict) -> dict:
+    """Flatten ``run_l1(..., return_torch=True)`` grids for L2 / renderer."""
+    nH, nW = int(cells["nH"]), int(cells["nW"])
+    N = nH * nW
+    return {
+        "nH": nH,
+        "nW": nW,
+        "theta": cells["theta"].reshape(N, 1),
+        "k_star": cells["k_star"].reshape(N),
+        "q": cells["q"].reshape(N, 1),
+        "kappa": cells["kappa"].reshape(N, 1),
+        "z1_abs_sum": cells["z1_abs_sum"].reshape(N),
+        "rho_peak": cells["rho_peak"].reshape(N),
+        "z0": cells["z0"].reshape(N),
+        "cx_z2": cells["cx_z2"].reshape(N),
+        "cy_z2": cells["cy_z2"].reshape(N),
+        "is_border": cells["is_border"].reshape(N).bool(),
+    }
+
+
 def run_l1_cells_flat(
     l0_pix: dict[str, torch.Tensor],
     border_mask: torch.Tensor,
     H0: int,
     W0: int,
     device: torch.device,
+    *,
+    von_mises_kappa: torch.Tensor,
 ) -> dict:
-    """Live L1 from cached L0 tensors (ρ / cells depend on current ``L1.*`` params)."""
+    """Live L1 from cached L0 (differentiable w.r.t. learned von Mises κ)."""
     h2m = l0_pix["h2m"].to(device=device, dtype=torch.float32)
     z1 = torch.complex(
         l0_pix["z1_re"].to(device=device, dtype=torch.float32),
@@ -123,15 +145,16 @@ def run_l1_cells_flat(
         K=L1.K,
         bin_tuning=L1.COL_BIN_TUNING,
         cos_power=L1.COL_COS_POWER,
-        von_mises_kappa=L1.COL_VON_MISES_KAPPA,
+        von_mises_kappa=von_mises_kappa,
         device=device,
         verbose=False,
+        return_torch=True,
     )
     P = int(cells["P"])
-    cells["is_border"] |= (
+    cells["is_border"] = cells["is_border"] | (
         (cells["cy"] + P / 2 > H0) | (cells["cx"] + P / 2 > W0)
     )
-    return build_cells_flat(cells)
+    return build_cells_flat_torch(cells)
 
 
 def build_cells_flat(cells: dict) -> dict:
@@ -141,6 +164,7 @@ def build_cells_flat(cells: dict) -> dict:
         "nH": nH,
         "nW": nW,
         "theta": torch.from_numpy(cells["theta"].reshape(N, 1).astype(np.float32)),
+        "k_star": torch.from_numpy(cells["k_star"].reshape(N).astype(np.int64)),
         "q": torch.from_numpy(cells["q"].reshape(N, 1).astype(np.float32)),
         "kappa": torch.from_numpy(cells["kappa"].reshape(N, 1).astype(np.float32)),
         "z1_abs_sum": torch.from_numpy(cells["z1_abs_sum"].reshape(N).astype(np.float32)),
@@ -178,8 +202,18 @@ class StriateE2E(nn.Module):
         )
         _ = render_cell_hidden
         self.renderer = ModulationRenderer(hidden=render_pixel_hidden)
+        self._l1_von_mises_kappa_raw = nn.Parameter(
+            torch.tensor(
+                _inv_softplus(float(L1.COL_VON_MISES_KAPPA)),
+                dtype=torch.float32,
+            )
+        )
         self.eps = eps
         self.render_eps = max(float(eps), 1e-6)
+
+    @property
+    def l1_von_mises_kappa(self) -> torch.Tensor:
+        return F.softplus(self._l1_von_mises_kappa_raw)
 
     def forward_batch(self, meta_list):
         bmaps = []
@@ -204,14 +238,18 @@ class StriateE2E(nn.Module):
         return bmaps
 
 
-def prepare_batch(items, device):
+def prepare_batch(items, device, model: StriateE2E):
     meta = []
     for item in items:
         (gi, gt, Hp, Wp, Hg, Wg, H0, W0, l0_pix, border_mask, img) = item
-        cf_dev = {
-            k: (v.to(device) if isinstance(v, torch.Tensor) else v)
-            for k, v in run_l1_cells_flat(l0_pix, border_mask, H0, W0, device).items()
-        }
+        cf_dev = run_l1_cells_flat(
+            l0_pix,
+            border_mask,
+            H0,
+            W0,
+            device,
+            von_mises_kappa=model.l1_von_mises_kappa,
+        )
         l0_dev = {
             k: v.to(device) for k, v in l0_pix.items()
         }
@@ -557,7 +595,7 @@ def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
     print("\n  learned (value):")
     for name in (
         "b_coll", "b_seed", "b_iso", "b_cross",
-        "eta_p", "eta_z",
+        "eta_p", "eta_z", "l1_von_mises_kappa",
     ):
         p = getattr(d, name)
         val = float(p.detach()) if not isinstance(p, torch.Tensor) else float(p.item())
@@ -570,6 +608,7 @@ def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
         ("_b_cross_raw", "b_cross"),
         ("_eta_p_raw", "eta_p"),
         ("_eta_z_raw", "eta_z"),
+        ("_l1_von_mises_kappa_raw", "l1_von_mises_kappa"),
     ):
         t = getattr(d, raw, None)
         if t is None or t.grad is None:
@@ -631,6 +670,13 @@ def plot_training_curves(history, out_dir):
     print(f"  saved {p}")
 
 
+def format_l1_param_lines(model: StriateE2E, *, indent: str = "  ") -> list[str]:
+    return [
+        f"{indent}von Mises κ={model.l1_von_mises_kappa.item():.3f} (learned; "
+        f"exp(κ·cos2Δθ) bin sharpness — not per-cell orientation κ)",
+    ]
+
+
 def format_l2_param_lines(d, *, indent: str = "  ") -> list[str]:
     """Multi-line L2 learned-parameter summary (infer / train logging)."""
     sub = indent + "  "
@@ -667,12 +713,21 @@ def _format_dynamics_params(model):
     return "".join(parts)
 
 
-def format_model_param_counts(model):
-    d = model.dynamics
-    n_dyn = sum(p.numel() for p in d.parameters())
+def format_model_param_counts(model: StriateE2E) -> tuple[int, int, int, int]:
+    """Returns (total, L2 dynamics, L1 von Mises κ, renderer)."""
+    n_l2 = sum(p.numel() for p in model.dynamics.parameters())
+    n_l1 = model._l1_von_mises_kappa_raw.numel()
     n_renderer = sum(p.numel() for p in model.renderer.parameters())
     n_total = sum(p.numel() for p in model.parameters())
-    return n_total, n_dyn, n_renderer
+    return n_total, n_l2, n_l1, n_renderer
+
+
+def format_model_param_summary(model: StriateE2E) -> str:
+    n_tot, n_l2, n_l1, n_r = format_model_param_counts(model)
+    return (
+        f"{n_tot} total = L2 dynamics {n_l2} + L1 von Mises κ {n_l1} "
+        f"(bin sharpness, not per-cell κ) + renderer {n_r}"
+    )
 
 
 def _format_render_params(model):
@@ -818,11 +873,7 @@ def main():
         optimizer, T_max=args.epochs, eta_min=args.lr * 0.1
     )
 
-    n_tot, n_dyn, n_r = format_model_param_counts(model)
-    print(
-        f"\nmodel: {n_tot} params total  Adam: {n_tot} "
-        f"(dynamics {n_dyn} + renderer {n_r})"
-    )
+    print(f"\nmodel: {format_model_param_summary(model)}  (Adam on all)")
 
     train_ds = StriateDataset(train_cache, fit_stems)
     train_loader = DataLoader(
@@ -841,7 +892,7 @@ def main():
             moved.append((gi, gt, Hp, Wp, Hg, Wg, H0, W0, l0_pix, border_mask, img))
         debug_drive_batch(
             model,
-            prepare_batch(moved, device),
+            prepare_batch(moved, device, model),
             device,
             lam_dice=args.lam_dice,
             lam_bce=args.lam_bce,
@@ -869,7 +920,7 @@ def main():
                 (gi, gt, Hp, Wp, Hg, Wg, H0, W0, l0_pix, border_mask, img) = item
                 moved.append((gi, gt, Hp, Wp, Hg, Wg, H0, W0, l0_pix, border_mask, img))
 
-            meta_list = prepare_batch(moved, device)
+            meta_list = prepare_batch(moved, device, model)
             bmaps = model.forward_batch(meta_list)
 
             dice_sum = None

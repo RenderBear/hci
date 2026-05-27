@@ -25,10 +25,10 @@ L1 = SimpleNamespace(
     PATCH_OVERLAP=3,
     BORDER_PATCH_MAX_FRAC=0.2,
     EPS=1e-15,
-    K=12,
+    K=24,
     # "von_mises" | "cos_pow"
     COL_BIN_TUNING="von_mises",
-    COL_VON_MISES_KAPPA=8.0,
+    COL_VON_MISES_KAPPA=8.0,  # init for learned L1 von Mises κ (softplus in StriateE2E)
     COL_COS_POWER=2,
 )
 
@@ -36,7 +36,7 @@ L1 = SimpleNamespace(
 L2 = SimpleNamespace(
     R_FAC_POOL=5,   # collinear (facilitation) pool radius
     R_SUP_POOL=10,   # iso / cross (suppression) pool radius
-    K=12,
+    K=24,
     T_REFINE=5,
     EPS=1e-9,
     ETA_Z_INIT=20.0,  # seed: ρ_seed = ρ_peak / (ρ_total + η_z)

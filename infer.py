@@ -50,8 +50,9 @@ from train import (
     StriateE2E,
     build_cells_flat,
     build_l0_pix,
+    format_l1_param_lines,
     format_l2_param_lines,
-    format_model_param_counts,
+    format_model_param_summary,
     format_renderer_param_lines,
     report_checkpoint_compatibility,
 )
@@ -122,7 +123,7 @@ def _sync(device):
         torch.cuda.synchronize()
 
 
-def run_l0_l1(img_path, device):
+def run_l0_l1(img_path, device, *, von_mises_kappa: float | None = None):
 
     timings = {}
 
@@ -172,7 +173,9 @@ def run_l0_l1(img_path, device):
         K=L1.K,
         bin_tuning=L1.COL_BIN_TUNING,
         cos_power=L1.COL_COS_POWER,
-        von_mises_kappa=L1.COL_VON_MISES_KAPPA,
+        von_mises_kappa=(
+            L1.COL_VON_MISES_KAPPA if von_mises_kappa is None else von_mises_kappa
+        ),
         device=device,
         verbose=False,
     )
@@ -403,15 +406,18 @@ def forward_with_diagnostics(
 
 
 def _format_model_summary(
-    model, n_tot, n_dyn, n_r, device, diagnostics, *, l2_iters=None,
+    model, device, diagnostics, *, l2_iters=None,
 ):
     d = model.dynamics
     r = model.renderer
     lines = [
         "Model",
-        f"  params:      {n_tot} ({n_dyn} dynamics, {n_r} renderer)",
+        f"  params:      {format_model_param_summary(model)}",
         f"  device:      {device}",
         f"  diagnostics: {diagnostics}",
+        "",
+        "L1",
+        *format_l1_param_lines(model),
         "",
         "L2",
         *format_l2_param_lines(d),
@@ -488,7 +494,6 @@ def main():
 
     ckpt = torch.load(args.model, map_location="cpu", weights_only=False)
     model = build_model(ckpt, device)
-    n_tot, n_dyn, n_r = format_model_param_counts(model)
     t_refine_ckpt = int(model.dynamics.T_refine)
     l2_iters = (
         int(args.l2_iters) if args.l2_iters is not None else t_refine_ckpt
@@ -498,7 +503,7 @@ def main():
 
     if args.verbose:
         for line in _format_model_summary(
-            model, n_tot, n_dyn, n_r, device, args.diagnostics, l2_iters=l2_iters,
+            model, device, args.diagnostics, l2_iters=l2_iters,
         ):
             print(line)
         if args.no_dynamics:
@@ -506,7 +511,11 @@ def main():
         print()
 
     img_path = os.path.join(args.input_dir, args.image)
-    prep, prep_t = run_l0_l1(img_path, device)
+    prep, prep_t = run_l0_l1(
+        img_path,
+        device,
+        von_mises_kappa=float(model.l1_von_mises_kappa.detach().cpu()),
+    )
 
     collect_diags = args.verbose or args.diagnostics
     model.dynamics.T_refine = l2_iters
