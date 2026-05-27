@@ -1,8 +1,8 @@
 r"""train.py — STRIATE training: cell-grid conv dynamics + harmonic render.
 
-Pipeline per image: L0 contrast/harmonics → L1 cells (κ from z₁ polarity)
-→ L2 cell-grid ρ refinement (ρ_seed = λ₁/(λ₁+λ₂+η_z); conv pools → NR-squashed drive²/(drive² + b_iso·c̃_iso + b_cross·c̃_cross + η_p²))
-→ bilinear upsample of cell ρ (and θ for NMS) to pixels ($B$ = ρ on the pixel grid).
+Pipeline per image: L0 contrast/harmonics → L1 K-bin projection (ρ_raw from h₂m)
+→ L2 cell-grid ρ refinement (ρ_seed = ρ_peak/(ρ_total+η_z); conv pools → NR-squashed drive²/(drive² + b_iso·c̃_iso + b_cross·c̃_cross + η_p²))
+→ splat renderer ($\hat B = \bar\rho \cdot \mathrm{gate}$).
 Loss combines soft-Dice and per-pixel BCE on the same η± valid band
 (target≥η_pos or target<η_neg), weighted by ``--lam_dice`` and ``--lam_bce``
 (each can be 0).
@@ -233,10 +233,11 @@ def precompute_image(img_path, gt_path, gt_format):
     l0_pix = build_l0_pix(
         s_np, h1m, h2m, border_mask_np, h2m_lum=h2m_lum, h2m_chr=h2m_chr,
     )
-    del h, vld, s, h1m, h2m, h2m_lum, h2m_chr
+    del h, vld, s, h1m, h2m_lum, h2m_chr
     gc.collect()
 
     cells = run_l1(
+        h2m,
         z1,
         z2,
         L1.PATCH_SIZE,
@@ -244,9 +245,11 @@ def precompute_image(img_path, gt_path, gt_format):
         patch_overlap=L1.PATCH_OVERLAP,
         border_patch_max_frac=L1.BORDER_PATCH_MAX_FRAC,
         eps=L1.EPS,
+        K=L1.K,
+        cos_power=L1.COL_COS_POWER,
         verbose=False,
     )
-    del z1, z2
+    del h2m, z1, z2, border_mask_t
     gc.collect()
 
     P = cells["P"]
@@ -626,7 +629,7 @@ def format_l2_param_lines(d, *, indent: str = "  ") -> list[str]:
     """Multi-line L2 learned-parameter summary (infer / train logging)."""
     sub = indent + "  "
     return [
-        f"{indent}geometry:  K={d.K}  R={d.R}  T_refine={d.T_refine}",
+        f"{indent}geometry:  K={d.K}  R_fac={d.R_fac}  R_sup={d.R_sup}  T_refine={d.T_refine}",
         f"{indent}binning:   hard peak θ-bin per cell",
         f"{indent}drive:",
         f"{sub}b_coll={d.b_coll.item():.3f}  b_seed={d.b_seed.item():.3f}",
@@ -636,7 +639,7 @@ def format_l2_param_lines(d, *, indent: str = "  ") -> list[str]:
         f"{sub}η_coll={d.eta_coll.item():.3f}  η_iso={d.eta_iso.item():.3f}  "
         f"η_cross={d.eta_cross.item():.3f}  η_p={d.eta_p.item():.3f}",
         f"{indent}seed:  η_z={d.eta_z.item():.3f}  "
-        f"(ρ_seed = λ₁/(λ₁+λ₂+η_z))",
+        f"(ρ_seed = ρ_peak/(ρ_total+η_z))",
     ]
 
 
@@ -762,7 +765,7 @@ def main():
         f"Dynamics: R_fac={L2.R_FAC_POOL}  R_sup={L2.R_SUP_POOL}  K={L2.K}  "
         f"T={L2.T_REFINE}  "
         f"drive²/(drive² + b_iso·c̃_iso + b_cross·c̃_cross + η_p²); "
-        f"ρ_seed = λ₁/(λ₁+λ₂+η_z); "
+        f"ρ_seed = ρ_peak/(ρ_total+η_z); "
         f"  TBPTT: {TRAIN.L2_SNAPSHOT_MAX} segments  "
         f"window=max(1, T//{TRAIN.L2_SNAPSHOT_MAX})  (full grad per segment)"
     )

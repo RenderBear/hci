@@ -99,9 +99,9 @@ def viz_l1_lambdas_three(
     interior = ~np.asarray(is_border, dtype=bool)
 
     panels = [
-        (a1, r"$\lambda_1$ (branch 0)"),
-        (a2, r"$\lambda_2$ (branch 1)"),
-        (a3, r"$\lambda_3$ (smallest eigenvalue)"),
+        (a1, r"$\rho_{\mathrm{peak}}$ (max bin)"),
+        (a2, r"$\rho_{\mathrm{2nd}}$ (2nd bin)"),
+        (a3, r"$\rho_{\mathrm{off}}$ (total − peak)"),
     ]
 
     fig, axes = plt.subplots(3, 1, figsize=(5.5, 5.2 * 3), facecolor=VIZ.BG)
@@ -545,7 +545,7 @@ def viz_infer_l1_lambdas(
         lam3,
         is_border,
         out_path,
-        suptitle=r"L1 $\lambda$ (L2 seed: $\rho_{\mathrm{seed}}=\lambda_1/(\lambda_1+\lambda_2+\eta_z)$)",
+        suptitle=r"L1 bin masses (L2 seed: $\rho_{\mathrm{seed}}=\rho_{\mathrm{peak}}/(\rho_{\mathrm{total}}+\eta_z)$)",
     )
 
 
@@ -565,7 +565,7 @@ def viz_infer_cell_rho_maps(
         out_path,
         suptitle=(
             r"Cell $\rho$ — single-branch dynamics "
-            r"(seed: $\rho_{\mathrm{seed}}=\lambda_1/(\lambda_1+\lambda_2+\eta_z)$, "
+            r"(seed: $\rho_{\mathrm{seed}}=\rho_{\mathrm{peak}}/(\rho_{\mathrm{total}}+\eta_z)$, "
             rf"$\eta_z$={eta_z:.4g})"
         ),
         layout_rows_cols=(1, 2),

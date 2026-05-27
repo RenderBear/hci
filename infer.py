@@ -1,8 +1,8 @@
 r"""infer.py — STRIATE single-image inference.
 
-Pipeline: L0 → L1 (+ κ from z₁ polarity) → L2 ρ-space cell-grid dynamics (optional; use
-``--no-dynamics`` to skip L2 and feed NR-normalized ρ_seed through the renderer)
-→ **bilinear** boundary map ($B$ = ρ upsampled from the cell grid; L0 fields unused),
+Pipeline: L0 → L1 K-bin projection → L2 ρ-space cell-grid dynamics (optional; use
+``--no-dynamics`` to skip L2 and feed ρ_seed through the renderer)
+→ splat boundary map ($\hat B = \bar\rho \cdot \mathrm{gate}$),
 optional ridge NMS along θ, then thresholded edge PNG (default τ = 0.5).
 """
 
@@ -154,13 +154,14 @@ def run_l0_l1(img_path, device):
     l0_pix = build_l0_pix(
         s_np, h1m, h2m, bm_np, h2m_lum=h2m_lum, h2m_chr=h2m_chr,
     )
-    del h, vld, s, h1m, h2m, h2m_lum, h2m_chr
+    del h, vld, s, h1m, h2m_lum, h2m_chr
     gc.collect()
     _sync(device)
     timings["l0"] = time.perf_counter() - t0
 
     t1 = time.perf_counter()
     cells = run_l1(
+        h2m,
         z1,
         z2,
         L1.PATCH_SIZE,
@@ -168,10 +169,12 @@ def run_l0_l1(img_path, device):
         patch_overlap=L1.PATCH_OVERLAP,
         border_patch_max_frac=L1.BORDER_PATCH_MAX_FRAC,
         eps=L1.EPS,
+        K=L1.K,
+        cos_power=L1.COL_COS_POWER,
         device=device,
         verbose=False,
     )
-    del z1, z2, bm_t
+    del h2m, z1, z2, bm_t
     gc.collect()
     cells["is_border"] |= (cells["cy"] + cells["P"] / 2 > H0) | (
         cells["cx"] + cells["P"] / 2 > W0

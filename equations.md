@@ -1,26 +1,28 @@
-# HCI — equations (code-aligned)
+# STRIATE — equations (code-aligned)
 
-This file records the **notation and equations implemented in this repository**: `hci/L0.py`, `hci/L1.py`, `hci/renderer.py`, `hci/seed.py`, `train.py`, `infer.py`, `test.py`. Hyperparameters and defaults live in `params.py` (`L0`, `L1`, `SEED`, `RENDER`, `TRAIN`, …).
+This file records the **notation and equations implemented in this repository**: `hci/L0.py`, `hci/L1.py`, `hci/L2.py`, `hci/renderer.py`, `train.py`, `infer.py`, `test.py`. Hyperparameters and defaults live in `params.py` (`L0`, `L1`, `L2`, `RENDER`, `TRAIN`, …).
 
 ---
 
 ## 1. End-to-end pipeline
 
-1. **L0** — RGB → directional differences $d_k^{\mathrm{lum}}, d_k^{\mathrm{chr}}$ (optionally **cached** across training steps when geometry and `L0.L0_DIST_CACHE_VERSION` match). Naka–Rushton with **fixed** scalars $\eta_0^{\mathrm{lum}}, \eta_0^{\mathrm{chr}}$ (`L0.ETA_LUM`, `L0.ETA_CHR`) and gain $\gamma$ (`L0.GAMMA`). Outputs include pixel $h_{2m}$, split $h_{2m}^{\mathrm{lum}}, h_{2m}^{\mathrm{chr}}$, and orientation $\theta_h = \tfrac12 \arg z_2$.
-2. **L1** — $\cos^2$ hypercolumns on $h_{2m}$; **seed NR** with learned $\eta_z$ maps raw $\boldsymbol{\mu}$ to $\boldsymbol{\rho}^{\mathrm{seed}}\in[0,1]^K$; then $T$ **pass NR** steps with kernel-normalized collinear / flank / cross pools, excitatory drive $\rho^{\mathrm{seed}}\beta_{\mathrm{seed}}+\beta_c\mathbf{s}_{\mathrm{coll}}$, and divisive update $\boldsymbol{\rho}\leftarrow \mathrm{drive}^2/(\mathrm{drive}^2+\eta_p^2+\beta_f\mathbf{s}_{\mathrm{flank}}^2+\beta_x\mathbf{s}_{\mathrm{cross}}^2+\varepsilon)$ with learned scalars $\eta_z,\eta_p,\beta_{\cdot}$ and kernel scales $\sigma_d,\sigma_t,\sigma_{\mathrm{iso}}$. Diagnostic $\kappa$ (cosine alignment of $\boldsymbol{\rho}$ vs raw collinear conv) is **not** multiplied into $\rho$; the renderer reads $\bar\kappa_{\mathrm{col}}$ from the dominant bin.
-3. **Seed module** — `RhoSeedModule` passes dominant $\rho$ from `cells_flat["lam"][...,0]` through to the renderer (no extra recurrent dynamics on the seed tensor).
-4. **Renderer** — θ combing on cells, bilinear interp of $\bar\rho, \bar\theta, \bar\kappa_{\mathrm{col}}$ to pixels, tangential / normal **stencils** on $h_{2m}^{\mathrm{lum}}+h_{2m}^{\mathrm{chr}}$, **14→8→1** thinning MLP gate ($\bar\rho$ is feature index 2, not multiplied out):
-   $$\hat B(p) = \bigl(h_{2m}^{\mathrm{lum}}(p)+h_{2m}^{\mathrm{chr}}(p)\bigr)\,\mathrm{gate}(p).$$
+1. **L0** — RGB → split luminance / chrominance directional differences; per-direction min subtraction; independent Naka–Rushton per channel with **fixed** scalars $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ (`L0.ETA_LUM`, `L0.ETA_CHR`) and gain $\gamma$ (`L0.GAMMA`). Produces harmonic stack $s$, magnitudes $h_{1m}, h_{2m}$, and split $h_{2m}^{\mathrm{lum}}, h_{2m}^{\mathrm{chr}}$. Complex fields $z_1, z_2$ are read from $s$ (`z_from_l0_harmonics`). L0 is **precomputed and cached** for training; it is not updated during training.
+2. **L1** — Pixel $K$-bin $\cos^p$ projection of $h_{2m}$ (`L1.K`, `L1.COL_COS_POWER`); sum-pool over $P\times P$ patches → per-cell $\rho_{\mathrm{raw}}^{(k)}$, dominant $\theta$, polarity $q$, anisotropy $\delta$, optional $\kappa$, and $h_{2m}$-weighted splat anchors. **Precomputed and cached** with L0.
+3. **L2** (`TileDynamics`) — Seed $\rho_{\mathrm{seed}} = \rho_{\mathrm{peak}}/(\rho_{\mathrm{total}}+\eta_z)$; then $T_{\mathrm{refine}}$ recurrent steps with grouped `conv2d` collinear / iso / cross pools, NR-squashed drive terms, and divisive $\rho$ update. Runs **live each training step** so gradients reach the nine learned L2 scalars.
+4. **Renderer** (`ModulationRenderer`) — Cell-grid $\theta$ combing and $\rho$-gated anchor smoothing; **Gaussian-line splat** of refined $\rho$ to pixels; coherence map; tangential / normal **stencils on $\bar\rho$**; **12→8→1** thinning MLP gate:
+   $$\hat B(p) = \bar\rho(p)\,\mathrm{gate}(p).$$
 
-There is **no** second L0 pass, **no** spatial $\eta$-MLP, and **no** regional $\eta$ modulation inside the training or inference graphs; $h_{2m}^{\mathrm{lum}}, h_{2m}^{\mathrm{chr}}$ at render time are those from the initial L0 forward.
+There is **no** spatial $\eta$-MLP and **no** second L0 pass inside the training graph. L1 $\kappa$ is computed but **not** fed to the renderer. `L1.K` must match `L2.K` for hard orientation bins.
+
+At inference, optional **ridge NMS** (`ridge_nms`) thins $\hat B$ using splat-dominant orientation $\theta^\star(p)$.
 
 ---
 
 ## 2. L0 — split luminance / chrominance harmonics
 
-Eight offsets $\delta_k \in \mathbb{Z}^2$ (`L0.OFFSETS`). RGB is mapped to orthonormal luminance $L$ and chrominance $C$.
+Eight offsets $\delta_k \in \mathbb{Z}^2$ (`L0.OFFSETS`). RGB maps to luminance $L=(R+G+B)/3$ and chrominance $C=(R,G,B)-L\mathbf{1}$ (3-vector per pixel).
 
-**Directional differences** (magnitude on $L$, $\ell_2$ on $C$):
+**Directional differences**:
 
 $$
 d_k^{\mathrm{lum}}(p) = \bigl|L(p) - L(p+\delta_k)\bigr|, \qquad
@@ -34,257 +36,291 @@ $$
 \tilde d_k^{\mathrm{chr}} = d_k^{\mathrm{chr}} - \min_j d_j^{\mathrm{chr}} .
 $$
 
-**Naka–Rushton** with fixed $\eta_0^{\mathrm{lum}}, \eta_0^{\mathrm{chr}}$ and denominator floor in code so flat regions stay numerically stable:
+**Naka–Rushton** (independent per channel, per direction; $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ fixed from `params.L0`):
 
 $$
-h_k^{\mathrm{lum}} = \gamma\,\frac{(\tilde d_k^{\mathrm{lum}})^2}{(\eta_0^{\mathrm{lum}})^2 + (\tilde d_k^{\mathrm{lum}})^2}, \qquad
-h_k^{\mathrm{chr}} = \gamma\,\frac{(\tilde d_k^{\mathrm{chr}})^2}{(\eta_0^{\mathrm{chr}})^2 + (\tilde d_k^{\mathrm{chr}})^2}.
+h_k^{\mathrm{lum}} = \gamma\,\frac{(\tilde d_k^{\mathrm{lum}})^2}{\eta_{\mathrm{lum}}^2 + (\tilde d_k^{\mathrm{lum}})^2}, \qquad
+h_k^{\mathrm{chr}} = \gamma\,\frac{(\tilde d_k^{\mathrm{chr}})^2}{\eta_{\mathrm{chr}}^2 + (\tilde d_k^{\mathrm{chr}})^2}.
 $$
 
-**Second harmonic** (complex $z_2$, magnitude $h_{2m}$, orientation $\theta_h$):
+Combined directional response $h_k = h_k^{\mathrm{lum}} + h_k^{\mathrm{chr}}$.
+
+**Harmonics** (unit bearings $\hat u_k$ from offsets; $F$ stacks $\cos\varphi_k, \sin\varphi_k, \cos 2\varphi_k, \sin 2\varphi_k$):
 
 $$
-z_2(p) = \sum_k \bigl(h_k^{\mathrm{lum}} + h_k^{\mathrm{chr}}\bigr)\, e^{2i\varphi_k}, \qquad
-h_{2m}(p) = |z_2(p)|, \qquad
-\theta_h(p) = \tfrac12 \arg z_2(p).
+s(p) = \sum_k h_k(p)\, F_k \in \mathbb{R}^4, \qquad
+z_1(p) = s_0 + i s_1, \quad z_2(p) = s_2 + i s_3,
+$$
+$$
+h_{1m}(p) = |z_1(p)|, \qquad h_{2m}(p) = |z_2(p)|.
 $$
 
-Pixel fields $h_{2m}^{\mathrm{lum}}(p)$, $h_{2m}^{\mathrm{chr}}(p)$ are the magnitudes of the lum-only and chr-only harmonic sums (`compute_l0_rgb`).
+Split second-harmonic magnitudes $h_{2m}^{\mathrm{lum}}, h_{2m}^{\mathrm{chr}}$ use the same projection on $h_k^{\mathrm{lum}}, h_k^{\mathrm{chr}}$ alone (`compute_l0_rgb`). Border pixels are zeroed before L1.
+
+*(Legacy path: grayscale / non-RGB uses divisive normalization $h_k = \gamma\, d_k^2 / (\eta_0^2 + \sum_j d_j^2)$ in `compute_contrast_field`.)*
 
 ---
 
-## 3. L1 — hypercolumn binning (raw oriented mass)
+## 3. L1 — pixel K-bin projection
 
-Patch size $P$, stride $S = P - \texttt{patch\_overlap}$ → cell grid $(n_H, n_W)$, $K$ bins (`L1.COL_K_BINS`), bin centres $\bar\theta_k = k\pi/K$.
+Patch size $P$ (`L1.PATCH_SIZE`), stride $S = P - \texttt{patch\_overlap}$ (`L1.PATCH_OVERLAP`) → cell grid $(n_H, n_W)$, $K$ bins (`L1.K`, default 24, same as `L2.K`). Bin centres $\bar\theta_k = k\pi/K$. A cell is **border** when the mean border mask over its patch exceeds `L1.BORDER_PATCH_MAX_FRAC`.
 
-**Oriented energy** into bin $k$ at cell $c$ (sum over pixels in the patch):
-
-$$
-\rho_k^{\mathrm{proj}}(c) = \sum_{p \in \mathrm{patch}(c)} h_{2m}(p)\,\cos^{p}\!\bigl(\theta_h(p) - \bar\theta_k\bigr),
-\qquad p = \texttt{L1.COL\_COS\_POWER}\ (\text{default }4).
-$$
-
-**Bin competition** (learned $T>0$, `SEED.BIN_TEMP` init): per cell $c$,
+Pixel orientation from L0 ($\S$2):
 
 $$
-p_k(c) = \frac{\exp(\rho_k^{\mathrm{proj}}(c)/T)}{\sum_j \exp(\rho_j^{\mathrm{proj}}(c)/T)}, \qquad
-T = \mathrm{softplus}(\tilde T),
-$$
-$$
-\rho_k^{\mathrm{raw}}(c) = p_k(c)\,\sum_j \rho_j^{\mathrm{proj}}(c)
-$$
-(preserves cell oriented energy; $\mu_k=\rho_k^{\mathrm{raw}}$ for seed NR).
-
-With $K{=}24$ and $\cos^2$ tuning alone, $\rho_k^{\mathrm{proj}}$ is nearly flat for a single orientation, so cross pools suppress uniformly; $\cos^4$ plus softmax restores bin contrast before seed NR.
-
-Border cells zero $\rho_k^{\mathrm{raw}}$. **Cell total oriented energy** (used downstream / diagnostics):
-
-$$
-z_0(c) = \sum_{k=0}^{K-1} \rho_k^{\mathrm{raw}}(c).
+\theta_{2m}(p) = \tfrac12 \arg z_2(p).
 $$
 
-Take $\mu_k(c) = \rho_k^{\mathrm{raw}}(c)$. **Seed NR** (once, before passes) compresses raw drive to $[0,1]$ so it matches the normalized pools in §4:
+**Pixel-level bin channels** ($p = \texttt{L1.COL\_COS\_POWER}$, default 4):
 
 $$
-\rho_k^{\mathrm{seed}}(c) = \frac{\mu_k(c)^2}{\mu_k(c)^2 + \eta_z^2 + \varepsilon}, \qquad
-\eta_z = \mathrm{softplus}(\tilde\eta_z).
+e_k(p) = h_{2m}(p)\,\cos^{p}\!\bigl(\theta_{2m}(p) - \bar\theta_k\bigr), \qquad k = 0,\ldots,K-1.
 $$
 
-Recurrence starts from $\boldsymbol{\rho}^{(0)}=\boldsymbol{\rho}^{\mathrm{seed}}$. `rho_k_initial` in `cells` stores **post–seed-NR** $\boldsymbol{\rho}^{\mathrm{seed}}$.
+**Per-cell raw bin mass** (sum over patch; implemented as sum-pool / `avg_pool2d` × $P^2$):
+
+$$
+\rho_{\mathrm{raw}}^{(k)}(c) = \sum_{p \in \mathrm{patch}(c)} e_k(p).
+$$
+
+**Dominant orientation and anisotropy**:
+
+$$
+k^\*(c) = \arg\max_k \rho_{\mathrm{raw}}^{(k)}(c), \qquad
+\theta(c) = \bar\theta_{k^\*(c)},
+$$
+$$
+\rho_{\mathrm{peak}}(c) = \rho_{\mathrm{raw}}^{(k^\*)}(c), \qquad
+\rho_{\mathrm{total}}(c) = \sum_k \rho_{\mathrm{raw}}^{(k)}(c),
+$$
+$$
+\delta(c) = \frac{\rho_{\mathrm{peak}}(c)}{\rho_{\mathrm{total}}(c) + \varepsilon}.
+$$
+
+**Polarity** (winning-bin $\theta$, patch sum of $z_1$):
+
+$$
+q(c) = \Re\!\Bigl(\overline{Z_1(c)}\, e^{i\theta(c)}\Bigr), \qquad
+Z_1(c) = \sum_{p \in \mathrm{patch}(c)} z_1(p).
+$$
+
+**Orientation confidence** $\kappa \in [0,1]$ (`_patch_orientation_kappa`): $z_1$ polarity agreement along the edge normal implied by $(\theta, q)$.
+
+**Splat anchors** ($h_{2m}$-weighted centroid within the patch; stored as `cx_z2`, `cy_z2`):
+
+$$
+c_x(c) = \frac{\sum_{p \in \mathrm{patch}(c)} h_{2m}(p)\, x(p)}{\sum_{p \in \mathrm{patch}(c)} h_{2m}(p) + \varepsilon}, \qquad
+c_y(c) \text{ analogously}.
+$$
+
+**Cache / L2-facing fields** (legacy key names preserved):
+
+| Key | Value |
+|-----|--------|
+| `lam[...,0]` | $\rho_{\mathrm{peak}}$ |
+| `lam[...,1]` | second-largest bin mass |
+| `z0` | $\rho_{\mathrm{total}}$ |
+| `lam3` | $\rho_{\mathrm{total}} - \rho_{\mathrm{peak}}$ (off-peak mass) |
+| `rho_bins` | full $(n_H, n_W, K)$ tensor |
+
+Border cells zero $\theta, q, \delta, \rho_{\mathrm{raw}}, \kappa$. L2 uses **branch 0 only** ($\theta = \theta_0$); `branch_pick` from `TileDynamics` is always zero.
 
 ---
 
-## 4. GABA — seed NR + three-pool pass recurrence
+## 4. L2 — seed and tile dynamics (`TileDynamics`)
 
-Let $\boldsymbol{\rho}^{(t)}(c)\in\mathbb{R}_+^K$ be the bin vector at the **start** of pass $t$ ($\boldsymbol{\rho}^{(0)}=\boldsymbol{\rho}^{\mathrm{seed}}$ from §3). $\boldsymbol{\rho}^{\mathrm{seed}}$ is **fixed** for all passes. Border cells zero $\boldsymbol{\rho}$ after each map.
-
-### Learned scalars (`HypercolumnSeed`, softplus of raw parameters)
-
-Includes bin softmax temperature $T$ (`_bin_temp_raw` → `bin_temp`) applied to $\rho^{\mathrm{proj}}$ before seed NR.
+Interior mask $\mathrm{ok}(c) = \neg\,\texttt{is\_border}(c)$. Hard orientation bin per cell ($K =$ `L2.K`, default 24):
 
 $$
-\eta_z = \mathrm{softplus}(\tilde\eta_z), \quad
-\eta_p = \mathrm{softplus}(\tilde\eta_p), \quad
-\beta_{\mathrm{seed}} = \mathrm{softplus}(\tilde\beta_{\mathrm{seed}}), \quad
-\beta_c = \mathrm{softplus}(\tilde\beta_c), \quad
-\beta_f = \mathrm{softplus}(\tilde\beta_f), \quad
-\beta_x = \mathrm{softplus}(\tilde\beta_x).
+b(c) = \left\lfloor \frac{\theta(c) \bmod \pi}{\pi/K} \right\rfloor \in \{0,\ldots,K-1\}.
 $$
 
-Defaults in `params.SEED`: `ETA_Z`, `ETA_P`, `BETA_SEED`, `BETA_C`, `BETA_F`, `BETA_X`.
-
-### Kernel scales ($R =$ `L1.COL_RADIUS`)
+### Seed (once, fixed in drive)
 
 $$
-\sigma_d = \mathrm{softplus}(\tilde\alpha_d)\,R, \qquad
-\sigma_t = \mathrm{softplus}(\tilde\alpha_t)\,R, \qquad
-\sigma_{\mathrm{iso}} = \mathrm{softplus}(\tilde\alpha_{\mathrm{iso}})\,R.
+\rho_{\mathrm{seed}}(c) = \frac{\rho_{\mathrm{peak}}(c)}{\rho_{\mathrm{total}}(c) + \eta_z + \varepsilon}, \qquad
+\eta_z = \mathrm{softplus}(\tilde\eta_z),
 $$
 
-On the $(2R+1)^2$ patch (disk clip, center omitted), radial Gaussian $w_d(r)=\exp(-r^2/2\sigma_d^2)$ and oriented envelope $\mathrm{gauss}(r,\sigma_d,\sigma_t)$ use offset angle $\phi=\mathrm{atan2}(d_i,d_j)$ ($d_j$ horizontal, $d_i$ vertical). The tangential Gaussian suppresses neighbors **perpendicular** to bin axis $\bar\theta_k=k\pi/K$ via $d_\perp = d_i\cos\bar\theta_k + d_j\sin\bar\theta_k$ (at $\bar\theta_k=0$, $d_\perp=d_i$ kills above/below, preserving the horizontal strip). Then:
+with $\rho_{\mathrm{peak}} = \texttt{lam[...,0]}$ and $\rho_{\mathrm{total}} = \texttt{z0}$ from L1 (§3). Border cells: $\rho_{\mathrm{seed}} = 0$. With $T_{\mathrm{refine}}=0$ (`infer --no-dynamics`), $\rho$ stays at $\rho_{\mathrm{seed}}$ on interior cells.
+
+### Learned scalars (softplus of raw parameters)
 
 $$
-G^{\mathrm{coll}}_k = \mathrm{gauss}(r,\sigma_d,\sigma_t)\,\cos^2(\phi-\bar\theta_k), \qquad
-G^{\mathrm{flank}}_k = \mathrm{gauss}(r,\sigma_d,\sigma_t)\,\sin^2(\phi-\bar\theta_k).
+\eta_z,\; b_{\mathrm{seed}},\; b_{\mathrm{coll}},\; b_{\mathrm{iso}},\; b_{\mathrm{cross}},\;
+\eta_{\mathrm{coll}},\; \eta_{\mathrm{iso}},\; \eta_{\mathrm{cross}},\; \eta_p .
 $$
 
-**Cross-orientation** pool uses a single isotropic kernel (no angular weighting):
+Defaults in `params.L2`: `ETA_Z_INIT`, `B_SEED_INIT`, `B_COLL_INIT`, `B_ISO_INIT`, `B_CROSS_INIT`, `ETA_COLL_INIT`, `ETA_ISO_INIT`, `ETA_CROSS_INIT`, `ETA_P_INIT`.
+
+### Fixed conv kernels (buffers, no gradients)
+
+Radii $R_{\mathrm{fac}} =$ `L2.R_FAC_POOL`, $R_{\mathrm{sup}} =$ `L2.R_SUP_POOL`. Bin axes $\bar\theta_k = k\pi/K$. Offset $(d_i, d_j)$ from cell centre, $\hat t_k = (\cos\bar\theta_k, \sin\bar\theta_k)$, $\hat n_k = (-\sin\bar\theta_k, \cos\bar\theta_k)$, $\hat d = (d_i, d_j)/\|d\|$.
+
+**Collinear** (facilitation radius $R_{\mathrm{fac}}$, centre omitted):
 
 $$
-G^{\mathrm{cross}} = \mathrm{gauss}(r,\sigma_{\mathrm{iso}}).
+W^{\mathrm{coll}}_k(d) = \bigl|\hat t_k \cdot \hat d\bigr|.
 $$
 
-### Kernel-normalized depthwise convolution
-
-For nonnegative kernel $G$ (per bin $k$ where applicable):
+**Iso-orientation** (suppression radius $R_{\mathrm{sup}}$):
 
 $$
-\hat s_k^{(t)}(c) = \frac{(G_k * \rho_k^{(t)})(c)}{(G_k * \mathbf{1})(c) + \varepsilon}.
+W^{\mathrm{iso}}_k(d) = (\hat n_k \cdot \hat d)^2.
 $$
 
-Implementation: `_norm_conv` in `hci/L1.py`. Pools $\hat s_{\mathrm{coll},k}$, $\hat s_{\mathrm{flank},k}$ convolve $\rho_k^{(t)}$ with $G^{\mathrm{coll}}_k$, $G^{\mathrm{flank}}_k$. **Cross pool** mixes other bins with orientation distance weights before spatial pooling:
+**Cross-orientation** (same $R_{\mathrm{sup}}$, isotropic):
 
 $$
-w_{k,j} = \frac{\sin^2\!\bigl(\pi(k-j)/K\bigr)}{\sum_{j'\neq k}\sin^2\!\bigl(\pi(k-j')/K\bigr)}, \quad j\neq k; \qquad w_{k,k}=0,
+W^{\mathrm{cross}}(d) = 1 \quad \text{(disk patch, centre omitted)}.
 $$
 
+### Pools on the cell grid
+
+Let $\rho^{(t)}$ be the scalar $\rho$ field at pass start ($\rho^{(0)} = \rho_{\mathrm{seed}}$). Pools use $\rho^{(t)}$; $\rho_{\mathrm{seed}}$ is **fixed** in the drive.
+
+Gather at each cell's hard bin $b(c)$ after grouped `conv2d`:
+
 $$
-\tilde\rho_k^{(t)}(c) = \sum_{j=0}^{K-1} w_{k,j}\,\rho_j^{(t)}(c),
+\rho_{\mathrm{coll}}(c) = \frac{(W^{\mathrm{coll}}_{b(c)} * \rho^{(t)})(c)}{(W^{\mathrm{coll}}_{b(c)} * \mathbf{1})(c) + \varepsilon},
+$$
+$$
+c_{\mathrm{iso}}(c) = \frac{(W^{\mathrm{iso}}_{b(c)} * (\rho^{(t)})^2)(c)}{(W^{\mathrm{iso}}_{b(c)} * \mathbf{1})(c) + \varepsilon},
+$$
+
+Cross pool mixes $\rho^2$ across bins before isotropic convolution; own-bin mass is subtracted:
+
+$$
+c_{\mathrm{cross}}(c) = \frac{m_0^{\mathrm{tot}}(c) - m_0^{\mathrm{own}}(c)}{m_0^{\mathrm{tot}}(c) + \varepsilon},
+$$
+
+where $m_0^{\mathrm{tot}}$ is the isotropic conv sum over all bins and $m_0^{\mathrm{own}}$ the own-bin contribution. All pools are masked by $\mathrm{ok}(c)$.
+
+**NR squash** (bounded drive / inhibition signals):
+
+$$
+\tilde x = \frac{x^2}{x^2 + \eta^2}.
+$$
+
+Apply with $(x,\eta) \in \{(\rho_{\mathrm{coll}}, \eta_{\mathrm{coll}}), (c_{\mathrm{iso}}, \eta_{\mathrm{iso}}), (c_{\mathrm{cross}}, \eta_{\mathrm{cross}})\}$.
+
+### Pass update ($t = 0,\ldots,T_{\mathrm{refine}}-1$, `L2.T_REFINE`)
+
+$$
+\mathrm{drive}^{(t)}(c) = b_{\mathrm{seed}}\,\rho_{\mathrm{seed}}(c) + b_{\mathrm{coll}}\,\tilde\rho_{\mathrm{coll}}^{(t)}(c),
+$$
+$$
+\rho^{(t+1)}(c) = \mathrm{ok}(c)\cdot
+\frac{\bigl(\mathrm{drive}^{(t)}(c)\bigr)^2}
+{\bigl(\mathrm{drive}^{(t)}(c)\bigr)^2
++ b_{\mathrm{iso}}\,\tilde c_{\mathrm{iso}}^{(t)}(c)
++ b_{\mathrm{cross}}\,\tilde c_{\mathrm{cross}}^{(t)}(c)
++ \eta_p^2 + \varepsilon}.
+$$
+
+**TBPTT**: during training, $\rho$ is detached every `grad_window = max(1, T_{\mathrm{refine}} // \texttt{TRAIN.L2\_SNAPSHOT\_MAX})` steps to limit BPTT depth.
+
+**Diagnostics** (`return_surface_diags`): NR-squashed pool snapshots at $t{=}0$ and $t{=}$last; optional bimodality $\sum_c \rho(1-\rho)$ per snapshot step.
+
+---
+
+## 5. Renderer — splat, coherence, stencils, thinning head
+
+**Step 1 — cell grid.** $\rho$-weighted double-angle $\theta$ smoothing (`RENDER.THETA_SMOOTH_PASSES`); $\rho$- and orientation-gated smoothing of anchors $(c_x^{z_2}, c_y^{z_2})$. Coordinates and $\theta$ are **detached** before splat (no coordinate gradients into L2).
+
+**Step 2 — Gaussian-line splat.** For each active cell $c$ with $\rho_c > 0$, deposit along normal to $\theta_c$ with learned width $\sigma_\perp = \mathrm{softplus}(\tilde\sigma_\perp)$:
+
+$$
+\phi_c(p) = \exp\!\left(-\frac{d_\perp(p,c)^2}{2\sigma_\perp^2}\right),
 \qquad
-\hat s_{\mathrm{cross},k}^{(t)}(c) = \mathrm{norm\_conv}(\tilde\rho_k^{(t)}, G^{\mathrm{cross}}).
+\bar\rho(p) = \frac{\sum_c \rho_c\,\phi_c(p)}{\sum_c \phi_c(p) + \varepsilon}.
 $$
 
-Neighboring bins ($\approx 7.5°$ at $K=24$) get weight $\sin^2(\pi/K)\approx 0.017$; orthogonal bins ($90°$) get weight $1.0$.
-
-### Pass update ($t = 0,\ldots,T-1$, `L1.COL_PASSES`)
-
-**Drive** (local seed baseline plus collinear facilitation):
+Dominant orientation per pixel (scatter-max by $\rho_c\,\phi_c$):
 
 $$
-\mathrm{drive}_k^{(t)}(c) =
-\rho_k^{\mathrm{seed}}(c)\,\beta_{\mathrm{seed}}
-+ \beta_c\,\hat s_{\mathrm{coll},k}^{(t)}(c).
+\theta^\star(p) = \theta_{c^\star(p)}, \qquad
+c^\star(p) = \arg\max_c \rho_c\,\phi_c(p).
 $$
 
-The $\rho_k^{\mathrm{seed}}\beta_{\mathrm{seed}}$ term scales with local oriented energy; $\beta_c\hat s_{\mathrm{coll}}$ adds neighbor collinear context without an extra $\rho^{\mathrm{seed}}$ gate on that term.
-
-**Divisive NR** (scalar floor $\eta_p$; flank and cross as independent suppressive channels):
+**Step 3 — coherence** (within splat footprint):
 
 $$
-\rho_k^{(t+1)}(c) = \frac{\bigl(\mathrm{drive}_k^{(t)}(c)\bigr)^2}
-{\bigl(\mathrm{drive}_k^{(t)}(c)\bigr)^2 + \eta_p^2 + \beta_f\,\bigl(\hat s_{\mathrm{flank},k}^{(t)}(c)\bigr)^2 + \beta_x\,\bigl(\hat s_{\mathrm{cross},k}^{(t)}(c)\bigr)^2 + \varepsilon}.
+\mathrm{coh}(p) = \frac{\sum_c \rho_c\,\phi_c(p)\,\cos^2\!\bigl(\theta_c - \theta^\star(p)\bigr)}
+{\sum_c \rho_c\,\phi_c(p) + \varepsilon}.
 $$
 
-Each suppressive term in the denominator is an independent channel; they accumulate without interaction. Clean contours ($\hat s_{\mathrm{coll}}$ high, $\hat s_{\mathrm{flank}}$ low) yield large drive and small denominator → high $\rho$. Parallel texture or ramp edges ($\hat s_{\mathrm{flank}}$ high) grow the denominator and suppress $\rho$. $\varepsilon$ is `SEED.EPS` (`nr_eps` in code).
-
-### Diagnostic $\kappa$
-
-Raw collinear conv $S_k^{\mathrm{raw}}=(G^{\mathrm{coll}}_k * \rho_k^{(t)})(c)$ (unnormalized). Per-cell cosine over bins:
+**Step 4 — stencils on $\bar\rho$** with unit tangent $\hat t = (\cos\theta^\star, \sin\theta^\star)$, normal $\hat n = (-\sin\theta^\star, \cos\theta^\star)$, learned spacings $s_t, s_n$ (softplus not applied to $s_t, s_n$ in code—they are raw `nn.Parameter` initialized at 1):
 
 $$
-\kappa^{(t)}(c) = \frac{\boldsymbol{\rho}^{(t)}(c)\cdot \mathbf{S}^{\mathrm{raw}(t)}(c)}
-{\bigl\|\boldsymbol{\rho}^{(t)}(c)\bigr\|\,\bigl\|\mathbf{S}^{\mathrm{raw}(t)}(c)\bigr\| + \varepsilon}.
+\mathrm{tang}_j(p) = \bar\rho\!\left(p + j\, s_t\, \hat t(p)\right), \qquad
+\mathrm{norm}_j(p) = \bar\rho\!\left(p + j\, s_n\, \hat n(p)\right), \qquad j \in \{-2,-1,0,1,2\}.
 $$
 
-`kappa_pass0_cell` / `kappa_col_cell` store $\kappa^{(t)}$ after the first / last pass. $\kappa$ is **not** multiplied into $\rho$ in the recurrence; it is exported to the renderer feature stack as $\bar\kappa_{\mathrm{col}}$.
+(Bilinear sampling via `grid_sample`.)
 
-**Geometry viz** (`infer.py` → `{stem}_geometry.png`): pass-0 max over bins of $\hat s_{\mathrm{coll}}$, $\hat s_{\mathrm{flank}}$, $\hat s_{\mathrm{cross}}$ on the cell grid.
-
-An optional callback `eta_update_fn` remains in `gaba_recurrence` for API compatibility; **training and bundled infer paths pass `None`.**
-
----
-
-## 5. Post-recurrence dominant channel
-
-Dominant bin:
-
-$$
-b^*(c) = \arg\max_{k} \rho_k^{(T)}(c).
-$$
-
-**Cached / renderer-facing scalars** per cell (modulo border and tile-interior masking in code):
-
-$$
-\rho_{\mathrm{dom}}(c) = \rho_{b^*}^{(T)}(c), \qquad
-\theta(c) = \bigl(\bar\theta_{b^*},\, \bar\theta_{b^*}\bigr), \qquad
-\kappa_{\mathrm{col}}(c) = \kappa_{b^*}(c), \qquad
-\rho_{\max}(c) = \max_k \rho_k^{(T)}(c),
-$$
-
-plus collinear energy $e_{\mathrm{col}}$ at the dominant bin (unnormalized collinear conv on final $\boldsymbol{\rho}$), initial $\rho$ at $b^*$ from the seed-NR snapshot, etc., as produced by `run_l1_hypercolumn` and flattened in `build_cells_flat`.
-
----
-
-## 6. Renderer — interp, stencils, readout MLP
-
-**θ combing** on the cell grid (double-angle, ρ-weighted smoothing, `RENDER.THETA_SMOOTH_PASSES`), then **bilinear** sampling of stacked cell fields to pixels → $\bar\rho(p)$, $\bar\theta(p)$, $\bar\kappa_{\mathrm{col}}(p)$. Interpolated orientation used for stencil geometry may be **stopped** for autograd where noted in `hci/renderer.py`.
-
-**Stencils** on $h_{2m}^{\Sigma} = h_{2m}^{\mathrm{lum}} + h_{2m}^{\mathrm{chr}}$ with unit tangent $\hat t = (\cos\bar\theta,\sin\bar\theta)$ and normal $\hat n = (-\sin\bar\theta,\cos\bar\theta)$, learned spacings $s_t, s_n = \mathrm{softplus}(\cdot)$:
-
-$$
-\mathrm{tang}_j(p) = h_{2m}^{\Sigma}\bigl(p + j\, s_t\, \hat t(p)\bigr), \qquad
-\mathrm{norm}_j(p) = h_{2m}^{\Sigma}\bigl(p + j\, s_n\, \hat n(p)\bigr), \qquad j \in \{-2,-1,0,1,2\}.
-$$
-
-**Feature vector** $F_p \in \mathbb{R}^{14}$ (no separate $\eta$ modulation channel):
+**Feature vector** $F_p \in \mathbb{R}^{12}$:
 
 $$
 F_p = \bigl[
-h_{2m}^{\mathrm{lum}},\, h_{2m}^{\mathrm{chr}},\, \bar\rho,\, \bar\kappa_{\mathrm{col}},\,
+\bar\rho,\, \mathrm{coh},\,
 \mathrm{tang}_{-2},\ldots,\mathrm{tang}_{2},\,
 \mathrm{norm}_{-2},\ldots,\mathrm{norm}_{2}
 \bigr].
 $$
 
-**Boundary map** ($\bar\rho$ enters only via $F_p$, so loss gradients on $\hat B$ reach L1 $\rho$ through the MLP, not a compensating multiplicative shortcut):
+**Thinning head** (structural priors at init: Mexican-hat on `norm5`, flat smooth on `tang5`, $\sigma(\mathrm{MLP}(F_p)) \approx 0.88$ at $t{=}0$):
 
 $$
-\mathrm{gate}(p) = \sigma\bigl(\mathrm{MLP}_{\mathrm{read}}(F_p)\bigr), \qquad
-\hat B(p) = h_{2m}^{\Sigma}(p)\,\mathrm{gate}(p).
+\mathrm{gate}(p) = \sigma\!\bigl(W_2\,\mathrm{ReLU}(W_1 F_p + b_1) + b_2\bigr), \qquad
+\hat B(p) = \bar\rho(p)\,\mathrm{gate}(p).
 $$
 
-$\mathrm{MLP}_{\mathrm{read}}$: **14 → 8 → 1** (ReLU between linear layers). Checkpoints that stored a **15**-input first layer can be loaded via `upgrade_renderer_state_dict`, which drops the last input column of `thinning.fc1.weight` to match the current head.
+$\mathrm{MLP}$: **12 → 8 → 1**. Output is cropped to original content size $(H_0, W_0)$.
+
+`upgrade_renderer_state_dict` strips legacy renderer keys (e.g. `_sigma_par_raw`, `perp_conv.*`) before `load_state_dict(..., strict=False)`.
 
 ---
 
-## 7. Training (`train.py`)
+## 6. Training (`train.py`)
 
-- **Disk cache** (`precompute_image`): L0 and geometry only; stores `h2m`, `theta_h`, `border_mask`, `l0_pix`, optional `d_lum` / `d_chr`, GT, projection metadata — **not** `cells_flat`. Invalidation: `TRAIN.CACHE_VERSION`. Directional tensors may be reused when `L0.L0_DIST_CACHE_VERSION` and the stored signature match.
-- **Each step** (`prepare_batch` → `run_l1_live_cells` → `HarmonicContourE2E.forward_batch`): L1 runs **live** with `cells_format="torch"` so gradients reach `HypercolumnSeed` ($\tilde\eta_z$, $\tilde\eta_p$, $\tilde\beta_{\cdot}$, $\tilde\alpha_{d,t,\mathrm{iso}}$). `RhoSeedModule` then reads dominant $\rho$; the renderer consumes the same cached L0 pixel tensors (no interleaved L0 recompute inside GABA).
+- **Disk cache** (`precompute_image`): L0 + L1 + `cells_flat`, `l0_pix`, GT, projection metadata — **not** L2 $\rho$ or renderer output. Invalidation: `TRAIN.CACHE_VERSION`.
+- **Each step** (`prepare_batch` → `StriateE2E.forward_batch`): L2 runs live on cached `cells_flat`; renderer consumes the same cached L0 tensors (passed through for API compat; splat stencils use $\bar\rho$, not $h_{2m}$).
 
-**Loss** (defaults in `params.TRAIN`): weighted sum of soft-Dice and/or BCE on the valid edge band vs.\ ground-truth boundaries.
+**Loss** (defaults `TRAIN.LAM_DICE=0`, `TRAIN.LAM_BCE=1`): weighted sum of soft-Dice and/or BCE on the **η± edge band** — valid pixels where $\mathrm{GT} \ge \eta_{\mathrm{pos}}$ or $\mathrm{GT} < \eta_{\mathrm{neg}}$ (default $\eta_{\mathrm{pos}} = \eta_{\mathrm{neg}} = 0.5$). Positive label on $\mathrm{GT} \ge \eta_{\mathrm{pos}}$.
+
+Checkpoints store `{"model_state": state_dict}` (`intermediate.pt`, `final.pt`).
 
 ---
 
-## 8. Learned parameter count (current architecture)
+## 7. Learned parameter count (current architecture)
 
 | Block | Count | Notes |
 |------:|------:|------|
-| $\tilde\eta_z, \tilde T, \tilde\eta_p$ | 3 | Seed NR + bin softmax + pass NR floor |
-| $\tilde\beta_{\mathrm{seed}}, \tilde\beta_c, \tilde\beta_f, \tilde\beta_x$ | 4 | Drive ($\tilde\beta_{\mathrm{seed}}, \tilde\beta_c$) + NR denom ($\tilde\beta_f, \tilde\beta_x$) |
-| $\tilde\alpha_d, \tilde\alpha_t, \tilde\alpha_{\mathrm{iso}}$ | 3 | Kernel scales → $\sigma_d,\sigma_t,\sigma_{\mathrm{iso}}$ |
-| $s_t, s_n$ | 2 | Stencil spacing |
-| $\mathrm{MLP}_{\mathrm{read}}$ (14→8→1) | 129 | $14\cdot 8 + 8 + 8 + 1$ |
-| **Total (E2E)** | **141** | `HarmonicContourE2E` (10 seed + 131 renderer) |
+| $\tilde\eta_z, \tilde b_{\mathrm{seed}}, \tilde b_{\mathrm{coll}}, \tilde b_{\mathrm{iso}}, \tilde b_{\mathrm{cross}}$ | 5 | Seed + drive / inhibition gains |
+| $\tilde\eta_{\mathrm{coll}}, \tilde\eta_{\mathrm{iso}}, \tilde\eta_{\mathrm{cross}}, \tilde\eta_p$ | 4 | NR half-sats + pass floor |
+| $\tilde\sigma_\perp, s_t, s_n$ | 3 | Splat width + stencil spacings |
+| $\mathrm{MLP}_{\mathrm{thin}}$ (12→8→1) | 113 | $12\cdot 8 + 8 + 8 + 1$ |
+| **Total (`StriateE2E`)** | **125** | 9 L2 + 116 renderer |
 
-Legacy checkpoints may contain `eta_mlp.*`, `seed.hc_seed._alpha_raw`, or `seed.hc_seed._gaba_alpha_raw`; `remap_checkpoint_state_dict` drops those keys and warm-starts missing $\tilde\beta_{\cdot}$, $\tilde\alpha_t$, $\tilde\alpha_{\mathrm{iso}}$ from `params.SEED` / `params.L1` defaults so `load_state_dict(..., strict=False)` stays clean.
+L0 $\eta$ and L1 geometry are **not** learned. Legacy checkpoints from older K-bin / 14-feature renderer architectures may load with missing/unexpected keys; use `upgrade_renderer_state_dict` and `load_state_dict(..., strict=False)` with `report_checkpoint_compatibility`.
 
 ---
 
-## 9. Module map
+## 8. Module map
 
 | Stage | Primary code |
 |-------|----------------|
-| $d_k$, NR, harmonics, interior mask | `hci/L0.py` |
-| Hypercolumns, GABA recurrence, dominant extract, `HypercolumnSeed` | `hci/L1.py` |
-| `RhoSeedModule` wrapper | `hci/seed.py` |
-| Interp, stencils, thinning | `hci/renderer.py` |
-| Cache, batching, loss, checkpoint remap | `train.py` |
-| Single-image pipeline, viz hooks | `infer.py`, `hci/diagnostics_viz.py` |
-| Test-set sweep | `test.py` |
+| $d_k$, NR, harmonics, $z_1, z_2$, interior mask | `hci/L0.py` |
+| Pixel K-bin projection, $\kappa$, $h_{2m}$ anchors | `hci/L1.py` |
+| $\rho_{\mathrm{seed}}$, conv pools, recurrent $\rho$ refine | `hci/L2.py` |
+| Splat, coherence, stencils, thinning head, NMS | `hci/renderer.py` |
+| Cache, batching, loss, checkpoints | `train.py` |
+| Single-image pipeline, diagnostics | `infer.py`, `hci/diagnostics_viz.py` |
+| Test-set sweep (ODS / OIS / AP) | `test.py` |
 
 ---
 
-## 10. Revision note
+## 9. Revision note
 
-This document matches the **three-pool GABA recurrence** in `hci/L1.py`: learned **seed NR** ($\eta_z$), kernel-normalized **collinear / flank / cross** pools, **excitatory drive** ($\rho^{\mathrm{seed}}\beta_{\mathrm{seed}}+\beta_c s_{\mathrm{coll}}$), **divisive flank and cross** in the NR denominator, scalar pass floor $\eta_p$, learned $\sigma_{\mathrm{iso}}$ for cross-orientation inhibition, **14-dimensional** renderer readout, and **no** spatial η-MLP.
+This document matches the **STRIATE** stack: L1 **K-bin projection** (§3), L2 **`TileDynamics`** (§4), **Gaussian-line splat** renderer (§5), **`StriateE2E`** (125 learned scalars).

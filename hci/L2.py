@@ -1,7 +1,10 @@
 r"""L2 — cell-grid ρ refinement via recurrent Naka–Rushton on convolved geometry.
 
 Seed (once, fixed in drive):
-       ρ_seed = λ₁ / (λ₁ + λ₂ + η_z + ε)
+       ρ_seed = ρ_peak / (ρ_total + η_z + ε)
+
+  L1 exports ρ_peak = max_k ρ_raw^{(k)} and ρ_total = Σ_k ρ_raw^{(k)} as
+  cells_flat["lam"][...,0] and cells_flat["z0"].
 
   Per iteration t (ρ⁽⁰⁾ = ρ_seed for pooling; ρ_seed fixed in drive):
        ρ̃_coll = ρ_coll²/(ρ_coll² + η_coll²),  c̃_iso = c_iso²/(c_iso² + η_iso²),
@@ -175,7 +178,7 @@ def rho_seed_from_lam1_z0(
     is_border: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    """ρ_seed = λ₁/(λ₁+λ₂+η_z+ε); border cells → 0."""
+    """ρ_seed = ρ_peak / (ρ_total + η_z + ε); lam1=peak bin mass, z0=total bin mass."""
     denom = z0 + eta_z + eps
     rho = lam1 / denom.clamp_min(eps)
     return torch.where(is_border, torch.zeros_like(rho), rho)

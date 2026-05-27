@@ -12,7 +12,7 @@ STRIATE/
 ├── infer.py                 # single-image inference + diagnostics
 ├── hci/
 │   ├── L0.py                # pixel-level contrast
-│   ├── L1.py                # cell-level eigendecomposition
+│   ├── L1.py                # cell-level K-bin projection
 │   ├── L2.py                # tile-level coupled dynamics
 │   ├── renderer.py          # learned ridge projection
 │   └── diagnostics_viz.py   # visualisation utilities
@@ -22,7 +22,7 @@ STRIATE/
     └── test/results.json
 ```
 
-**Equation and notation reference:** `HCI_SYSTEM_EQUATIONS.md` (HCI system spec; see disclaimer there vs this repo), `equations.md` (code-aligned K-bin notes), and `docs/docs.html` (open in a browser).
+**Equation and notation reference:** `equations.md` (code-aligned STRIATE pipeline: L0 → L1 K-bin → L2 → splat renderer) and `docs/docs.html` (open in a browser).
 
 ## Requirements
 

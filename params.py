@@ -19,13 +19,15 @@ L0 = SimpleNamespace(
     GAMMA=1.0,
 )
 
-# ── L1: per-patch eigendecomposition → cell grid ────────────────────────────
+# ── L1: pixel K-bin cos² projection → cell grid ─────────────────────────────
 L1 = SimpleNamespace(
     PATCH_SIZE=5,
     PATCH_OVERLAP=3,
     BORDER_PATCH_MAX_FRAC=0.2,
     EPS=1e-15,
     N_BRANCHES=2,
+    K=24,
+    COL_COS_POWER=2,
 )
 
 # ── L2: cell-grid conv dynamics (ρ refinement) ───────────────────────────────
@@ -35,7 +37,7 @@ L2 = SimpleNamespace(
     K=24,
     T_REFINE=5,
     EPS=1e-9,
-    ETA_Z_INIT=2.0,  # seed denom: ρ_seed = λ₁/(λ₁+λ₂+η_z)
+    ETA_Z_INIT=2.0,  # seed: ρ_seed = ρ_peak / (ρ_total + η_z)
     LOGIT_CLAMP=1e-4,
     # drive / inhibition (softplus-positive, learned; constant over t)
     B_SEED_INIT=0.5,
@@ -75,9 +77,9 @@ TRAIN = SimpleNamespace(
     BATCH_SIZE=4,
     GRAD_CLIP=1.0,
     NUM_WORKERS=2,
-    LAM_DICE=1.0,
-    LAM_BCE=0.0,
-    CACHE_VERSION=42,
+    LAM_DICE=0.0,
+    LAM_BCE=1.0,
+    CACHE_VERSION=43,
     L2_SNAPSHOT_MAX=5,
 )
 
