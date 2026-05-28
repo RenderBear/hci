@@ -53,7 +53,6 @@ def build_model(ckpt, device):
         K=L2.K,
         t_refine=L2.T_REFINE,
         eps=L2.EPS,
-        eta_z_init=L2.ETA_Z_INIT,
         render_cell_hidden=RENDER.CELL_HIDDEN,
         render_pixel_hidden=RENDER.PIXEL_HIDDEN,
     )

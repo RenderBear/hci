@@ -2,20 +2,20 @@ r"""L2 — cell-grid ρ refinement via recurrent Naka–Rushton on convolved geo
 
 State: ρ(c, k) — K competing orientation hypotheses per cell.
 
-Seed (once, fixed in drive; per-cell normalize then per-bin NR):
-       ρ̂^(k) = ρ_bins^(k) / (ρ_total + ε)
-       ρ_seed^(k) = (ρ̂^(k))² / ((ρ̂^(k))² + η_z² + ε)
+Seed (IC only; peak-relative bin profile → ρ⁽⁰⁾):
+       ρ_seed^(k) = ρ_bins^(k) / (ρ_peak + η_z + ε)   (anisotropy; learned floor η_z)
 
-  Per iteration t (ρ⁽⁰⁾ = ρ_seed; ρ_seed fixed in drive; cross from evolving ρ):
-       drive^(k) = b_seed·ρ_seed^(k) + b_coll·ρ_coll^(k)
+  Per iteration t (ρ⁽⁰⁾ = ρ_seed; lateral drive only; cross from evolving ρ):
+       drive^(k) = b_coll·ρ̃_coll^(k)   (neighborhood consensus, no seed in drive)
        cross^(k) = mean_{k'≠k} (W_disk * ρ^(k',t))   (spatial other-bin pool)
-       ρ^(k,t+1) = drive² / (drive² + b_iso·c_iso^(k) + b_cross·cross^(k) + η_p² + ε)
+       ρ̃^(k,t+1) = drive² / (drive² + b_iso·c_iso^(k) + b_cross·cross^(k) + η_p² + ε)
+       ρ^(k,t+1) = (1−α)ρ^(k,t) + α·ρ̃^(k,t+1)   (α learned, softplus, init 0.5)
 
   Geometric pools: grouped conv2d over K channels directly (no one-hot scatter).
   Coll: conv2d(ρ, W_coll); iso: conv2d(ρ², W_iso); cross: conv2d(ρ, W_disk); count-normalized.
 
-Learned: b_coll, b_seed, b_iso, b_cross, η_p, η_z
-         — **6** nonnegative scalars (softplus).
+Learned: b_coll, b_iso, b_cross, η_p, η_z, α
+         — **6** nonnegative scalars (softplus; α clamped to [0, 1]).
   Renderer receives max_k ρ^(k) and parabolic θ from final ρ bins.
 """
 
@@ -170,14 +170,11 @@ def rho_seed_from_bins(
     is_border: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    """Per-bin NR seed on normalized bins: ρ̂^(k)=ρ_bins^(k)/(ρ_total+ε); then NR with η_z."""
+    """Peak-relative seed: ρ_seed^(k) = ρ_bins^(k) / (ρ_peak + η_z + ε)."""
     if is_border.dim() > 1:
         is_border = is_border.reshape(-1)
-    rho_total = rho_bins.sum(dim=-1, keepdim=True)
-    rho_hat = rho_bins / (rho_total + eps)
-    rho_sq = rho_hat * rho_hat
-    eta_z_sq = eta_z * eta_z
-    rho_seed = rho_sq / (rho_sq + eta_z_sq + eps)
+    rho_peak = rho_bins.max(dim=-1, keepdim=True).values
+    rho_seed = rho_bins / (rho_peak + eta_z + eps)
     mask = is_border.unsqueeze(-1) if is_border.dim() == 1 else is_border.unsqueeze(-1)
     return torch.where(mask, torch.zeros_like(rho_seed), rho_seed)
 
@@ -248,6 +245,7 @@ class TileDynamics(nn.Module):
         t_refine=L2.T_REFINE,
         eps=L2.EPS,
         eta_z_init=L2.ETA_Z_INIT,
+        alpha_init=L2.ALPHA_INIT,
         tbptt_n_segments: int = TRAIN.L2_SNAPSHOT_MAX,
         **kw,
     ):
@@ -258,9 +256,11 @@ class TileDynamics(nn.Module):
         self.tbptt_n_segments = max(1, int(tbptt_n_segments))
 
         self._eta_z_raw = nn.Parameter(torch.tensor(_inv_softplus(max(eta_z_init, 1e-6))))
+        self._alpha_raw = nn.Parameter(
+            torch.tensor(_inv_softplus(float(alpha_init)), dtype=torch.float32)
+        )
 
         self._b_coll_raw = nn.Parameter(torch.tensor(_inv_softplus(L2.B_COLL_INIT)))
-        self._b_seed_raw = nn.Parameter(torch.tensor(_inv_softplus(L2.B_SEED_INIT)))
         self._b_iso_raw = nn.Parameter(torch.tensor(_inv_softplus(L2.B_ISO_INIT)))
         self._b_cross_raw = nn.Parameter(torch.tensor(_inv_softplus(L2.B_CROSS_INIT)))
         self._eta_p_raw = nn.Parameter(
@@ -279,16 +279,19 @@ class TileDynamics(nn.Module):
     @property
     def eta_z(self):
         return Fn.softplus(self._eta_z_raw)
+
     @property
     def b_coll(self): return Fn.softplus(self._b_coll_raw)
-    @property
-    def b_seed(self): return Fn.softplus(self._b_seed_raw)
     @property
     def b_iso(self): return Fn.softplus(self._b_iso_raw)
     @property
     def b_cross(self): return Fn.softplus(self._b_cross_raw)
     @property
     def eta_p(self): return Fn.softplus(self._eta_p_raw)
+
+    @property
+    def alpha(self):
+        return Fn.softplus(self._alpha_raw).clamp(0.0, 1.0)
 
     @property
     def grad_window(self) -> int:
@@ -323,19 +326,21 @@ class TileDynamics(nn.Module):
 
     def _iterate_once(
         self,
+        rho_prev,
         rho_coll,
         c_iso,
         cross,
-        rho_seed,
         ok_map,
         return_drive_terms: bool = False,
     ):
-        drive = self.b_seed * rho_seed + self.b_coll * rho_coll
+        drive = self.b_coll * rho_coll
         drive_sq = drive * drive
         eta_p_sq = self.eta_p * self.eta_p
         inhib = self.b_iso * c_iso + self.b_cross * cross + eta_p_sq
         ok_k = ok_map.unsqueeze(-1)
-        rho_next = (drive_sq / (drive_sq + inhib + self.eps)) * ok_k
+        rho_nr = (drive_sq / (drive_sq + inhib + self.eps)) * ok_k
+        a = self.alpha
+        rho_next = (1.0 - a) * rho_prev + a * rho_nr
 
         if return_drive_terms:
             with torch.no_grad():
@@ -352,8 +357,9 @@ class TileDynamics(nn.Module):
                     "drive_mean": _stat(drive)[0],
                     "drive_sq_mean": _stat(drive_sq)[0],
                     "inhib_mean": _stat(inhib)[0],
+                    "rho_nr_mean": _stat(rho_nr)[0],
                     "rho_next_mean": _stat(rho_next)[0],
-                    "term_seed_mean": _stat(self.b_seed * rho_seed)[0],
+                    "alpha": float(a.detach()),
                     "term_coll_mean": _stat(self.b_coll * rho_coll)[0],
                     "term_iso_mean": _stat(self.b_iso * c_iso)[0],
                     "term_cross_mean": _stat(self.b_cross * cross)[0],
@@ -374,8 +380,6 @@ class TileDynamics(nn.Module):
             rho_bins_in.reshape(N, K), self.eta_z, is_border, self.eps,
         )
         ok_map = (~is_border).reshape(nH, nW)
-        rho_seed_3d = rho_seed.reshape(nH, nW, K)
-
         rho = rho_seed.clone()
         snapshot_steps: set[int] | None = None
         bimodality_per_iter: list[float] | None = None
@@ -424,7 +428,7 @@ class TileDynamics(nn.Module):
             )
             last = want_drive_debug and (t_iter == self.T_refine - 1)
             out = self._iterate_once(
-                rho_coll, c_iso, cross, rho_seed_3d,
+                rho_3d, rho_coll, c_iso, cross,
                 ok_map.to(dtype=rho.dtype, device=device),
                 return_drive_terms=last,
             )

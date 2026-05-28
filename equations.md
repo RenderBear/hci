@@ -141,25 +141,25 @@ $$
 b(c) = \left\lfloor \frac{\theta(c) \bmod \pi}{\pi/K} \right\rfloor \in \{0,\ldots,K-1\}.
 $$
 
-### Seed (once, fixed in drive)
+### Seed (IC only)
 
-Per-cell normalize L1 bin masses, then per-bin Naka–Rushton:
+Peak-relative bin profile — equalizes contrast, preserves anisotropy (unlike $\rho_{\mathrm{total}}$ normalization):
 
 $$
-\hat\rho^{(k)}(c) = \frac{\rho_{\mathrm{bins}}^{(k)}(c)}{\rho_{\mathrm{total}}(c) + \varepsilon}, \qquad
-\rho_{\mathrm{seed}}^{(k)}(c) = \frac{\bigl(\hat\rho^{(k)}(c)\bigr)^2}{\bigl(\hat\rho^{(k)}(c)\bigr)^2 + \eta_z^2 + \varepsilon}, \qquad
+\rho_{\mathrm{peak}}(c) = \max_k \rho_{\mathrm{bins}}^{(k)}(c), \qquad
+\rho_{\mathrm{seed}}^{(k)}(c) = \frac{\rho_{\mathrm{bins}}^{(k)}(c)}{\rho_{\mathrm{peak}}(c) + \eta_z + \varepsilon}, \qquad
 \eta_z = \mathrm{softplus}(\tilde\eta_z).
 $$
 
-Border cells: $\rho_{\mathrm{seed}}^{(k)} = 0$. $\eta_z$ is the half-saturation on normalized bin mass (default `ETA_Z_INIT = 0.15`; uniform cell $\hat\rho^{(k)} \approx 1/K$). With $T_{\mathrm{refine}}=0$ (`infer --no-dynamics`), $\rho^{(k)}$ stays at $\rho_{\mathrm{seed}}^{(k)}$ on interior cells.
+With $\eta_z \ll \rho_{\mathrm{peak}}$, peak bin $\approx 1$; $\eta_z$ floors weak cells. Off-peak bins are fractions relative to the peak. Edge: neighbors $\ll 1$; texture: neighbors $\approx 1$. Border cells: $\rho_{\mathrm{seed}}^{(k)} = 0$. With $T_{\mathrm{refine}}=0$ (`infer --no-dynamics`), $\rho^{(k)}$ stays at $\rho_{\mathrm{seed}}^{(k)}$ on interior cells.
 
 ### Learned scalars (softplus of raw parameters)
 
 $$
-\eta_z,\; b_{\mathrm{seed}},\; b_{\mathrm{coll}},\; b_{\mathrm{iso}},\; b_{\mathrm{cross}},\; \eta_p .
+\eta_z,\; b_{\mathrm{coll}},\; b_{\mathrm{iso}},\; b_{\mathrm{cross}},\; \eta_p,\; \alpha .
 $$
 
-Defaults in `params.L2`: `ETA_Z_INIT`, `B_SEED_INIT`, `B_COLL_INIT`, `B_ISO_INIT`, `B_CROSS_INIT`, `ETA_P_INIT`.
+Defaults in `params.L2`: `ETA_Z_INIT`, `B_COLL_INIT`, `B_ISO_INIT`, `B_CROSS_INIT`, `ETA_P_INIT`, `ALPHA_INIT`. $\rho_{\mathrm{seed}}$ sets $\rho^{(0)}$ only; refine fixed points are lateral (coll / iso / cross), not seed-pinned.
 
 ### Fixed conv kernels (buffers, no gradients)
 
@@ -204,16 +204,21 @@ Clean edge with same-orientation neighbors: low $c_{\mathrm{cross}}^{(k^\star)}$
 ### Pass update ($t = 0,\ldots,T_{\mathrm{refine}}-1$, `L2.T_REFINE`)
 
 $$
-\mathrm{drive}^{(t)}(c,k) = b_{\mathrm{seed}}\,\rho_{\mathrm{seed}}^{(k)}(c) + b_{\mathrm{coll}}\,\rho_{\mathrm{coll}}^{(k,t)}(c),
+\mathrm{drive}^{(t)}(c,k) = b_{\mathrm{coll}}\,\tilde\rho_{\mathrm{coll}}^{(k,t)}(c),
 $$
 $$
-\rho^{(k,t+1)}(c) = \mathrm{ok}(c)\cdot
+\tilde\rho^{(k,t+1)}(c) = \mathrm{ok}(c)\cdot
 \frac{\bigl(\mathrm{drive}^{(t)}(c,k)\bigr)^2}
 {\bigl(\mathrm{drive}^{(t)}(c,k)\bigr)^2
 + b_{\mathrm{iso}}\,c_{\mathrm{iso}}^{(k,t)}(c)
 + b_{\mathrm{cross}}\,c_{\mathrm{cross}}^{(k,t)}(c)
-+ \eta_p^2 + \varepsilon}.
++ \eta_p^2 + \varepsilon},
 $$
+$$
+\rho^{(k,t+1)}(c) = (1 - \alpha)\,\rho^{(k,t)}(c) + \alpha\,\tilde\rho^{(k,t+1)}(c),
+\qquad \alpha = \mathrm{clamp}_{[0,1]}\!\bigl(\mathrm{softplus}(\tilde\alpha)\bigr),
+$$
+with default $\alpha \approx 0.5$ (`L2.ALPHA_INIT`). Mixing keeps $\rho_{\mathrm{seed}}$ in the trajectory while the NR step pursues neighborhood consensus; $\alpha$ sets how fast $\rho$ moves from the seed IC toward the lateral fixed point.
 
 **TBPTT**: during training, $\rho$ is detached every `grad_window = max(1, T_{\mathrm{refine}} // \texttt{TRAIN.L2\_SNAPSHOT\_MAX})` steps to limit BPTT depth.
 
@@ -294,7 +299,7 @@ Checkpoints store `{"model_state": state_dict}` (`intermediate.pt`, `final.pt`).
 
 | Block | Count | Notes |
 |------:|------:|------|
-| $\tilde\eta_z, \tilde b_{\mathrm{seed}}, \tilde b_{\mathrm{coll}}, \tilde b_{\mathrm{iso}}, \tilde b_{\mathrm{cross}}, \tilde\eta_p$ | 6 | Seed + drive / inhibition + pass NR floor |
+| $\tilde\eta_z, \tilde b_{\mathrm{coll}}, \tilde b_{\mathrm{iso}}, \tilde b_{\mathrm{cross}}, \tilde\eta_p, \tilde\alpha$ | 6 | Seed denom floor + lateral drive / inhibition + mixing |
 | $\tilde\sigma_\perp, s_t, s_n$ | 3 | Splat width + stencil spacings |
 | $\mathrm{MLP}_{\mathrm{thin}}$ (12→8→1) | 113 | $12\cdot 8 + 8 + 8 + 1$ |
 | **Total (`StriateE2E`)** | **122** | 6 L2 + 116 renderer |

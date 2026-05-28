@@ -1,7 +1,7 @@
 r"""train.py — STRIATE training: cell-grid conv dynamics + harmonic render.
 
 Pipeline per image: L0 contrast/harmonics (cached) → L1 K-bin projection live each step
-→ L2 cell-grid ρ refinement (per-bin NR seed; conv pools + dynamic cross → drive²/(drive² + b_iso·c_iso + b_cross·cross + η_p²))
+→ L2 cell-grid ρ refinement (peak-relative seed; lateral refine + mixing)
 → splat renderer ($\hat B = \bar\rho \cdot \mathrm{gate}$).
 Loss combines soft-Dice and per-pixel BCE on the same η± valid band
 (target≥η_pos or target<η_neg), weighted by ``--lam_dice`` and ``--lam_bce``
@@ -596,8 +596,8 @@ def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
             print(f"  {k}: {v:.4f}")
     print("\n  learned (value):")
     for name in (
-        "b_coll", "b_seed", "b_iso", "b_cross",
-        "eta_p", "eta_z", "l1_von_mises_kappa",
+        "b_coll", "b_iso", "b_cross",
+        "eta_p", "eta_z", "alpha", "l1_von_mises_kappa",
     ):
         p = getattr(d, name)
         val = float(p.detach()) if not isinstance(p, torch.Tensor) else float(p.item())
@@ -605,11 +605,11 @@ def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
     print("\n  |grad| on raw params:")
     for raw, label in (
         ("_b_coll_raw", "b_coll"),
-        ("_b_seed_raw", "b_seed"),
         ("_b_iso_raw", "b_iso"),
         ("_b_cross_raw", "b_cross"),
         ("_eta_p_raw", "eta_p"),
         ("_eta_z_raw", "eta_z"),
+        ("_alpha_raw", "alpha"),
         ("_l1_von_mises_kappa_raw", "l1_von_mises_kappa"),
     ):
         t = getattr(d, raw, None)
@@ -686,12 +686,12 @@ def format_l2_param_lines(d, *, indent: str = "  ") -> list[str]:
         f"{indent}geometry:  K={d.K}  R_fac={d.R_fac}  R_sup={d.R_sup}  T_refine={d.T_refine}",
         f"{indent}binning:   K-channel ρ state (per-orientation hypotheses)",
         f"{indent}drive:",
-        f"{sub}b_coll={d.b_coll.item():.3f}  b_seed={d.b_seed.item():.3f}",
+        f"{sub}b_coll={d.b_coll.item():.3f}  (lateral drive only)",
         f"{indent}inhibition:",
         f"{sub}b_iso={d.b_iso.item():.3f}  b_cross={d.b_cross.item():.3f}  "
-        f"η_p={d.eta_p.item():.3f}",
+        f"η_p={d.eta_p.item():.3f}  α={d.alpha.item():.3f}",
         f"{indent}seed:  η_z={d.eta_z.item():.4g}  "
-        f"(ρ̂^(k)=ρ_bins^(k)/(ρ_total+ε); ρ_seed from NR(ρ̂,η_z); "
+        f"ρ_seed^(k)=ρ_bins^(k)/(ρ_peak+η_z+ε)  "
         f"cross^(k)=mean_{{k'≠k}} W_disk*ρ^(k'))",
     ]
 
@@ -709,8 +709,9 @@ def _format_dynamics_params(model):
         "\n--- L2 ---\n",
         *[ln + "\n" for ln in format_l2_param_lines(d, indent="")],
         "\n--- dynamics ---\n",
-        "drive = b_seed·ρ_seed^(k) + b_coll·ρ_coll^(k)\n",
-        "ρ^(k) = drive² / (drive² + b_iso·c_iso^(k) + b_cross·cross^(k) + η_p² + ε)\n",
+        "drive = b_coll·ρ_coll^(k)\n",
+        "ρ̃ = NR(drive², b_iso·c_iso + b_cross·cross + η_p²); "
+        "ρ ← (1−α)ρ + α·ρ̃\n",
         "cross^(k) = mean_{k'≠k} count-norm(W_disk * ρ^(k')); grouped conv2d pools each step\n",
     ]
     return "".join(parts)
@@ -825,8 +826,8 @@ def main():
     print(
         f"Dynamics: R_fac={L2.R_FAC_POOL}  R_sup={L2.R_SUP_POOL}  K={L2.K}  "
         f"T={L2.T_REFINE}  "
-        f"drive²/(drive² + b_iso·c_iso^(k) + b_cross·cross^(k) + η_p²); "
-        f"ρ̂^(k)=ρ_bins^(k)/(ρ_total+ε); ρ_seed from NR(ρ̂,η_z); "
+        f"ρ←(1−α)ρ+α·NR(drive²/(drive²+b_iso·c_iso+b_cross·cross+η_p²)); "
+        f"ρ_seed^(k)=ρ_bins^(k)/(ρ_peak+η_z+ε); α init={L2.ALPHA_INIT}; "
         f"cross^(k)=mean_{{k'≠k}} W_disk*ρ^(k'); "
         f"  TBPTT: {TRAIN.L2_SNAPSHOT_MAX} segments  "
         f"window=max(1, T//{TRAIN.L2_SNAPSHOT_MAX})  (full grad per segment)"
@@ -866,7 +867,6 @@ def main():
         K=L2.K,
         t_refine=L2.T_REFINE,
         eps=L2.EPS,
-        eta_z_init=L2.ETA_Z_INIT,
         render_cell_hidden=RENDER.CELL_HIDDEN,
         render_pixel_hidden=RENDER.PIXEL_HIDDEN,
     ).to(device)

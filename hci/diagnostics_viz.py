@@ -543,8 +543,7 @@ def viz_infer_l1_rho_masses(
         out_path,
         suptitle=(
             r"L1 bin masses (L2 seed: "
-            r"$\rho_{\mathrm{seed}}^{(k)}=(\hat\rho^{(k)})^2/((\hat\rho^{(k)})^2+\eta_z^2)$, "
-            r"$\hat\rho^{(k)}=\rho_{\mathrm{bins}}^{(k)}/(\rho_{\mathrm{total}}+\varepsilon)$)"
+            r"$\rho_{\mathrm{seed}}^{(k)}=\rho_{\mathrm{bins}}^{(k)}/(\rho_{\mathrm{peak}}+\eta_z+\varepsilon)$)"
         ),
     )
 
@@ -554,19 +553,16 @@ def viz_infer_cell_rho_maps(
     rho_post: np.ndarray,
     is_border: np.ndarray,
     out_path: str,
-    *,
-    eta_z: float,
 ) -> None:
 
     viz_rho_branch_grid(
         [rho_seed, rho_post],
-        [r"seed $\rho^{(0)}$", "post-L2 ρ"],
+        [r"seed $\rho^{(0)}$ (max over K)", "post-L2 ρ"],
         is_border,
         out_path,
         suptitle=(
-            r"Cell $\rho$ — single-branch dynamics "
-            r"(per-bin NR on normalized bins; half-saturation $\eta_z$="
-            rf"{eta_z:.4g} on $\hat\rho^{{(k)}}$)"
+            r"Cell $\rho$ — peak-relative seed IC, then L2 refine "
+            r"($\rho_{\mathrm{seed}}^{(k)}=\rho_{\mathrm{bins}}^{(k)}/(\rho_{\mathrm{peak}}+\eta_z+\varepsilon)$)"
         ),
         layout_rows_cols=(1, 2),
     )

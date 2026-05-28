@@ -115,7 +115,6 @@ def build_model(ckpt, device):
         K=L2.K,
         t_refine=L2.T_REFINE,
         eps=L2.EPS,
-        eta_z_init=L2.ETA_Z_INIT,
         render_cell_hidden=RENDER.CELL_HIDDEN,
         render_pixel_hidden=RENDER.PIXEL_HIDDEN,
     )
@@ -559,8 +558,6 @@ def main():
         .numpy()
         .reshape(nH, nW)
     )
-    eta_z = float(d.eta_z.detach().cpu().item())
-
     if args.verbose and args.no_dynamics:
         print("L2: skipped (--no-dynamics); ρ_seed on interior cells → bilinear ρ map.")
     elif args.verbose and diags is not None and "iter_stats" in diags:
@@ -638,7 +635,7 @@ def main():
 
         p_maps = os.path.join(od, f"{stem}_l2_rho_seed_post.png")
         viz_infer_cell_rho_maps(
-            rho_seed_vis, rho_post, is_border, p_maps, eta_z=eta_z,
+            rho_seed_vis, rho_post, is_border, p_maps,
         )
         saved_files.append(p_maps)
 

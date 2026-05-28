@@ -39,14 +39,14 @@ L2 = SimpleNamespace(
     K=24,
     T_REFINE=5,
     EPS=1e-9,
-    ETA_Z_INIT=0.15,  # seed NR half-saturation on per-cell normalized ρ̂_bins (≈1/K uniform)
+    ETA_Z_INIT=1e04,  # seed: ρ_bins^(k)/(ρ_peak+η_z+ε); L1 mass floor in denom
     LOGIT_CLAMP=1e-4,
     # drive / inhibition (softplus-positive, learned; constant over t)
-    B_SEED_INIT=0.5,
     B_COLL_INIT=0.5,
     B_ISO_INIT=0.3,
     B_CROSS_INIT=0.3,
     ETA_P_INIT=0.1,  # NR floor η_p² in ρ update denominator
+    ALPHA_INIT=0.5,  # refine mixing: ρ ← (1−α)ρ + α·NR(drive,inhib)
 )
 
 # ── Render: §2.5 anisotropic splat + ρ̄ gate G + perp conv (see striate/renderer.py) ─
