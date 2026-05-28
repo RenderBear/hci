@@ -691,7 +691,8 @@ def format_l2_param_lines(d, *, indent: str = "  ") -> list[str]:
         f"{sub}b_iso={d.b_iso.item():.3f}  b_cross={d.b_cross.item():.3f}  "
         f"η_p={d.eta_p.item():.3f}",
         f"{indent}seed:  η_z={d.eta_z.item():.4g}  "
-        f"(ρ_seed^(k) = (ρ_bins^(k))²/((ρ_bins^(k))²+η_z²); cross^(k) = (ρ_tot−ρ^(k))/(K−1))",
+        f"(ρ̂^(k)=ρ_bins^(k)/(ρ_total+ε); ρ_seed from NR(ρ̂,η_z); "
+        f"cross^(k)=mean_{{k'≠k}} W_disk*ρ^(k'))",
     ]
 
 
@@ -709,8 +710,8 @@ def _format_dynamics_params(model):
         *[ln + "\n" for ln in format_l2_param_lines(d, indent="")],
         "\n--- dynamics ---\n",
         "drive = b_seed·ρ_seed^(k) + b_coll·ρ_coll^(k)\n",
-        "ρ^(k) = drive² / (drive² + b_iso·c_iso^(k) + b_cross·(ρ_tot−ρ^(k))/(K−1) + η_p² + ε)\n",
-        "grouped conv2d pools on K-channel ρ each step; T_refine iterations\n",
+        "ρ^(k) = drive² / (drive² + b_iso·c_iso^(k) + b_cross·cross^(k) + η_p² + ε)\n",
+        "cross^(k) = mean_{k'≠k} count-norm(W_disk * ρ^(k')); grouped conv2d pools each step\n",
     ]
     return "".join(parts)
 
@@ -824,9 +825,9 @@ def main():
     print(
         f"Dynamics: R_fac={L2.R_FAC_POOL}  R_sup={L2.R_SUP_POOL}  K={L2.K}  "
         f"T={L2.T_REFINE}  "
-        f"drive²/(drive² + b_iso·c_iso^(k) + b_cross·(ρ_tot−ρ^(k))/(K−1) + η_p²); "
-        f"ρ_seed^(k) = (ρ_bins^(k))²/((ρ_bins^(k))²+η_z²); "
-        f"cross^(k) = (ρ_tot−ρ^(k))/(K−1); "
+        f"drive²/(drive² + b_iso·c_iso^(k) + b_cross·cross^(k) + η_p²); "
+        f"ρ̂^(k)=ρ_bins^(k)/(ρ_total+ε); ρ_seed from NR(ρ̂,η_z); "
+        f"cross^(k)=mean_{{k'≠k}} W_disk*ρ^(k'); "
         f"  TBPTT: {TRAIN.L2_SNAPSHOT_MAX} segments  "
         f"window=max(1, T//{TRAIN.L2_SNAPSHOT_MAX})  (full grad per segment)"
     )

@@ -143,14 +143,15 @@ $$
 
 ### Seed (once, fixed in drive)
 
-Per-bin Naka–Rushton on L1 raw masses (no across-bin normalization; preserves magnitude):
+Per-cell normalize L1 bin masses, then per-bin Naka–Rushton:
 
 $$
-\rho_{\mathrm{seed}}^{(k)}(c) = \frac{\bigl(\rho_{\mathrm{bins}}^{(k)}(c)\bigr)^2}{\bigl(\rho_{\mathrm{bins}}^{(k)}(c)\bigr)^2 + \eta_z^2 + \varepsilon}, \qquad
+\hat\rho^{(k)}(c) = \frac{\rho_{\mathrm{bins}}^{(k)}(c)}{\rho_{\mathrm{total}}(c) + \varepsilon}, \qquad
+\rho_{\mathrm{seed}}^{(k)}(c) = \frac{\bigl(\hat\rho^{(k)}(c)\bigr)^2}{\bigl(\hat\rho^{(k)}(c)\bigr)^2 + \eta_z^2 + \varepsilon}, \qquad
 \eta_z = \mathrm{softplus}(\tilde\eta_z).
 $$
 
-Border cells: $\rho_{\mathrm{seed}}^{(k)} = 0$. $\eta_z$ is the half-saturation in L1 mass units (default `ETA_Z_INIT = 10^4`, order of typical edge/texture bin energies). With $T_{\mathrm{refine}}=0$ (`infer --no-dynamics`), $\rho^{(k)}$ stays at $\rho_{\mathrm{seed}}^{(k)}$ on interior cells.
+Border cells: $\rho_{\mathrm{seed}}^{(k)} = 0$. $\eta_z$ is the half-saturation on normalized bin mass (default `ETA_Z_INIT = 0.15`; uniform cell $\hat\rho^{(k)} \approx 1/K$). With $T_{\mathrm{refine}}=0$ (`infer --no-dynamics`), $\rho^{(k)}$ stays at $\rho_{\mathrm{seed}}^{(k)}$ on interior cells.
 
 ### Learned scalars (softplus of raw parameters)
 
@@ -176,6 +177,12 @@ $$
 W^{\mathrm{iso}}_k(d) = (\hat n_k \cdot \hat d)^2.
 $$
 
+**Cross pool** (isotropic, suppression radius $R_{\mathrm{sup}}$, centre omitted):
+
+$$
+W^{\mathrm{disk}}(d) = 1 \quad (d \neq 0).
+$$
+
 ### Pools on the cell grid
 
 State $\rho^{(t)}(c,k)$ has $K$ channels per cell. **Coll/iso** pool the evolving $\rho^{(t)}$ via grouped `conv2d` (count-normalized per $k$). $\rho_{\mathrm{seed}}^{(k)}$ is **fixed** in the drive.
@@ -185,14 +192,14 @@ $$
 c_{\mathrm{iso}}^{(k)} = \frac{W^{\mathrm{iso}}_k * (\rho^{(t)}_k)^2}{W^{\mathrm{iso}}_k * \mathbf{1} + \varepsilon}.
 $$
 
-**Cross** — mean other-bin mass from **evolving** $\rho^{(t)}$ (per $k$; enters inhibition as $b_{\mathrm{cross}}\,c_{\mathrm{cross}}^{(k,t)}$):
+**Cross** — spatial mean other-bin mass from **evolving** $\rho^{(t)}$ (per $k$; enters inhibition as $b_{\mathrm{cross}}\,c_{\mathrm{cross}}^{(k,t)}$):
 
 $$
-\rho_{\mathrm{tot}}^{(t)}(c) = \sum_k \rho^{(k,t)}(c), \qquad
-c_{\mathrm{cross}}^{(k,t)}(c) = \mathrm{ok}(c)\cdot\frac{\rho_{\mathrm{tot}}^{(t)}(c) - \rho^{(k,t)}(c)}{K - 1}.
+\tilde\rho^{(k,t)} = \frac{W^{\mathrm{disk}} * \rho^{(k,t)}}{W^{\mathrm{disk}} * \mathbf{1} + \varepsilon}, \qquad
+c_{\mathrm{cross}}^{(k,t)}(c) = \mathrm{ok}(c)\cdot\frac{\sum_{k' \neq k} \tilde\rho^{(k',t)}(c)}{K - 1}.
 $$
 
-Texture (many similar bins): $c_{\mathrm{cross}}^{(k)} \approx \bar\rho$ high for all $k$. Clean edge (one dominant bin): $c_{\mathrm{cross}}^{(k^\star)} \approx 0$ at the peak. Diagnostics plot $(\rho_{\mathrm{tot}} - \rho_{\mathrm{peak}})/(K-1)$ and $\max_k \rho^{(k)}$ (renderer scalar).
+Clean edge with same-orientation neighbors: low $c_{\mathrm{cross}}^{(k^\star)}$ at the peak. T-junction / texture: high cross (neighbors in multiple bins). Diagnostics plot $\max_k c_{\mathrm{cross}}^{(k)}$ and $\max_k \rho^{(k)}$ (renderer scalar).
 
 ### Pass update ($t = 0,\ldots,T_{\mathrm{refine}}-1$, `L2.T_REFINE`)
 

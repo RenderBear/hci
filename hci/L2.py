@@ -2,16 +2,17 @@ r"""L2 — cell-grid ρ refinement via recurrent Naka–Rushton on convolved geo
 
 State: ρ(c, k) — K competing orientation hypotheses per cell.
 
-Seed (once, fixed in drive; per-bin NR, no across-bin normalization):
-       ρ_seed^(k) = (ρ_bins^(k))² / ((ρ_bins^(k))² + η_z² + ε)
+Seed (once, fixed in drive; per-cell normalize then per-bin NR):
+       ρ̂^(k) = ρ_bins^(k) / (ρ_total + ε)
+       ρ_seed^(k) = (ρ̂^(k))² / ((ρ̂^(k))² + η_z² + ε)
 
   Per iteration t (ρ⁽⁰⁾ = ρ_seed; ρ_seed fixed in drive; cross from evolving ρ):
        drive^(k) = b_seed·ρ_seed^(k) + b_coll·ρ_coll^(k)
-       cross^(k) = (ρ_total^(t) − ρ^(k,t)) / (K − 1)   (mean other-bin ρ)
+       cross^(k) = mean_{k'≠k} (W_disk * ρ^(k',t))   (spatial other-bin pool)
        ρ^(k,t+1) = drive² / (drive² + b_iso·c_iso^(k) + b_cross·cross^(k) + η_p² + ε)
 
   Geometric pools: grouped conv2d over K channels directly (no one-hot scatter).
-  Coll: conv2d(ρ, W_coll); iso: conv2d(ρ², W_iso); count-normalized per bin.
+  Coll: conv2d(ρ, W_coll); iso: conv2d(ρ², W_iso); cross: conv2d(ρ, W_disk); count-normalized.
 
 Learned: b_coll, b_seed, b_iso, b_cross, η_p, η_z
          — **6** nonnegative scalars (softplus).
@@ -40,8 +41,8 @@ def _build_conv_kernels(
     K: int,
     device: torch.device | None = None,
     dtype: torch.dtype = torch.float32,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """W_coll, W_iso, W_count_coll, W_count — center = 0; coll uses R_fac, rest use R_sup."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """W_coll, W_iso, W_disk, W_count_coll, W_count — center = 0; coll uses R_fac, rest R_sup."""
     patch_fac = 2 * R_fac + 1
     patch_sup = 2 * R_sup + 1
     dev = device if device is not None else torch.device("cpu")
@@ -69,14 +70,16 @@ def _build_conv_kernels(
     n_dot_d = -sin_b[:, None, None] * d_i + cos_b[:, None, None] * d_j
     W_iso = (n_dot_d * n_dot_d).unsqueeze(1)
 
+    W_disk = torch.ones(K, 1, patch_sup, patch_sup, device=dev, dtype=dtype)
     W_count_coll = torch.ones(K, 1, patch_fac, patch_fac, device=dev, dtype=dtype)
     W_count = torch.ones(K, 1, patch_sup, patch_sup, device=dev, dtype=dtype)
 
     W_iso[:, :, R_sup, R_sup] = 0.0
+    W_disk[:, :, R_sup, R_sup] = 0.0
     W_count_coll[:, :, R_fac, R_fac] = 0.0
     W_count[:, :, R_sup, R_sup] = 0.0
 
-    return W_coll, W_iso, W_count_coll, W_count
+    return W_coll, W_iso, W_disk, W_count_coll, W_count
 
 
 def _pool_cell_geometry(
@@ -122,15 +125,32 @@ def _pool_cell_geometry(
 def cross_from_rho(
     rho: torch.Tensor,
     ok_map: torch.Tensor,
+    W_disk: torch.Tensor,
+    W_count: torch.Tensor,
+    R_sup: int,
     K: int | None = None,
+    eps: float = 1e-9,
 ) -> torch.Tensor:
-    """Mean other-bin ρ: (ρ_total − ρ^(k)) / (K − 1), in [0, 1] when ρ ∈ [0, 1]."""
+    """Spatial mean other-bin ρ: avg_{k'≠k} count-norm conv(W_disk, ρ^(k'))."""
+    nH, nW, k_ch = rho.shape
     if K is None:
-        K = rho.shape[-1]
+        K = k_ch
     km1 = max(int(K) - 1, 1)
-    rho_total = rho.sum(dim=-1, keepdim=True)
-    cross = (rho_total - rho) / km1
-    return cross * ok_map.unsqueeze(-1).to(dtype=cross.dtype, device=cross.device)
+    dtype = rho.dtype
+    dev = rho.device
+
+    rho_bins = rho.permute(2, 0, 1).unsqueeze(0)
+    ok_bins = ok_map.to(dtype=dtype, device=dev).reshape(1, 1, nH, nW).expand(1, K, nH, nW)
+    W_disk = W_disk.to(device=dev, dtype=dtype)
+    W_count = W_count.to(device=dev, dtype=dtype)
+
+    rho_pooled_bins = Fn.conv2d(rho_bins, W_disk, padding=R_sup, groups=K)
+    count_bins = Fn.conv2d(ok_bins, W_count, padding=R_sup, groups=K)
+    rho_pooled = rho_pooled_bins / (count_bins + eps)
+    pooled_total = rho_pooled.sum(dim=1, keepdim=True)
+    cross_bins = (pooled_total - rho_pooled) / km1
+    cross = cross_bins.squeeze(0).permute(1, 2, 0)
+    return cross * ok_map.unsqueeze(-1).to(dtype=cross.dtype, device=dev)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -150,10 +170,12 @@ def rho_seed_from_bins(
     is_border: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    """Per-bin NR seed: ρ_seed^(k) = (ρ_bins^(k))² / ((ρ_bins^(k))² + η_z² + ε)."""
+    """Per-bin NR seed on normalized bins: ρ̂^(k)=ρ_bins^(k)/(ρ_total+ε); then NR with η_z."""
     if is_border.dim() > 1:
         is_border = is_border.reshape(-1)
-    rho_sq = rho_bins * rho_bins
+    rho_total = rho_bins.sum(dim=-1, keepdim=True)
+    rho_hat = rho_bins / (rho_total + eps)
+    rho_sq = rho_hat * rho_hat
     eta_z_sq = eta_z * eta_z
     rho_seed = rho_sq / (rho_sq + eta_z_sq + eps)
     mask = is_border.unsqueeze(-1) if is_border.dim() == 1 else is_border.unsqueeze(-1)
@@ -245,11 +267,12 @@ class TileDynamics(nn.Module):
             torch.tensor(_inv_softplus(float(L2.ETA_P_INIT)), dtype=torch.float32)
         )
 
-        W_coll, W_iso, W_count_coll, W_count = _build_conv_kernels(
+        W_coll, W_iso, W_disk, W_count_coll, W_count = _build_conv_kernels(
             self.R_fac, self.R_sup, K,
         )
         self.register_buffer("W_coll", W_coll)
         self.register_buffer("W_iso", W_iso)
+        self.register_buffer("W_disk", W_disk)
         self.register_buffer("W_count_coll", W_count_coll)
         self.register_buffer("W_count", W_count)
 
@@ -280,12 +303,14 @@ class TileDynamics(nn.Module):
         rho_3d: torch.Tensor,
         ok_map: torch.Tensor,
     ) -> None:
-        """Scalar cell maps: max-K coll/iso; peak-bin cross; max-K ρ (renderer input)."""
+        """Scalar cell maps: max-K coll/iso/cross; max-K ρ (renderer input)."""
         ok_f = ok_map.to(dtype=rho_3d.dtype, device=rho_3d.device)
         rho_peak = rho_3d.max(dim=-1).values * ok_f
-        km1 = max(self.K - 1, 1)
-        rho_total = rho_3d.sum(dim=-1)
-        c_cross_peak = (rho_total - rho_peak) / km1 * ok_f
+        cross = cross_from_rho(
+            rho_3d, ok_map, self.W_disk, self.W_count,
+            self.R_sup, self.K, self.eps,
+        )
+        c_cross_peak = cross.max(dim=-1).values * ok_f
         store[tag] = {
             k: v.detach().cpu().numpy().astype(np.float64)
             for k, v in (
@@ -393,7 +418,10 @@ class TileDynamics(nn.Module):
 
             rho_3d = rho.reshape(nH, nW, K)
             rho_coll, c_iso = _pool(rho_3d)
-            cross = cross_from_rho(rho_3d, ok_map, K)
+            cross = cross_from_rho(
+                rho_3d, ok_map, self.W_disk, self.W_count,
+                self.R_sup, K, self.eps,
+            )
             last = want_drive_debug and (t_iter == self.T_refine - 1)
             out = self._iterate_once(
                 rho_coll, c_iso, cross, rho_seed_3d,

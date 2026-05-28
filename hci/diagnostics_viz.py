@@ -543,7 +543,8 @@ def viz_infer_l1_rho_masses(
         out_path,
         suptitle=(
             r"L1 bin masses (L2 seed: "
-            r"$\rho_{\mathrm{seed}}^{(k)}=(\rho_{\mathrm{bins}}^{(k)})^2/((\rho_{\mathrm{bins}}^{(k)})^2+\eta_z^2)$)"
+            r"$\rho_{\mathrm{seed}}^{(k)}=(\hat\rho^{(k)})^2/((\hat\rho^{(k)})^2+\eta_z^2)$, "
+            r"$\hat\rho^{(k)}=\rho_{\mathrm{bins}}^{(k)}/(\rho_{\mathrm{total}}+\varepsilon)$)"
         ),
     )
 
@@ -564,8 +565,8 @@ def viz_infer_cell_rho_maps(
         out_path,
         suptitle=(
             r"Cell $\rho$ — single-branch dynamics "
-            r"(per-bin NR seed; half-saturation $\eta_z$="
-            rf"{eta_z:.4g} in $\rho_{{\mathrm{{bins}}}}$ units)"
+            r"(per-bin NR on normalized bins; half-saturation $\eta_z$="
+            rf"{eta_z:.4g} on $\hat\rho^{{(k)}}$)"
         ),
         layout_rows_cols=(1, 2),
     )
@@ -727,7 +728,7 @@ def viz_infer_l2_suppression_factors(
         labels.append(r"iso pool $I$ (same θ-bin, cell avg)")
     if cross_pool_nb is not None:
         panels.append(cross_pool_nb)
-        labels.append(r"cross pool $C$ (mean other-bin $\rho$)")
+        labels.append(r"cross pool $C$ (spatial mean other-bin $\rho$)")
 
     if not panels:
         return False
@@ -736,7 +737,7 @@ def viz_infer_l2_suppression_factors(
     layout = (1, n) if n <= 2 else (1, 3)
 
     sig_suptitle = (
-        r"L2 suppression — iso pool $I$ and cross (mean other-bin $\rho$)"
+        r"L2 suppression — iso pool $I$ and cross (spatial other-bin $\rho$)"
     )
     viz_rho_branch_grid(
         panels,
@@ -768,7 +769,7 @@ def viz_infer_l2_geometry(
     rows = (
         ("rho_coll", r"$\max_k\,\tilde{\rho}_{\mathrm{coll}}^{(k)}$"),
         ("c_iso", r"$\max_k\,\tilde{c}_{\mathrm{iso}}^{(k)}$"),
-        ("c_cross", r"$(\rho_{\mathrm{tot}}-\rho_{\mathrm{peak}})/(K{-}1)$"),
+        ("c_cross", r"$\max_k c_{\mathrm{cross}}^{(k)}$ (spatial other-bin)"),
         ("rho_peak", r"$\max_k\,\rho^{(k)}$ (renderer)"),
     )
     panels: list[np.ndarray] = []
@@ -789,7 +790,7 @@ def viz_infer_l2_geometry(
         labels,
         is_border,
         out_path,
-        suptitle="L2 cell geometry — coll / iso / peak cross / peak ρ",
+        suptitle="L2 cell geometry — coll / iso / spatial cross / peak ρ",
         layout_rows_cols=(4, 2),
     )
     return True
