@@ -596,7 +596,7 @@ def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
             print(f"  {k}: {v:.4f}")
     print("\n  learned (value):")
     for name in (
-        "b_coll", "b_iso", "b_cross",
+        "b_coll", "b_seed", "b_iso", "b_cross",
         "eta_p", "eta_z", "alpha", "l1_von_mises_kappa",
     ):
         p = getattr(d, name)
@@ -686,7 +686,7 @@ def format_l2_param_lines(d, *, indent: str = "  ") -> list[str]:
         f"{indent}geometry:  K={d.K}  R_fac={d.R_fac}  R_sup={d.R_sup}  T_refine={d.T_refine}",
         f"{indent}binning:   K-channel ρ state (per-orientation hypotheses)",
         f"{indent}drive:",
-        f"{sub}b_coll={d.b_coll.item():.3f}  (lateral drive only)",
+        f"{sub}b_seed={d.b_seed.item():.3f}  b_coll={d.b_coll.item():.3f}",
         f"{indent}inhibition:",
         f"{sub}b_iso={d.b_iso.item():.3f}  b_cross={d.b_cross.item():.3f}  "
         f"η_p={d.eta_p.item():.3f}  α={d.alpha.item():.3f}",
@@ -709,7 +709,7 @@ def _format_dynamics_params(model):
         "\n--- L2 ---\n",
         *[ln + "\n" for ln in format_l2_param_lines(d, indent="")],
         "\n--- dynamics ---\n",
-        "drive = b_coll·ρ_coll^(k)\n",
+        "drive = b_seed·ρ_seed^(k) + b_coll·ρ_coll^(k)\n",
         "ρ̃ = NR(drive², b_iso·c_iso + b_cross·cross + η_p²); "
         "ρ ← (1−α)ρ + α·ρ̃\n",
         "cross^(k) = mean_{k'≠k} count-norm(W_disk * ρ^(k')); grouped conv2d pools each step\n",

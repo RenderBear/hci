@@ -8,7 +8,7 @@ This file records the **notation and equations implemented in this repository**:
 
 1. **L0** — RGB → split luminance / chrominance directional differences; per-direction min subtraction; independent Naka–Rushton per channel with **fixed** scalars $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ (`L0.ETA_LUM`, `L0.ETA_CHR`) and gain $\gamma$ (`L0.GAMMA`). Produces harmonic stack $s$, magnitudes $h_{1m}, h_{2m}$, and split $h_{2m}^{\mathrm{lum}}, h_{2m}^{\mathrm{chr}}$. Complex fields $z_1, z_2$ are read from $s$ (`z_from_l0_harmonics`). L0 is **precomputed and cached** for training; it is not updated during training.
 2. **L1** — Pixel $K$-bin von Mises (or $\cos^p$) projection of $h_{2m}$ (`L1.K`; von Mises $\kappa$ is **learned**, softplus, init `L1.COL_VON_MISES_KAPPA`$=8$); sum-pool over $P\times P$ patches → per-cell $\rho_{\mathrm{raw}}^{(k)}$, dominant $\theta$, polarity $q$, anisotropy $\delta$, optional $\kappa$, and $h_{2m}$-weighted splat anchors. **Precomputed and cached** with L0.
-3. **L2** (`TileDynamics`) — Per-bin NR seed from L1 $\rho_{\mathrm{bins}}^{(k)}$; then $T_{\mathrm{refine}}$ recurrent steps with grouped `conv2d` collinear / iso pools, dynamic cross (mean other-bin $\rho$), and divisive $\rho$ update. Runs **live each training step** so gradients reach the six learned L2 scalars.
+3. **L2** (`TileDynamics`) — Per-bin NR seed from L1 $\rho_{\mathrm{bins}}^{(k)}$; then $T_{\mathrm{refine}}$ recurrent steps with grouped `conv2d` collinear / iso pools, dynamic cross (mean other-bin $\rho$), and divisive $\rho$ update. Runs **live each training step** so gradients reach the seven learned L2 scalars.
 4. **Renderer** (`ModulationRenderer`) — Cell-grid $\theta$ combing and $\rho$-gated anchor smoothing; **Gaussian-line splat** of refined $\rho$ to pixels; coherence map; tangential / normal **stencils on $\bar\rho$**; **12→8→1** thinning MLP gate:
    $$\hat B(p) = \bar\rho(p)\,\mathrm{gate}(p).$$
 
@@ -156,10 +156,10 @@ With $\eta_z \ll \rho_{\mathrm{peak}}$, peak bin $\approx 1$; $\eta_z$ floors we
 ### Learned scalars (softplus of raw parameters)
 
 $$
-\eta_z,\; b_{\mathrm{coll}},\; b_{\mathrm{iso}},\; b_{\mathrm{cross}},\; \eta_p,\; \alpha .
+\eta_z,\; b_{\mathrm{seed}},\; b_{\mathrm{coll}},\; b_{\mathrm{iso}},\; b_{\mathrm{cross}},\; \eta_p,\; \alpha .
 $$
 
-Defaults in `params.L2`: `ETA_Z_INIT`, `B_COLL_INIT`, `B_ISO_INIT`, `B_CROSS_INIT`, `ETA_P_INIT`, `ALPHA_INIT`. $\rho_{\mathrm{seed}}$ sets $\rho^{(0)}$ only; refine fixed points are lateral (coll / iso / cross), not seed-pinned.
+Defaults in `params.L2`: `ETA_Z_INIT`, `B_SEED_INIT`, `B_COLL_INIT`, `B_ISO_INIT`, `B_CROSS_INIT`, `ETA_P_INIT`, `ALPHA_INIT`. $\rho_{\mathrm{seed}}$ sets $\rho^{(0)}$ and is **fixed** in the drive (minimum evidence floor for isolated edges).
 
 ### Fixed conv kernels (buffers, no gradients)
 
@@ -204,7 +204,7 @@ Clean edge with same-orientation neighbors: low $c_{\mathrm{cross}}^{(k^\star)}$
 ### Pass update ($t = 0,\ldots,T_{\mathrm{refine}}-1$, `L2.T_REFINE`)
 
 $$
-\mathrm{drive}^{(t)}(c,k) = b_{\mathrm{coll}}\,\tilde\rho_{\mathrm{coll}}^{(k,t)}(c),
+\mathrm{drive}^{(t)}(c,k) = b_{\mathrm{seed}}\,\rho_{\mathrm{seed}}^{(k)}(c) + b_{\mathrm{coll}}\,\tilde\rho_{\mathrm{coll}}^{(k,t)}(c),
 $$
 $$
 \tilde\rho^{(k,t+1)}(c) = \mathrm{ok}(c)\cdot
@@ -218,7 +218,7 @@ $$
 \rho^{(k,t+1)}(c) = (1 - \alpha)\,\rho^{(k,t)}(c) + \alpha\,\tilde\rho^{(k,t+1)}(c),
 \qquad \alpha = \mathrm{clamp}_{[0,1]}\!\bigl(\mathrm{softplus}(\tilde\alpha)\bigr),
 $$
-with default $\alpha \approx 0.5$ (`L2.ALPHA_INIT`). Mixing keeps $\rho_{\mathrm{seed}}$ in the trajectory while the NR step pursues neighborhood consensus; $\alpha$ sets how fast $\rho$ moves from the seed IC toward the lateral fixed point.
+with default $\alpha \approx 0.5$ (`L2.ALPHA_INIT`). Mixing dampens step-to-step oscillation; $b_{\mathrm{seed}}$ vs $b_{\mathrm{coll}}$ balances own initial evidence vs collinear neighborhood consensus.
 
 **TBPTT**: during training, $\rho$ is detached every `grad_window = max(1, T_{\mathrm{refine}} // \texttt{TRAIN.L2\_SNAPSHOT\_MAX})` steps to limit BPTT depth.
 
@@ -299,10 +299,10 @@ Checkpoints store `{"model_state": state_dict}` (`intermediate.pt`, `final.pt`).
 
 | Block | Count | Notes |
 |------:|------:|------|
-| $\tilde\eta_z, \tilde b_{\mathrm{coll}}, \tilde b_{\mathrm{iso}}, \tilde b_{\mathrm{cross}}, \tilde\eta_p, \tilde\alpha$ | 6 | Seed denom floor + lateral drive / inhibition + mixing |
+| $\tilde\eta_z, \tilde b_{\mathrm{seed}}, \tilde b_{\mathrm{coll}}, \tilde b_{\mathrm{iso}}, \tilde b_{\mathrm{cross}}, \tilde\eta_p, \tilde\alpha$ | 7 | Seed + drive / inhibition + mixing |
 | $\tilde\sigma_\perp, s_t, s_n$ | 3 | Splat width + stencil spacings |
 | $\mathrm{MLP}_{\mathrm{thin}}$ (12→8→1) | 113 | $12\cdot 8 + 8 + 8 + 1$ |
-| **Total (`StriateE2E`)** | **122** | 6 L2 + 116 renderer |
+| **Total (`StriateE2E`)** | **123** | 7 L2 + 116 renderer |
 
 L0 $\eta$ and L1 geometry are **not** learned. Legacy checkpoints from older K-bin / 14-feature renderer architectures may load with missing/unexpected keys; use `upgrade_renderer_state_dict` and `load_state_dict(..., strict=False)` with `report_checkpoint_compatibility`.
 
