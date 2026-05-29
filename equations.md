@@ -220,7 +220,7 @@ $$
 $$
 with defaults `B_SEED_INIT = B_COLL_INIT = 0.5`, `ALPHA_INIT = 0.5`. **Mixing** dampens coll/iso/cross oscillation across steps. **Seed pin** ($b_{\mathrm{seed}}$) gives a minimum drive from the initial hypothesis so short edges without long collinear context do not collapse; $b_{\mathrm{seed}}$ vs $b_{\mathrm{coll}}$ trades local evidence vs neighborhood consensus.
 
-**TBPTT**: during training, $\rho$ is detached every `grad_window = max(1, T_{\mathrm{refine}} // \texttt{TRAIN.L2\_SNAPSHOT\_MAX})` steps to limit BPTT depth.
+**TBPTT**: `grad_window = \texttt{L2\_SNAPSHOT\_MAX}` ($=5$) when $T_{\mathrm{refine}} > 5$ (detach every 5 steps → at most 5 refine steps of gradient per segment). If $T_{\mathrm{refine}} \le 5$, no in-loop detach — full backprop through all refine steps so seed→coll compounding is visible to $\eta_z$, $b_{\mathrm{seed}}$, etc.
 
 **Diagnostics** (`return_surface_diags`): raw pool snapshots at $t{=}0$ and $t{=}$last; optional bimodality $\sum_c \rho(1-\rho)$ per snapshot step.
 

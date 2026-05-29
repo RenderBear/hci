@@ -829,8 +829,8 @@ def main():
         f"ρ←(1−α)ρ+α·NR(drive²/(drive²+b_iso·c_iso+b_cross·cross+η_p²)); "
         f"ρ_seed=ρ_raw²/(ρ_raw²+η_z²), ρ_raw=ρ_bins/(ρ_total+ε); α init={L2.ALPHA_INIT}; "
         f"cross^(k)=mean_{{k'≠k}} W_disk*ρ^(k'); "
-        f"  TBPTT: {TRAIN.L2_SNAPSHOT_MAX} segments  "
-        f"window=max(1, T//{TRAIN.L2_SNAPSHOT_MAX})  (full grad per segment)"
+        f"  TBPTT: max {TRAIN.L2_SNAPSHOT_MAX} refine steps/segment; "
+        f"detach every {TRAIN.L2_SNAPSHOT_MAX} steps only if T>{TRAIN.L2_SNAPSHOT_MAX}"
     )
     print(
         f"Render: bilinear cell grid → pixel ρ (and θ); no render MLP / no splat"

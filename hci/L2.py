@@ -206,10 +206,18 @@ def collapse_rho_bins(
 
 def l2_grad_window(
     t_refine: int,
-    n_segments: int = TRAIN.L2_SNAPSHOT_MAX,
+    max_bptt_steps: int = TRAIN.L2_SNAPSHOT_MAX,
 ) -> int:
-    """TBPTT detach interval: max(1, T_refine // n_segments)."""
-    return max(1, int(t_refine) // max(1, int(n_segments)))
+    """TBPTT detach interval: at most max_bptt_steps refine steps per grad segment.
+
+    If T_refine <= max_bptt_steps, no in-loop detach (full backprop through all
+    iterations). If T_refine > max_bptt_steps, detach every max_bptt_steps steps.
+    """
+    t = int(t_refine)
+    m = max(1, int(max_bptt_steps))
+    if t <= m:
+        return t + 1
+    return m
 
 
 def l2_snapshot_steps(
