@@ -140,29 +140,26 @@ Interior mask $\mathrm{ok}(c) = \neg\,\texttt{is\_border}(c)$. State is **$K$ ch
 
 ### Seed (IC only; fixed in drive)
 
-From L1 `rho_bins` (same $\rho_{\mathrm{bins}}^{(k)}$ as §3). Same pattern as L0 (§2): per-cell min subtraction on normalized bins, then Naka–Rushton squash. Code names the normalized fraction `rho_raw` and the min-subtracted contrast `rho_tilde`:
+From L1 `rho_bins` (same $\rho_{\mathrm{bins}}^{(k)}$ as §3). Same pattern as L0 (§2): per-cell min subtraction on raw bin masses, then Naka–Rushton squash. Code names $\rho_{\mathrm{raw}}^{(k)} = \rho_{\mathrm{bins}}^{(k)}$ and the min-subtracted contrast $\tilde\rho$:
 
 $$
-\rho_{\mathrm{total}}(c) = \sum_k \rho_{\mathrm{bins}}^{(k)}(c), \qquad
-\rho_{\mathrm{raw}}^{(k)}(c) = \frac{\rho_{\mathrm{bins}}^{(k)}(c)}{\rho_{\mathrm{total}}(c) + \varepsilon},
-$$
-$$
+\rho_{\mathrm{raw}}^{(k)}(c) = \rho_{\mathrm{bins}}^{(k)}(c), \qquad
 \tilde\rho^{(k)}(c) = \rho_{\mathrm{raw}}^{(k)}(c) - \min_j \rho_{\mathrm{raw}}^{(j)}(c),
 $$
 $$
 \rho_{\mathrm{seed}}^{(k)}(c) = \frac{\bigl(\tilde\rho^{(k)}(c)\bigr)^2}{\bigl(\tilde\rho^{(k)}(c)\bigr)^2 + \eta_z^2}, \qquad
-\eta_z = \texttt{L2.ETA\_Z} = 0.05\ \text{(fixed, same scale as L0 $\eta$)}.
+\eta_z = \mathrm{softplus}(\tilde\eta_z).
 $$
 
-Min subtraction kills uniform texture (all bins $\approx 1/K$ → $\tilde\rho \approx 0$); anisotropic edges preserve peak-vs-min contrast regardless of absolute magnitude. Border cells: $\rho_{\mathrm{seed}}^{(k)} = 0$. With $T_{\mathrm{refine}}=0$ (`infer --no-dynamics`), $\rho^{(k)}$ stays at $\rho_{\mathrm{seed}}^{(k)}$.
+$\eta_z$ is NR half-saturation in $\tilde\rho$ units (default `ETA_Z_INIT = 1e4`; **learned**). Min subtraction kills uniform texture (equal bins → $\tilde\rho \approx 0$); anisotropic edges preserve peak-vs-min contrast. Border cells: $\rho_{\mathrm{seed}}^{(k)} = 0$. With $T_{\mathrm{refine}}=0$ (`infer --no-dynamics`), $\rho^{(k)}$ stays at $\rho_{\mathrm{seed}}^{(k)}$.
 
 ### Learned scalars (softplus of raw parameters)
 
 $$
-b_{\mathrm{seed}},\; b_{\mathrm{coll}},\; b_{\mathrm{iso}},\; b_{\mathrm{cross}},\; \eta_p,\; \alpha .
+\eta_z,\; b_{\mathrm{seed}},\; b_{\mathrm{coll}},\; b_{\mathrm{iso}},\; b_{\mathrm{cross}},\; \eta_p,\; \alpha .
 $$
 
-Defaults in `params.L2`: `B_SEED_INIT`, `B_COLL_INIT`, `B_ISO_INIT`, `B_CROSS_INIT`, `ETA_P_INIT`, `ALPHA_INIT`. $\rho_{\mathrm{seed}}$ sets $\rho^{(0)}$ and is **fixed** in the drive (minimum evidence floor for isolated edges).
+Defaults in `params.L2`: `ETA_Z_INIT`, `B_SEED_INIT`, `B_COLL_INIT`, `B_ISO_INIT`, `B_CROSS_INIT`, `ETA_P_INIT`, `ALPHA_INIT`. $\rho_{\mathrm{seed}}$ sets $\rho^{(0)}$ and is **fixed** in the drive (minimum evidence floor for isolated edges).
 
 ### Fixed conv kernels (buffers, no gradients)
 
@@ -223,7 +220,7 @@ $$
 $$
 with defaults `B_SEED_INIT = B_COLL_INIT = 0.5`, `ALPHA_INIT = 0.5`. **Mixing** dampens coll/iso/cross oscillation across steps. **Seed pin** ($b_{\mathrm{seed}}$) gives a minimum drive from the initial hypothesis so short edges without long collinear context do not collapse; $b_{\mathrm{seed}}$ vs $b_{\mathrm{coll}}$ trades local evidence vs neighborhood consensus.
 
-**TBPTT**: `grad_window = \texttt{L2\_SNAPSHOT\_MAX}` ($=5$) when $T_{\mathrm{refine}} > 5$ (detach every 5 steps → at most 5 refine steps of gradient per segment). If $T_{\mathrm{refine}} \le 5$, no in-loop detach — full backprop through all refine steps so seed→coll compounding is visible to $b_{\mathrm{seed}}$, etc.
+**TBPTT**: `grad_window = \texttt{L2\_SNAPSHOT\_MAX}` ($=5$) when $T_{\mathrm{refine}} > 5$ (detach every 5 steps → at most 5 refine steps of gradient per segment). If $T_{\mathrm{refine}} \le 5$, no in-loop detach — full backprop through all refine steps so seed→coll compounding is visible to $\eta_z$, $b_{\mathrm{seed}}$, etc.
 
 **Diagnostics** (`return_surface_diags`): raw pool snapshots at $t{=}0$ and $t{=}$last; optional bimodality $\sum_c \rho(1-\rho)$ per snapshot step.
 
@@ -302,13 +299,13 @@ Checkpoints store `{"model_state": state_dict}` (`intermediate.pt`, `final.pt`).
 
 | Block | Count | Notes |
 |------:|------:|------|
-| $\tilde b_{\mathrm{seed}}, \tilde b_{\mathrm{coll}}, \tilde b_{\mathrm{iso}}, \tilde b_{\mathrm{cross}}, \tilde\eta_p, \tilde\alpha$ | 6 | L2: drive / inhibition + mixing |
+| $\tilde\eta_z, \tilde b_{\mathrm{seed}}, \tilde b_{\mathrm{coll}}, \tilde b_{\mathrm{iso}}, \tilde b_{\mathrm{cross}}, \tilde\eta_p, \tilde\alpha$ | 7 | L2: seed NR + drive / inhibition + mixing |
 | $\tilde\kappa$ (L1 von Mises) | 1 | Bin sharpness in $e_k(p)$ |
 | $\tilde\sigma_\perp, s_t, s_n$ | 3 | Splat width + stencil spacings |
 | $\mathrm{MLP}_{\mathrm{thin}}$ (12→8→1) | 113 | $12\cdot 8 + 8 + 8 + 1$ |
-| **Total (`StriateE2E`)** | **123** | 6 L2 + 1 L1 $\kappa$ + 116 renderer |
+| **Total (`StriateE2E`)** | **124** | 7 L2 + 1 L1 $\kappa$ + 116 renderer |
 
-L0 $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ and L2 $\eta_z$ are **fixed** (`params.L0`, `params.L2`). Legacy checkpoints from older K-bin / 14-feature renderer architectures may load with missing/unexpected keys; use `upgrade_renderer_state_dict` and `load_state_dict(..., strict=False)` with `report_checkpoint_compatibility`.
+L0 $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ are **fixed** (`params.L0`). Legacy checkpoints from older K-bin / 14-feature renderer architectures may load with missing/unexpected keys; use `upgrade_renderer_state_dict` and `load_state_dict(..., strict=False)` with `report_checkpoint_compatibility`.
 
 ---
 
@@ -328,4 +325,4 @@ L0 $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ and L2 $\eta_z$ are **fixed** (`pa
 
 ## 9. Revision note
 
-This document matches the **STRIATE** stack: L1 **K-bin projection** (§3), L2 **`TileDynamics`** — $\rho_{\mathrm{raw}}=\rho_{\mathrm{bins}}/\rho_{\mathrm{total}}$, min-subtract + NR seed, seed pin + coll drive, spatial cross, mixing (§4), **Gaussian-line splat** renderer (§5), **`StriateE2E`** (123 learned scalars).
+This document matches the **STRIATE** stack: L1 **K-bin projection** (§3), L2 **`TileDynamics`** — min-subtract on $\rho_{\mathrm{bins}}$, NR seed, seed pin + coll drive, spatial cross, mixing (§4), **Gaussian-line splat** renderer (§5), **`StriateE2E`** (124 learned scalars).

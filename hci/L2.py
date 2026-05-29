@@ -171,11 +171,10 @@ def rho_seed_from_bins(
     is_border: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    """ρ_raw = ρ_bins/(ρ_total+ε); ρ̃ = ρ_raw − min_k ρ_raw; ρ_seed = ρ̃²/(ρ̃²+η_z²)."""
+    """ρ_raw = ρ_bins; ρ̃ = ρ_raw − min_k ρ_raw; ρ_seed = ρ̃²/(ρ̃²+η_z²)."""
     if is_border.dim() > 1:
         is_border = is_border.reshape(-1)
-    rho_total = rho_bins.sum(dim=-1, keepdim=True)
-    rho_raw = rho_bins / (rho_total + eps)
+    rho_raw = rho_bins
     rho_tilde = rho_raw - rho_raw.min(dim=-1, keepdim=True).values
     rho_tilde_sq = rho_tilde * rho_tilde
     eta_z_sq = eta_z * eta_z
@@ -257,6 +256,7 @@ class TileDynamics(nn.Module):
         K=L2.K,
         t_refine=L2.T_REFINE,
         eps=L2.EPS,
+        eta_z_init=L2.ETA_Z_INIT,
         alpha_init=L2.ALPHA_INIT,
         tbptt_n_segments: int = TRAIN.L2_SNAPSHOT_MAX,
         **kw,
@@ -266,8 +266,10 @@ class TileDynamics(nn.Module):
         self.R_fac, self.R_sup, self.K = r_fac_pool, r_sup_pool, K
         self.T_refine, self.eps = t_refine, eps
         self.tbptt_n_segments = max(1, int(tbptt_n_segments))
-        self.eta_z = float(L2.ETA_Z)
 
+        self._eta_z_raw = nn.Parameter(
+            torch.tensor(_inv_softplus(max(float(eta_z_init), 1e-8)), dtype=torch.float32)
+        )
         self._alpha_raw = nn.Parameter(
             torch.tensor(_inv_softplus(float(alpha_init)), dtype=torch.float32)
         )
@@ -288,6 +290,10 @@ class TileDynamics(nn.Module):
         self.register_buffer("W_disk", W_disk)
         self.register_buffer("W_count_coll", W_count_coll)
         self.register_buffer("W_count", W_count)
+
+    @property
+    def eta_z(self):
+        return Fn.softplus(self._eta_z_raw)
 
     @property
     def b_seed(self): return Fn.softplus(self._b_seed_raw)
