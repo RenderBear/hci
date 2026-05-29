@@ -554,18 +554,71 @@ def viz_infer_cell_rho_maps(
     is_border: np.ndarray,
     out_path: str,
 ) -> None:
+    """Seed vs post-L2 ρ (max over K) and Δρ = post − seed."""
+    seed = apply_border_zero(np.asarray(rho_seed, dtype=np.float64), is_border)
+    post = apply_border_zero(np.asarray(rho_post, dtype=np.float64), is_border)
+    delta = post - seed
+    interior = ~np.asarray(is_border, dtype=bool)
 
-    viz_rho_branch_grid(
-        [rho_seed, rho_post],
-        [r"seed $\rho^{(0)}$ (max over K)", "post-L2 ρ"],
-        is_border,
-        out_path,
-        suptitle=(
-            r"Cell $\rho$ — peak-relative seed IC, then L2 refine "
-            r"($\rho_{\mathrm{seed}}^{(k)}=\rho_{\mathrm{bins}}^{(k)}/(\rho_{\mathrm{peak}}+\eta_z+\varepsilon)$)"
-        ),
-        layout_rows_cols=(1, 2),
+    cmap_pos = rho_heatmap_cmap()
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5), facecolor=VIZ.BG)
+    suptitle = (
+        r"Cell $\rho$ — seed IC, post-L2, and $\Delta\rho$ "
+        r"($\rho_{\mathrm{seed}}^{(k)}=\rho_{\mathrm{bins}}^{(k)}/(\rho_{\mathrm{peak}}+\eta_z+\varepsilon)$; "
+        r"scalar maps = $\max_k \rho^{(k)}$)"
     )
+
+    for ax in axes:
+        ax.set_facecolor(VIZ.PANEL_BG)
+        ax.axis("off")
+
+    panels_pos = (
+        (seed, r"seed $\rho^{(0)}$ (max over K)"),
+        (post, r"post-L2 $\rho$ (max over K)"),
+    )
+    for ax, (arr, title) in zip(axes[:2], panels_pos):
+        m = max(float(np.max(arr)), VIZ.EPS)
+        ax.imshow(
+            arr / m,
+            cmap=cmap_pos,
+            vmin=0.0,
+            vmax=1.0,
+            interpolation="nearest",
+        )
+        ax.set_title(
+            f"{title}\nraw max={m:.4g}",
+            fontsize=9,
+            color=VIZ.FG,
+            fontfamily="monospace",
+        )
+
+    ax_d = axes[2]
+    if interior.any():
+        lim = max(float(np.max(np.abs(delta[interior]))), VIZ.EPS)
+    else:
+        lim = 1.0
+    im_d = ax_d.imshow(
+        delta,
+        cmap="coolwarm",
+        vmin=-lim,
+        vmax=lim,
+        interpolation="nearest",
+    )
+    ax_d.set_title(
+        r"$\Delta\rho$ = post $-$ seed"
+        f"\ninterior range [{float(delta[interior].min()) if interior.any() else 0:.4g}, "
+        f"{float(delta[interior].max()) if interior.any() else 0:.4g}]",
+        fontsize=9,
+        color=VIZ.FG,
+        fontfamily="monospace",
+    )
+    cbar = fig.colorbar(im_d, ax=ax_d, fraction=0.046, pad=0.04)
+    cbar.ax.tick_params(colors=VIZ.FG, labelsize=7)
+
+    fig.suptitle(suptitle, fontsize=10, color=VIZ.FG, fontfamily="monospace")
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
+    plt.close(fig)
 
 
 def viz_infer_rho_hist_cdf(

@@ -475,7 +475,8 @@ def main():
         "--diagnostics",
         action="store_true",
         help="Save additional diagnostics: base, l0_pinwheel, l1_rho_masses, geometry, "
-        "l2_rho_seed_post, l2_rho_hist_cdf, l2_bimodality_per_iter, l2_facilitation_factors, "
+        "l2_rho_seed_post (seed, post, Δρ), l2_rho_hist_cdf, l2_bimodality_per_iter, "
+        "l2_facilitation_factors, "
         "l2_suppression_factors, l2_bin_dynamics, render_softmap, "
         f"iters_snapshot (up to {TRAIN.L2_SNAPSHOT_MAX} softmaps evenly spaced over L2 steps; "
         "single map if --no-dynamics), "
