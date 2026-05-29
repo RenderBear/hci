@@ -1,7 +1,7 @@
-r"""train.py — STRIATE training: L1 projection + seed NR + harmonic render.
+r"""train.py — STRIATE training: z₂ moments + AND-gate seed + harmonic render.
 
-Pipeline per image: L0 contrast/harmonics (cached) → L1 K-bin projection live each step
-→ seed NR (η_z) → splat renderer ($\hat B = \bar\rho \cdot \mathrm{gate}$).
+Pipeline per image: L0 contrast/harmonics (cached) → live z₂ moment pooling each step
+→ AND-gate seed (g_R · g_E) → splat renderer ($\hat B = \bar\rho \cdot \mathrm{gate}$).
 Loss combines soft-Dice and per-pixel BCE on the same η± valid band
 (target≥η_pos or target<η_neg), weighted by ``--lam_dice`` and ``--lam_bce``
 (each can be 0).
@@ -33,9 +33,9 @@ from hci.L1 import (
     stride_from_patch_overlap,
     z_from_l0_harmonics,
     pad_for_patch_grid,
-    run_l1,
+    compute_cell_moments,
 )
-from hci.seed import CellSeed, _inv_softplus
+from hci.seed import AndGateSeed, _inv_softplus
 from hci.renderer import (
     ModulationRenderer,
     render_boundary_map_torch,
@@ -93,59 +93,47 @@ def proj_info_from_grid(H: int, W: int, P: int, patch_overlap: int) -> dict:
 
 
 def build_cells_flat_torch(cells: dict) -> dict:
-    """Flatten ``run_l1(..., return_torch=True)`` grids for seed / renderer."""
+    """Flatten ``compute_cell_moments(..., return_torch=True)`` for seed / renderer."""
     nH, nW = int(cells["nH"]), int(cells["nW"])
     N = nH * nW
+    rho_t = cells["rho_total"].reshape(N)
     return {
         "nH": nH,
         "nW": nW,
+        "S": int(cells["S"]),
+        "P": int(cells["P"]),
         "theta": cells["theta"].reshape(N, 1),
-        "k_star": cells["k_star"].reshape(N),
-        "q": cells["q"].reshape(N, 1),
-        "kappa": cells["kappa"].reshape(N, 1),
-        "z1_abs_sum": cells["z1_abs_sum"].reshape(N),
-        "rho_peak": cells["rho_peak"].reshape(N),
-        "rho_bins": cells["rho_bins"].reshape(N, -1),
-        "z0": cells["z0"].reshape(N),
+        "coherence_R": cells["coherence_R"].reshape(N),
+        "rho_total": rho_t,
+        "z0": rho_t,
         "cx_z2": cells["cx_z2"].reshape(N),
         "cy_z2": cells["cy_z2"].reshape(N),
         "is_border": cells["is_border"].reshape(N).bool(),
     }
 
 
-def run_l1_cells_flat(
+def run_moments_cells_flat(
     l0_pix: dict[str, torch.Tensor],
     border_mask: torch.Tensor,
     H0: int,
     W0: int,
     device: torch.device,
-    *,
-    von_mises_kappa: torch.Tensor,
 ) -> dict:
-    """Live L1 from cached L0 (differentiable w.r.t. learned von Mises κ)."""
+    """Live z₂ moment pooling from cached L0."""
     h2m = l0_pix["h2m"].to(device=device, dtype=torch.float32)
-    z1 = torch.complex(
-        l0_pix["z1_re"].to(device=device, dtype=torch.float32),
-        l0_pix["z1_im"].to(device=device, dtype=torch.float32),
-    )
     z2 = torch.complex(
         l0_pix["z2_re"].to(device=device, dtype=torch.float32),
         l0_pix["z2_im"].to(device=device, dtype=torch.float32),
     )
     bm = border_mask.to(device=device).bool()
-    cells = run_l1(
+    cells = compute_cell_moments(
         h2m,
-        z1,
         z2,
         L1.PATCH_SIZE,
-        border_mask=bm,
+        bm,
         patch_overlap=L1.PATCH_OVERLAP,
         border_patch_max_frac=L1.BORDER_PATCH_MAX_FRAC,
         eps=L1.EPS,
-        K=L1.K,
-        bin_tuning=L1.COL_BIN_TUNING,
-        cos_power=L1.COL_COS_POWER,
-        von_mises_kappa=von_mises_kappa,
         device=device,
         verbose=False,
         return_torch=True,
@@ -157,20 +145,25 @@ def run_l1_cells_flat(
     return build_cells_flat_torch(cells)
 
 
+# Legacy alias
+run_l1_cells_flat = run_moments_cells_flat
+
+
 def build_cells_flat(cells: dict) -> dict:
     nH, nW = cells["nH"], cells["nW"]
     N = nH * nW
+    rho_t = cells["rho_total"].reshape(N)
     return {
         "nH": nH,
         "nW": nW,
+        "S": int(cells["S"]),
+        "P": int(cells["P"]),
         "theta": torch.from_numpy(cells["theta"].reshape(N, 1).astype(np.float32)),
-        "k_star": torch.from_numpy(cells["k_star"].reshape(N).astype(np.int64)),
-        "q": torch.from_numpy(cells["q"].reshape(N, 1).astype(np.float32)),
-        "kappa": torch.from_numpy(cells["kappa"].reshape(N, 1).astype(np.float32)),
-        "z1_abs_sum": torch.from_numpy(cells["z1_abs_sum"].reshape(N).astype(np.float32)),
-        "rho_peak": torch.from_numpy(cells["rho_peak"].reshape(N).astype(np.float32)),
-        "rho_bins": torch.from_numpy(cells["rho_bins"].reshape(N, -1).astype(np.float32)),
-        "z0": torch.from_numpy(cells["z0"].reshape(N).astype(np.float32)),
+        "coherence_R": torch.from_numpy(
+            cells["coherence_R"].reshape(N).astype(np.float32)
+        ),
+        "rho_total": torch.from_numpy(rho_t.astype(np.float32)),
+        "z0": torch.from_numpy(rho_t.astype(np.float32)),
         "cx_z2": torch.from_numpy(cells["cx_z2"].reshape(N).astype(np.float32)),
         "cy_z2": torch.from_numpy(cells["cy_z2"].reshape(N).astype(np.float32)),
         "is_border": torch.from_numpy(cells["is_border"].reshape(N).astype(np.bool_)),
@@ -180,30 +173,26 @@ def build_cells_flat(cells: dict) -> dict:
 class StriateE2E(nn.Module):
     def __init__(
         self,
-        K: int = SEED.K,
         eps: float = SEED.EPS,
-        eta_z_init: float = SEED.ETA_Z_INIT,
+        R0_init: float = SEED.R0_INIT,
+        a_init: float = SEED.A_INIT,
+        b_init: float = SEED.B_INIT,
         render_cell_hidden: int = RENDER.CELL_HIDDEN,
         render_pixel_hidden: int = RENDER.PIXEL_HIDDEN,
         **kw,
     ):
         super().__init__()
-        _ = kw  # legacy kwargs (e.g. r_fac_pool, t_refine) ignored
-        self.seed = CellSeed(K=K, eps=eps, eta_z_init=eta_z_init)
+        _ = kw
+        self.seed = AndGateSeed(
+            eps=eps,
+            R0_init=R0_init,
+            a_init=a_init,
+            b_init=b_init,
+        )
         _ = render_cell_hidden
         self.renderer = ModulationRenderer(hidden=render_pixel_hidden)
-        self._l1_von_mises_kappa_raw = nn.Parameter(
-            torch.tensor(
-                _inv_softplus(float(L1.COL_VON_MISES_KAPPA)),
-                dtype=torch.float32,
-            )
-        )
         self.eps = eps
         self.render_eps = max(float(eps), 1e-6)
-
-    @property
-    def l1_von_mises_kappa(self) -> torch.Tensor:
-        return F.softplus(self._l1_von_mises_kappa_raw)
 
     def forward_batch(self, meta_list):
         bmaps = []
@@ -232,13 +221,12 @@ def prepare_batch(items, device, model: StriateE2E):
     meta = []
     for item in items:
         (gi, gt, Hp, Wp, Hg, Wg, H0, W0, l0_pix, border_mask, img) = item
-        cf_dev = run_l1_cells_flat(
+        cf_dev = run_moments_cells_flat(
             l0_pix,
             border_mask,
             H0,
             W0,
             device,
-            von_mises_kappa=model.l1_von_mises_kappa,
         )
         l0_dev = {
             k: v.to(device) for k, v in l0_pix.items()
@@ -545,20 +533,29 @@ def bce_loss_with_ignore(
 
 
 def upgrade_model_state_dict(state_dict: dict) -> dict:
-    """Map legacy ``dynamics.*`` keys to ``seed.*``; drop removed L2 params."""
+    """Map legacy keys; drop K-bin / η_z / von Mises params; init AND-gate if missing."""
     out: dict = {}
     for k, v in state_dict.items():
-        if k == "dynamics._eta_z_raw":
-            out["seed._eta_z_raw"] = v
-        elif k.startswith("dynamics."):
+        if k.startswith("dynamics."):
             continue
-        else:
-            out[k] = v
+        if k in ("seed._eta_z_raw", "_l1_von_mises_kappa_raw"):
+            continue
+        out[k] = v
+    if "seed._R0" not in out:
+        out["seed._R0"] = torch.tensor(float(SEED.R0_INIT), dtype=torch.float32)
+    if "seed._a_raw" not in out:
+        out["seed._a_raw"] = torch.tensor(
+            [_inv_softplus(float(SEED.A_INIT))], dtype=torch.float32
+        )
+    if "seed._b_raw" not in out:
+        out["seed._b_raw"] = torch.tensor(
+            [_inv_softplus(float(SEED.B_INIT))], dtype=torch.float32
+        )
     return out
 
 
 def debug_seed_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
-    """One training batch: seed stats + ∂loss/∂η_z."""
+    """One training batch: AND-gate stats + ∂loss/∂(R₀, a, b)."""
     model.train()
     meta = meta_list[0]
     cf = meta["cells_flat_dev"]
@@ -594,12 +591,13 @@ def debug_seed_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
         for key in ("rho_mean", "rho_max", "mid_band_frac", "n_interior"):
             if key in st:
                 print(f"  {key}: {st[key]}")
-    print(f"\n  η_z={model.seed.eta_z.item():.4g} (learned)")
-    t = model.seed._eta_z_raw
-    if t.grad is None:
-        print("  |grad| η_z: grad=None")
-    else:
-        print(f"  |grad| η_z: {t.grad.abs().mean().item():.2e}")
+    seed = model.seed
+    print(f"\n  R₀={seed.R0.item():.4g}  a={seed.a.item():.4g}  b={seed.b.item():.4g} (learned)")
+    for name, t in (("R₀", seed._R0), ("a", seed._a_raw), ("b", seed._b_raw)):
+        if t.grad is None:
+            print(f"  |grad| {name}: grad=None")
+        else:
+            print(f"  |grad| {name}: {t.grad.abs().mean().item():.2e}")
     print(f"\n  loss={loss.item():.4f}  requires_grad={loss.requires_grad}\n")
 
 
@@ -656,17 +654,16 @@ def plot_training_curves(history, out_dir):
 
 
 def format_l1_param_lines(model: StriateE2E, *, indent: str = "  ") -> list[str]:
+    _ = model
     return [
-        f"{indent}von Mises κ={model.l1_von_mises_kappa.item():.3f} (learned; "
-        f"exp(κ·cos2Δθ) bin sharpness — not per-cell orientation κ)",
+        f"{indent}z₂ moment pooling (R, ρ_total, θ) — no learned L1 params",
     ]
 
 
 def format_seed_param_lines(seed, *, indent: str = "  ") -> list[str]:
     return [
-        f"{indent}η_z={seed.eta_z.item():.4g} (learned)  "
-        f"ρ̂=ρ_bins/(ρ_total+ε); ρ̃=ρ̂−min_k ρ̂; "
-        f"ρ_seed=ρ̃²/(ρ̃²+η_z²); export ρ=max_k ρ_seed",
+        f"{indent}R₀={seed.R0.item():.4g}  a={seed.a.item():.4g}  b={seed.b.item():.4g} (learned)  "
+        f"ρ=g_R(R)·g_E(E_rel)·ok;  g_R=σ(a(R−R₀));  g_E=σ(b log E_rel)",
     ]
 
 
@@ -680,21 +677,17 @@ def format_renderer_param_lines(r, *, indent: str = "  ") -> list[str]:
     ]
 
 
-def format_model_param_counts(model: StriateE2E) -> tuple[int, int, int, int]:
-    """Returns (total, seed η_z, L1 von Mises κ, renderer)."""
+def format_model_param_counts(model: StriateE2E) -> tuple[int, int, int]:
+    """Returns (total, seed AND-gate, renderer)."""
     n_seed = sum(p.numel() for p in model.seed.parameters())
-    n_l1 = model._l1_von_mises_kappa_raw.numel()
     n_renderer = sum(p.numel() for p in model.renderer.parameters())
     n_total = sum(p.numel() for p in model.parameters())
-    return n_total, n_seed, n_l1, n_renderer
+    return n_total, n_seed, n_renderer
 
 
 def format_model_param_summary(model: StriateE2E) -> str:
-    n_tot, n_seed, n_l1, n_r = format_model_param_counts(model)
-    return (
-        f"{n_tot} total = seed η_z {n_seed} + L1 von Mises κ {n_l1} "
-        f"(bin sharpness, not per-cell κ) + renderer {n_r}"
-    )
+    n_tot, n_seed, n_r = format_model_param_counts(model)
+    return f"{n_tot} total = seed AND-gate {n_seed} + renderer {n_r}"
 
 
 def save_checkpoint(model, path):
@@ -761,7 +754,7 @@ def main():
     ap.add_argument(
         "--debug-seed",
         action="store_true",
-        help="Run one batch, print seed stats and η_z gradient, then exit",
+        help="Run one batch, print AND-gate stats and R₀/a/b gradients, then exit",
     )
     args = ap.parse_args()
 
@@ -778,8 +771,8 @@ def main():
         f"  max_train={mt}"
     )
     print(
-        f"Seed: ρ̂=ρ_bins/(ρ_total+ε); ρ̃=ρ̂−min_k ρ̂; "
-        f"ρ_seed=ρ̃²/(ρ̃²+η_z²); η_z init={SEED.ETA_Z_INIT} (learned)"
+        f"Seed: g_R=σ(a(R−R₀)) · g_E=σ(b log E_rel) · ok; "
+        f"R₀ init={SEED.R0_INIT}  a init={SEED.A_INIT}  b init={SEED.B_INIT} (learned)"
     )
     print(
         f"Render: Gaussian-line splat + stencil thinning MLP → "
@@ -812,7 +805,6 @@ def main():
     print(f"  training on all {len(fit_stems)} images (no held-out val)")
 
     model = StriateE2E(
-        K=SEED.K,
         eps=SEED.EPS,
         render_cell_hidden=RENDER.CELL_HIDDEN,
         render_pixel_hidden=RENDER.PIXEL_HIDDEN,

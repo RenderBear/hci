@@ -7,12 +7,12 @@ This file records the **notation and equations implemented in this repository**:
 ## 1. End-to-end pipeline
 
 1. **L0** — RGB → split luminance / chrominance directional differences; per-direction min subtraction; independent Naka–Rushton per channel with **fixed** scalars $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ (`L0.ETA_LUM`, `L0.ETA_CHR`) and gain $\gamma$ (`L0.GAMMA`). Produces harmonic stack $s$, magnitudes $h_{1m}, h_{2m}$, and split $h_{2m}^{\mathrm{lum}}, h_{2m}^{\mathrm{chr}}$. Complex fields $z_1, z_2$ are read from $s$ (`z_from_l0_harmonics`). L0 is **precomputed and cached** for training; it is not updated during training.
-2. **L1** — Pixel $K$-bin von Mises (or $\cos^p$) projection of $h_{2m}$ (`L1.K`; von Mises $\kappa$ is **learned**, softplus, init `L1.COL_VON_MISES_KAPPA`$=8$); sum-pool over $P\times P$ patches → per-cell $\rho_{\mathrm{bins}}^{(k)}$, $\theta$ from patch-summed $z_2$, polarity $q$, anisotropy $\delta$, per-cell orientation confidence $\kappa$, and $h_{2m}$-weighted splat anchors. **Runs live** each training step from cached L0 (`run_l1_cells_flat` in `prepare_batch`); **not** written to the L0 disk cache.
-3. **Seed** (`CellSeed`) — total-normalize L1 bin masses, min-subtract for orientation selectivity, per-bin Naka–Rushton with **learned** $\eta_z$ (init `SEED.ETA_Z_INIT`$=0.1$). Scalar export $\rho(c)=\max_k \rho_{\mathrm{seed}}^{(k)}(c)$; $\theta(c)$ passes through from L1 unchanged.
+2. **L1** — From L0 pixel field $z_2$, **sum-pool** over $P\times P$ patches → per-cell complex moment $Z_2$, scalar $\rho_{\mathrm{total}}$, coherence $R$, orientation $\theta = \tfrac12 \arg Z_2$, and $h_{2m}$-weighted splat anchors. **Runs live** each training step from cached L0 (`run_moments_cells_flat` in `prepare_batch`); **not** written to the L0 disk cache.
+3. **Seed** (`AndGateSeed` / `CellSeed`) — surround-normalized AND gate on $(R, E_{\mathrm{rel}})$ with **learned** $R_0, a, b$ (init `SEED.R0_INIT`, `SEED.A_INIT`, `SEED.B_INIT`). Scalar export $\rho(c)=g_R(c)\,g_E(c)\,\mathrm{ok}(c)$; $\theta(c)$ passes through from L1 unchanged.
 4. **Renderer** (`ModulationRenderer`) — Cell-grid $\theta$ combing and $\rho$-gated anchor smoothing; **Gaussian-line splat** of $\rho$ to pixels; coherence map; tangential / normal **9-tap stencils on $\bar\rho$**; **20→12→1** thinning MLP gate:
    $$\hat B(p) = \bar\rho(p)\,\mathrm{gate}(p).$$
 
-There is **no** spatial $\eta$-MLP and **no** second L0 pass inside the training graph. L1 per-cell orientation confidence $\kappa$ is computed but **not** fed to the renderer (distinct from learned von Mises bin sharpness $\kappa$ in $e_k(p)$). `L1.K` must match `SEED.K`.
+There is **no** spatial $\eta$-MLP and **no** second L0 pass inside the training graph. The renderer's splat-footprint coherence map $\mathrm{coh}(p)$ is distinct from per-cell $R(c)$.
 
 At inference, optional **ridge NMS** (`ridge_nms`) thins $\hat B$ using splat-dominant orientation $\theta^\star(p)$.
 
@@ -61,61 +61,24 @@ Split second-harmonic magnitudes $h_{2m}^{\mathrm{lum}}, h_{2m}^{\mathrm{chr}}$ 
 
 ---
 
-## 3. L1 — pixel K-bin projection
+## 3. L1 — per-cell z₂ moments
 
-Patch size $P$ (`L1.PATCH_SIZE`), stride $S = P - \texttt{patch\_overlap}$ (`L1.PATCH_OVERLAP`) → cell grid $(n_H, n_W)$, $K$ bins (`L1.K`, default 12, same as `SEED.K`). Bin centres $\bar\theta_k = k\pi/K$. A cell is **border** when the mean border mask over its patch exceeds `L1.BORDER_PATCH_MAX_FRAC`.
+Patch size $P$ (`L1.PATCH_SIZE`), stride $S = P - \texttt{patch\_overlap}$ (`L1.PATCH_OVERLAP`) → cell grid $(n_H, n_W)$. Border mask $\mathrm{ok}(c) = \neg\,\texttt{is\_border}(c)$. A cell is **border** when the mean border mask over its patch exceeds `L1.BORDER_PATCH_MAX_FRAC`.
 
-Pixel orientation from L0 ($\S$2):
-
-$$
-\theta_{2m}(p) = \tfrac12 \arg z_2(p).
-$$
-
-**Pixel-level bin channels** (default: von Mises, `L1.COL_BIN_TUNING`; $\kappa = \mathrm{softplus}(\tilde\kappa)$, init `L1.COL_VON_MISES_KAPPA` $= 8$):
+From the L0 pixel field $z_2(p) = s_2(p) + i\,s_3(p)$, compute **one complex moment and one scalar** per cell by sum-pool over $\mathrm{patch}(c)$:
 
 $$
-e_k(p) = h_{2m}(p)\,\exp\!\Bigl(\kappa\,\cos\bigl(2(\theta_{2m}(p) - \bar\theta_k)\bigr)\Bigr).
+Z_2(c) = \sum_{p \in \mathrm{patch}(c)} z_2(p), \qquad
+\rho_{\mathrm{total}}(c) = \sum_{p \in \mathrm{patch}(c)} |z_2(p)|.
 $$
 
-Alternate (`COL_BIN_TUNING` = `cos_pow`, `COL_COS_POWER` $= p$):
+Coherence and orientation read off the same moment in closed form:
 
 $$
-e_k(p) = h_{2m}(p)\,\cos^{p}\!\bigl(\theta_{2m}(p) - \bar\theta_k\bigr).
+R(c) = \frac{|Z_2(c)|}{\rho_{\mathrm{total}}(c) + \varepsilon} \in [0,1],
+\qquad
+\theta(c) = \tfrac{1}{2}\arg Z_2(c).
 $$
-
-At $\kappa{=}0$ the von Mises factor is flat across bins; at $\kappa{=}4$ it is much sharper than $\cos^2$ tuning. Mass is **not** normalized across $k$ at the pixel (contrast comes from pooling and seed NR).
-
-**Per-cell bin mass** (sum over patch; implemented as sum-pool / `avg_pool2d` × $P^2$):
-
-$$
-\rho_{\mathrm{bins}}^{(k)}(c) = \sum_{p \in \mathrm{patch}(c)} e_k(p).
-$$
-
-**Peak bin, orientation, and anisotropy**:
-
-$$
-k^\*(c) = \arg\max_k \rho_{\mathrm{bins}}^{(k)}(c), \qquad
-Z_2(c) = \sum_{p \in \mathrm{patch}(c)} z_2(p),
-$$
-$$
-\theta(c) = \tfrac12 \arg Z_2(c) \quad \text{(patch vector sum; not sub-bin fit to } k^\*\text{)},
-$$
-$$
-\rho_{\mathrm{peak}}(c) = \rho_{\mathrm{bins}}^{(k^\*)}(c), \qquad
-\rho_{\mathrm{total}}(c) = \sum_k \rho_{\mathrm{bins}}^{(k)}(c),
-$$
-$$
-\delta(c) = \frac{\rho_{\mathrm{peak}}(c)}{\rho_{\mathrm{total}}(c) + \varepsilon}.
-$$
-
-**Polarity** ($\theta(c)$ from $Z_2$, patch mean of $z_1$):
-
-$$
-\bar Z_1(c) = \frac{1}{P^2}\sum_{p \in \mathrm{patch}(c)} z_1(p), \qquad
-q(c) = \Re\!\Bigl(\overline{\bar Z_1(c)}\, e^{i\theta(c)}\Bigr).
-$$
-
-**Orientation confidence** $\kappa_{\mathrm{cell}}(c) \in [0,1]$ (`_patch_orientation_kappa`): $z_1$ polarity agreement along the edge normal implied by $(\theta, q)$. Not the same as learned von Mises $\kappa$ in $e_k(p)$.
 
 **Splat anchors** ($h_{2m}$-weighted centroid within the patch; stored as `cx_z2`, `cy_z2`):
 
@@ -124,43 +87,53 @@ c_x(c) = \frac{\sum_{p \in \mathrm{patch}(c)} h_{2m}(p)\, x(p)}{\sum_{p \in \mat
 c_y(c) \text{ analogously}.
 $$
 
-**Seed-facing fields** (`cells_flat`):
+**Seed / renderer fields** (`cells_flat`):
 
 | Key | Value |
 |-----|--------|
-| `rho_bins` | $(N, K)$ per-cell $\rho_{\mathrm{bins}}^{(k)}$ (seed input) |
-| `rho_peak` | $\rho_{\mathrm{peak}}$ (max bin mass) |
-| `z0` | $\rho_{\mathrm{total}}$ (sum over bins) |
+| `coherence_R` | $R(c)$ |
+| `rho_total`, `z0` | $\rho_{\mathrm{total}}(c)$ |
 | `theta` | $\theta(c) = \tfrac12 \arg Z_2(c)$ |
-| `k_star` | $k^\*(c) = \arg\max_k \rho_{\mathrm{bins}}^{(k)}$ (peak mass only; not used for $\theta$) |
 | `cx_z2`, `cy_z2` | $h_{2m}$-weighted splat anchors |
 
-Border cells zero $\theta, q, \delta, \kappa_{\mathrm{cell}}, \rho_{\mathrm{bins}}, \rho_{\mathrm{peak}}, \rho_{\mathrm{total}}$.
+Border cells → $0$ on $\rho_{\mathrm{total}}, R, \theta$ as before.
 
 ---
 
-## 4. Seed — NR orientation selectivity (`CellSeed`)
+## 4. Seed — surround-normalized AND gate (`AndGateSeed`)
 
-Interior mask $\mathrm{ok}(c) = \neg\,\texttt{is\_border}(c)$. From L1 `rho_bins`:
-
-$$
-\hat\rho^{(k)}(c) = \frac{\rho_{\mathrm{bins}}^{(k)}(c)}{\rho_{\mathrm{total}}(c) + \varepsilon}, \qquad
-\tilde\rho^{(k)}(c) = \hat\rho^{(k)}(c) - \min_j \hat\rho^{(j)}(c),
-$$
-$$
-\rho_{\mathrm{seed}}^{(k)}(c) = \frac{\bigl(\tilde\rho^{(k)}(c)\bigr)^2}{\bigl(\tilde\rho^{(k)}(c)\bigr)^2 + \eta_z^2}, \qquad
-\eta_z = \mathrm{softplus}(\tilde\eta_z).
-$$
-
-$\eta_z$ is NR half-saturation in $\tilde\rho$ units (default `SEED.ETA_Z_INIT = 0.1`; **learned**). Min subtraction kills uniform texture; anisotropic edges preserve peak-vs-min contrast. Border cells: $\rho_{\mathrm{seed}}^{(k)} = 0$.
-
-**Scalar export to renderer:**
+**Surround energy** via Gaussian kernel $G_\sigma$ on the cell grid (radius 5, $\sigma \approx 2$ cells, center-excluded, reflect-padded at borders):
 
 $$
-\rho(c) = \max_k \rho_{\mathrm{seed}}^{(k)}(c),
+\langle\rho_{\mathrm{total}}\rangle_{\mathcal{N}}(c) = (G_\sigma * \rho_{\mathrm{total}})(c),
+\qquad
+E_{\mathrm{rel}}(c) = \frac{\rho_{\mathrm{total}}(c)}{\varepsilon + \langle\rho_{\mathrm{total}}\rangle_{\mathcal{N}}(c)}.
 $$
 
-on interior cells ($\times\,\mathrm{ok}(c)$; border → $0$). **Orientation** $\theta(c)$ is read from L1 (`cells_flat['theta']`); seed does not refine $\theta$.
+**Two gates** with learned scalars $\tilde R_0, \tilde a, \tilde b$ (softplus on $a, b$ for positivity; $R_0$ unconstrained but init near 0.45):
+
+$$
+g_R(c) = \sigma\!\bigl(a\,(R(c) - R_0)\bigr),
+\qquad
+g_E(c) = \sigma\!\bigl(b\,\log E_{\mathrm{rel}}(c)\bigr).
+$$
+
+**Cell amplitude** (scalar export to renderer):
+
+$$
+\rho(c) = g_R(c)\,\cdot\,g_E(c)\,\cdot\,\mathrm{ok}(c).
+$$
+
+Border cells → $0$ on $\rho, \theta$. **Orientation** $\theta(c)$ is read from L1 (`cells_flat['theta']`); seed does not refine $\theta$.
+
+**Initialization**
+
+| Param | Init | Role |
+|------:|-----:|------|
+| $R_0$ | $0.45$ | Coherence floor |
+| $a$ | $\mathrm{softplus}^{-1}(12)$ | $g_R$ steepness |
+| $b$ | $\mathrm{softplus}^{-1}(5)$ | $g_E$ steepness |
+| $\sigma$ (surround) | $2.0$ cells | Fixed, not learned |
 
 ---
 
@@ -224,8 +197,8 @@ $\mathrm{MLP}$: **20 → 12 → 1**. Output is cropped to original content size 
 
 ## 6. Training (`train.py`)
 
-- **Disk cache** (`precompute_image`): L0 only — padded RGB, `l0_pix` ($h_{2m}$, $z_1$, $z_2$ channels), `border_mask`, GT, `proj_info` grid dims. **No** L1 $\rho$/cells. Invalidation: `TRAIN.L0_CACHE_VERSION` (bump when L0/pad/`l0_pix` change, **not** von Mises / L1 tuning).
-- **Each step** (`prepare_batch`): **live L1** from cached L0 → `cells_flat_dev`, then seed + renderer. Changing `L1.COL_BIN_TUNING`, `COL_VON_MISES_KAPPA`, etc. does not require rebuilding the cache.
+- **Disk cache** (`precompute_image`): L0 only — padded RGB, `l0_pix` ($h_{2m}$, $z_1$, $z_2$ channels), `border_mask`, GT, `proj_info` grid dims. **No** L1 cells. Invalidation: `TRAIN.L0_CACHE_VERSION` (bump when L0/pad/`l0_pix` change only).
+- **Each step** (`prepare_batch`): **live moment pooling** from cached L0 → `cells_flat_dev`, then AND-gate seed + renderer.
 
 **Loss** (defaults `TRAIN.LAM_DICE=0`, `TRAIN.LAM_BCE=1`): weighted sum of soft-Dice and/or BCE on the **η± edge band** — valid pixels where $\mathrm{GT} \ge \eta_{\mathrm{pos}}$ or $\mathrm{GT} < \eta_{\mathrm{neg}}$ (default $\eta_{\mathrm{pos}} = \eta_{\mathrm{neg}} = 0.5$). Positive label on $\mathrm{GT} \ge \eta_{\mathrm{pos}}$.
 
@@ -237,14 +210,13 @@ Checkpoints store `{"model_state": state_dict}` (`intermediate.pt`, `final.pt`).
 
 | Block | Count | Notes |
 |------:|------:|------|
-| $\tilde\eta_z$ | 1 | Seed NR half-saturation |
-| $\tilde\kappa$ (L1 von Mises) | 1 | Bin sharpness in $e_k(p)$ |
-| $\tilde\sigma_\perp, s_t, s_n$ | 3 | Splat width + stencil spacings |
+| $R_0, \tilde a, \tilde b$ | 3 | AND-gate scalars |
+| $\tilde\sigma_\perp, s_t, s_n$ | 3 | Renderer splat + stencils |
 | $\mathrm{MLP}_{\mathrm{thin}}$ (20→12→1) | 265 | $20\cdot 12 + 12 + 12 + 1$ |
 | **Renderer subtotal** | **268** | |
-| **Total (`StriateE2E`)** | **270** | 1 $\eta_z$ + 1 $\kappa$ + 268 renderer |
+| **Total (`StriateE2E`)** | **271** | 3 AND-gate + 268 renderer |
 
-L0 $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ are **fixed** (`params.L0`). Legacy checkpoints from L2 dynamics or older renderer architectures may load with missing/unexpected keys; use `upgrade_model_state_dict`, `upgrade_renderer_state_dict`, and `load_state_dict(..., strict=False)` with `report_checkpoint_compatibility`.
+L0 $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ are **fixed** (`params.L0`). Legacy checkpoints may contain `_eta_z_raw`, `_l1_von_mises_kappa_raw`; `upgrade_model_state_dict` strips these and inits AND-gate params if missing. Renderer weights load unchanged via `upgrade_renderer_state_dict` and `load_state_dict(..., strict=False)` with `report_checkpoint_compatibility`.
 
 ---
 
@@ -253,8 +225,8 @@ L0 $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ are **fixed** (`params.L0`). Legac
 | Stage | Primary code |
 |-------|----------------|
 | $d_k$, NR, harmonics, $z_1, z_2$, interior mask | `hci/L0.py` |
-| Pixel K-bin projection, $\kappa$, $h_{2m}$ anchors | `hci/L1.py` |
-| $\rho_{\mathrm{seed}}$, scalar $\rho$ export | `hci/seed.py` |
+| z₂ moment pooling, $R$, $\theta$, $h_{2m}$ anchors | `hci/L1.py` |
+| AND gate $g_R \cdot g_E$, scalar $\rho$ export | `hci/seed.py` |
 | Splat, coherence, stencils, thinning head, NMS | `hci/renderer.py` |
 | Cache, batching, loss, checkpoints | `train.py` |
 | Single-image pipeline, diagnostics | `infer.py`, `hci/diagnostics_viz.py` |
@@ -264,4 +236,4 @@ L0 $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ are **fixed** (`params.L0`). Legac
 
 ## 9. Revision note
 
-This document matches the **STRIATE** stack: **live L1** K-bin projection (§3), **seed NR** (§4), **Gaussian-line splat** renderer with 9-tap stencils (§5), **`StriateE2E`** (270 learned parameters). L0 only is disk-cached for training (§6).
+This document matches the **STRIATE** stack: **z₂ moment pooling** (§3), **surround-normalized AND gate** (§4), **Gaussian-line splat** renderer with 9-tap stencils (§5), **`StriateE2E`** (271 learned parameters). L0 only is disk-cached for training (§6).

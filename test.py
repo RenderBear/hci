@@ -1,7 +1,7 @@
 r"""test.py — STRIATE test-set evaluation (ODS, OIS, AP).
 
-Per image: same L0 → L1 → seed → render path as inference (raw boundary map). Two
-prediction tracks: ``c_eval`` without ridge NMS; ``s_eval`` with ridge NMS
+Per image: same L0 → moment pooling → AND-gate seed → render path as inference
+(raw boundary map). Two prediction tracks: ``c_eval`` without ridge NMS; ``s_eval`` with ridge NMS
 along dominant theta. BSDS-style matching uses about 0.75% of the image
 diagonal.
 
@@ -28,7 +28,7 @@ from scipy.ndimage import binary_dilation
 
 from params import L0, L1, SEED, RENDER, TEST
 from hci.L0 import compute_l0_rgb, compute_interior
-from hci.L1 import z_from_l0_harmonics, pad_for_patch_grid, run_l1
+from hci.L1 import z_from_l0_harmonics, pad_for_patch_grid, compute_cell_moments
 from hci.renderer import (
     compute_render_features,
     render_boundary_map_torch,
@@ -49,7 +49,6 @@ EVAL_THRESHOLDS = np.linspace(0.01, 0.99, TEST.THRESHOLD_COUNT)
 
 def build_model(ckpt, device):
     m = StriateE2E(
-        K=SEED.K,
         eps=SEED.EPS,
         render_cell_hidden=RENDER.CELL_HIDDEN,
         render_pixel_hidden=RENDER.PIXEL_HIDDEN,
@@ -152,6 +151,7 @@ def run_image_inference(model, img_path, device):
     )
     bm_t = ~compute_interior(ir_p.shape[0], ir_p.shape[1], device)
     z1, z2 = z_from_l0_harmonics(s, bm_t)
+    _ = z1
 
     s_np = s.cpu().numpy()
     bm_np = bm_t.cpu().numpy()
@@ -163,19 +163,14 @@ def run_image_inference(model, img_path, device):
     del h, vld, s, h1m, h2m_lum, h2m_chr
     gc.collect()
 
-    cells = run_l1(
+    cells = compute_cell_moments(
         h2m,
-        z1,
         z2,
         L1.PATCH_SIZE,
         border_mask=bm_t,
         patch_overlap=L1.PATCH_OVERLAP,
         border_patch_max_frac=L1.BORDER_PATCH_MAX_FRAC,
         eps=L1.EPS,
-        K=L1.K,
-        bin_tuning=L1.COL_BIN_TUNING,
-        cos_power=L1.COL_COS_POWER,
-        von_mises_kappa=model.l1_von_mises_kappa,
         device=device,
         verbose=False,
     )

@@ -19,24 +19,22 @@ L0 = SimpleNamespace(
     GAMMA=1.0,
 )
 
-# ── L1: pixel K-bin cos² projection → cell grid ─────────────────────────────
+# ── L1: patch geometry + z₂ moment pooling ─────────────────────────────────
 L1 = SimpleNamespace(
     PATCH_SIZE=5,
     PATCH_OVERLAP=3,
     BORDER_PATCH_MAX_FRAC=0.2,
     EPS=1e-15,
-    K=12,
-    # "von_mises" | "cos_pow"
-    COL_BIN_TUNING="von_mises",
-    COL_VON_MISES_KAPPA=8.0,  # init for learned L1 von Mises κ (softplus in StriateE2E)
-    COL_COS_POWER=2,
 )
 
-# ── Seed: NR orientation selectivity on L1 bin masses ────────────────────────
+# ── Seed: surround-normalized AND gate on (R, E_rel) ───────────────────────
 SEED = SimpleNamespace(
-    K=12,
     EPS=1e-9,
-    ETA_Z_INIT=0.1,  # NR half-saturation on ρ̃ (learned, softplus)
+    R0_INIT=0.45,
+    A_INIT=12.0,
+    B_INIT=5.0,
+    SURROUND_RADIUS=5,
+    SURROUND_SIGMA=2.0,
 )
 
 # ── Render: §2.5 anisotropic splat + ρ̄ gate G + perp conv (see striate/renderer.py) ─

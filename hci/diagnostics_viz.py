@@ -84,21 +84,24 @@ def _interior_vmin_vmax(arr: np.ndarray, interior: np.ndarray) -> tuple[float, f
 
 
 def viz_l1_rho_masses(
-    rho_peak: np.ndarray,
-    rho_total: np.ndarray,
+    panel_a: np.ndarray,
+    panel_b: np.ndarray,
     is_border: np.ndarray,
     out_path: str,
     suptitle: str,
+    *,
+    label_a: str = r"$\rho_{\mathrm{peak}}$ (max bin)",
+    label_b: str = r"$\rho_{\mathrm{total}}$ (sum over bins)",
 ) -> None:
 
     cmap = "coolwarm"
-    a1 = apply_border_zero(rho_peak, is_border)
-    a2 = apply_border_zero(rho_total, is_border)
+    a1 = apply_border_zero(panel_a, is_border)
+    a2 = apply_border_zero(panel_b, is_border)
     interior = ~np.asarray(is_border, dtype=bool)
 
     panels = [
-        (a1, r"$\rho_{\mathrm{peak}}$ (max bin)"),
-        (a2, r"$\rho_{\mathrm{total}}$ (sum over bins)"),
+        (a1, label_a),
+        (a2, label_b),
     ]
 
     fig, axes = plt.subplots(2, 1, figsize=(5.5, 5.2 * 2), facecolor=VIZ.BG)
@@ -530,23 +533,20 @@ def viz_infer_l0_pinwheel(
 
 
 def viz_infer_l1_rho_masses(
-    rho_peak: np.ndarray,
+    coherence_R: np.ndarray,
     rho_total: np.ndarray,
     is_border: np.ndarray,
     out_path: str,
 ) -> None:
 
     viz_l1_rho_masses(
-        rho_peak,
+        coherence_R,
         rho_total,
         is_border,
         out_path,
-        suptitle=(
-            r"L1 bin masses (seed: "
-            r"$\hat\rho=\rho_{\mathrm{bins}}/(\rho_{\mathrm{total}}+\varepsilon)$; "
-            r"$\tilde\rho=\hat\rho-\min_k\hat\rho^{(k)}$; "
-            r"$\rho_{\mathrm{seed}}=\tilde\rho^2/(\tilde\rho^2+\eta_z^2)$)"
-        ),
+        suptitle=r"L1 z₂ moments (R and $\rho_{\mathrm{total}}$ per cell)",
+        label_a=r"$R = |Z_2| / \sum|z_2|$",
+        label_b=r"$\rho_{\mathrm{total}} = \sum|z_2|$",
     )
 
 
@@ -782,7 +782,7 @@ def _cell_gt_labels(
 
 def viz_infer_cell_joint(
     coherence_R: np.ndarray,
-    rho_total: np.ndarray,
+    E_rel: np.ndarray,
     is_border: np.ndarray,
     cx: np.ndarray,
     cy: np.ndarray,
@@ -796,9 +796,9 @@ def viz_infer_cell_joint(
     r0_ref: float = 0.45,
     bins_2d: int = 48,
 ) -> None:
-    """Joint (R, ρ_total) with marginals; scatter colored by GT η± band when GT given."""
+    """Joint (R, E_rel) with marginals; scatter colored by GT η± band when GT given."""
     r_map = apply_border_zero(np.asarray(coherence_R, dtype=np.float64), is_border)
-    e_map = apply_border_zero(np.asarray(rho_total, dtype=np.float64), is_border)
+    e_map = apply_border_zero(np.asarray(E_rel, dtype=np.float64), is_border)
     ib = np.asarray(is_border, dtype=bool)
     if ib.ndim == 1 and r_map.ndim == 2:
         ib = ib.reshape(r_map.shape)
@@ -818,6 +818,7 @@ def viz_infer_cell_joint(
 
     e_max = max(float(np.percentile(e_flat, 99)) if n_cells else 1.0, VIZ.EPS)
     e_hi = e_max * 1.05
+    e_lo = max(float(np.percentile(e_flat, 1)) if n_cells else 0.0, 1e-3)
 
     fig = plt.figure(figsize=(8.8, 7.6), facecolor=VIZ.BG)
     gs = fig.add_gridspec(
@@ -833,22 +834,11 @@ def viz_infer_cell_joint(
     if n_cells > 0:
         ax_joint.hist2d(
             r_flat, e_flat, bins=bins_2d,
-            range=[[0.0, 1.0], [0.0, e_hi]],
+            range=[[0.0, 1.0], [e_lo, e_hi]],
             cmap="Greys", alpha=0.35, norm=mcolors.LogNorm(vmin=1.0),
         )
 
-    # |Z₂| = R · ρ_total level sets (plain product — sweeps into high-energy / low-R)
-    if n_cells > 0:
-        r_line = np.linspace(0.05, 1.0, 200)
-        z2_levels = np.percentile(r_flat * e_flat, [50, 75, 90])
-        for z2, ls in zip(z2_levels, ("--", ":", "-.")):
-            if z2 <= 0:
-                continue
-            ax_joint.plot(
-                r_line, z2 / np.clip(r_line, 0.08, None),
-                color="#aa66cc", lw=0.9, ls=ls, alpha=0.55,
-            )
-
+    ax_joint.axhline(1.0, color="#aa66cc", lw=0.9, ls=":", alpha=0.55)
     ax_joint.axvline(r0_ref, color="#88aaff", lw=1.0, ls="--", alpha=0.7)
 
     if has_gt and pos is not None:
@@ -882,9 +872,13 @@ def viz_infer_cell_joint(
         )
 
     ax_joint.set_xlim(0.0, 1.0)
-    ax_joint.set_ylim(0.0, e_hi)
+    ax_joint.set_ylim(e_lo, e_hi)
     ax_joint.set_xlabel(r"$R = |Z_2| / \sum|z_2|$", fontsize=9, color=VIZ.FG)
-    ax_joint.set_ylabel(r"$\rho_{\mathrm{total}}$", fontsize=9, color=VIZ.FG)
+    ax_joint.set_ylabel(
+        r"$E_{\mathrm{rel}} = \rho_{\mathrm{total}} / \langle\rho_{\mathrm{total}}\rangle_{\mathcal{N}}$",
+        fontsize=9,
+        color=VIZ.FG,
+    )
     ax_joint.tick_params(colors=VIZ.FG, labelsize=7)
     for s in ax_joint.spines.values():
         s.set_color("#333")
@@ -897,10 +891,10 @@ def viz_infer_cell_joint(
         s.set_color("#333")
 
     ax_right.hist(
-        e_flat, bins=bins_2d, range=(0.0, e_hi),
+        e_flat, bins=bins_2d, range=(e_lo, e_hi),
         orientation="horizontal", color=VIZ.ACCENT, alpha=0.85,
     )
-    ax_right.set_ylim(0.0, e_hi)
+    ax_right.set_ylim(e_lo, e_hi)
     ax_right.tick_params(labelleft=False, colors=VIZ.FG, labelsize=7)
     ax_right.set_xlabel("count", fontsize=8, color=VIZ.FG)
     for s in ax_right.spines.values():
@@ -912,9 +906,9 @@ def viz_infer_cell_joint(
         else " — pass --gt_dir for GT-colored bands"
     )
     fig.suptitle(
-        r"Joint $(R,\,\rho_{\mathrm{total}})$ per interior cell"
+        r"Joint $(R,\,E_{\mathrm{rel}})$ per interior cell"
         + gt_note
-        + r"  (dashed purple: $|Z_2|=R\cdot\rho_{\mathrm{total}}$ levels)",
+        + r"  (dashed blue: $R_0$; dotted purple: $E_{\mathrm{rel}}=1$)",
         fontsize=10, color=VIZ.FG, fontfamily="monospace",
     )
     fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)

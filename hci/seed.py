@@ -1,14 +1,12 @@
-r"""Cell-grid seed — NR orientation selectivity from L1 bin masses.
+r"""Cell-grid AND gate — surround-normalized coherence × energy.
 
-Per cell, from L1 ``rho_bins``:
-  ρ̂^(k) = ρ_bins^(k) / (ρ_total + ε)
-  ρ̃^(k) = ρ̂^(k) − min_j ρ̂^(j)
-  ρ_seed^(k) = ρ̃^(k)² / (ρ̃^(k)² + η_z²)
+From L1 moments (R, ρ_total):
+  E_rel = ρ_total / (ε + ⟨ρ_total⟩_𝒩)   (Gaussian surround, center-excluded)
+  g_R = σ(a(R − R₀)),  g_E = σ(b log E_rel)
+  ρ(c) = g_R · g_E · ok(c)
 
-Scalar export to renderer: ρ(c) = max_k ρ_seed^(k)(c).  Orientation θ comes
-from L1 (½ arg Σ z₂); this stage does not refine θ.
-
-Learned: η_z only (softplus, init 0.1).
+Learned: R₀ (init 0.45), a, b (softplus, init 12 / 5).
+θ passes through from L1 unchanged.
 """
 
 from __future__ import annotations
@@ -29,46 +27,93 @@ def _inv_softplus(x: float) -> float:
     return math.log(math.expm1(x))
 
 
-def rho_seed_from_bins(
-    rho_bins: torch.Tensor,
-    eta_z: float | torch.Tensor,
-    is_border: torch.Tensor,
-    eps: float,
+def _surround_kernel(
+    radius: int,
+    sigma: float,
+    device: torch.device,
+    dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Total-normalize, min-subtract, NR squash → (N, K) ρ_seed."""
-    if is_border.dim() > 1:
-        is_border = is_border.reshape(-1)
-    rho_total = rho_bins.sum(dim=-1, keepdim=True)
-    rho_hat = rho_bins / (rho_total + eps)
-    rho_tilde = rho_hat - rho_hat.min(dim=-1, keepdim=True).values
-    rho_tilde_sq = rho_tilde * rho_tilde
-    eta_z_sq = eta_z * eta_z
-    rho_seed = rho_tilde_sq / (rho_tilde_sq + eta_z_sq)
-    mask = is_border.unsqueeze(-1) if is_border.dim() == 1 else is_border.unsqueeze(-1)
-    return torch.where(mask, torch.zeros_like(rho_seed), rho_seed)
+    size = 2 * int(radius) + 1
+    coords = torch.arange(size, device=device, dtype=dtype) - float(radius)
+    yy, xx = torch.meshgrid(coords, coords, indexing="ij")
+    g = torch.exp(-(xx * xx + yy * yy) / (2.0 * float(sigma) ** 2))
+    g[int(radius), int(radius)] = 0.0
+    g = g / g.sum().clamp_min(1e-8)
+    return g
 
 
-class CellSeed(nn.Module):
-    """L1 bin masses → scalar ρ for renderer (max over NR seed bins)."""
+def surround_mean_rho_total(
+    rho_total: torch.Tensor,
+    nH: int,
+    nW: int,
+    *,
+    radius: int = SEED.SURROUND_RADIUS,
+    sigma: float = SEED.SURROUND_SIGMA,
+) -> torch.Tensor:
+    """⟨ρ_total⟩_𝒩 via center-excluded Gaussian conv (reflect-padded)."""
+    dev, dtype = rho_total.device, rho_total.dtype
+    grid = rho_total.reshape(nH, nW).to(dtype=dtype)
+    k = _surround_kernel(radius, sigma, dev, dtype).unsqueeze(0).unsqueeze(0)
+    pad = int(radius)
+    x = grid.unsqueeze(0).unsqueeze(0)
+    x_pad = Fn.pad(x, (pad, pad, pad, pad), mode="reflect")
+    return Fn.conv2d(x_pad, k).squeeze(0).squeeze(0)
+
+
+def relative_energy(
+    rho_total: torch.Tensor,
+    nH: int,
+    nW: int,
+    eps: float,
+    *,
+    radius: int = SEED.SURROUND_RADIUS,
+    sigma: float = SEED.SURROUND_SIGMA,
+) -> torch.Tensor:
+    """E_rel(c) = ρ_total / (ε + ⟨ρ_total⟩_𝒩), shape (nH, nW)."""
+    nb = surround_mean_rho_total(
+        rho_total, nH, nW, radius=radius, sigma=sigma,
+    )
+    grid = rho_total.reshape(nH, nW)
+    return grid / (float(eps) + nb)
+
+
+class AndGateSeed(nn.Module):
+    """Surround-normalized AND gate on (R, E_rel) → scalar ρ for renderer."""
 
     def __init__(
         self,
-        K: int = SEED.K,
         eps: float = SEED.EPS,
-        eta_z_init: float = SEED.ETA_Z_INIT,
+        R0_init: float = SEED.R0_INIT,
+        a_init: float = SEED.A_INIT,
+        b_init: float = SEED.B_INIT,
+        surround_radius: int = SEED.SURROUND_RADIUS,
+        surround_sigma: float = SEED.SURROUND_SIGMA,
         **kw,
     ):
         super().__init__()
         _ = kw
-        self.K = int(K)
         self.eps = float(eps)
-        self._eta_z_raw = nn.Parameter(
-            torch.tensor(_inv_softplus(float(eta_z_init)), dtype=torch.float32)
+        self.surround_radius = int(surround_radius)
+        self.surround_sigma = float(surround_sigma)
+        self._R0 = nn.Parameter(torch.tensor(float(R0_init), dtype=torch.float32))
+        self._a_raw = nn.Parameter(
+            torch.tensor(_inv_softplus(float(a_init)), dtype=torch.float32)
+        )
+        self._b_raw = nn.Parameter(
+            torch.tensor(_inv_softplus(float(b_init)), dtype=torch.float32)
         )
 
     @property
-    def eta_z(self) -> torch.Tensor:
-        return Fn.softplus(self._eta_z_raw)
+    def R0(self) -> torch.Tensor:
+        return self._R0.view(())
+
+    @property
+    def a(self) -> torch.Tensor:
+        return Fn.softplus(self._a_raw).view(())
+
+    @property
+    def b(self) -> torch.Tensor:
+        return Fn.softplus(self._b_raw).view(())
 
     def forward(
         self,
@@ -78,21 +123,28 @@ class CellSeed(nn.Module):
     ):
         _ = kw
         device = next(self.parameters()).device
-        nH, nW = cells_flat["nH"], cells_flat["nW"]
+        nH, nW = int(cells_flat["nH"]), int(cells_flat["nW"])
         N = nH * nW
-        K = self.K
 
-        rho_bins_in = cells_flat["rho_bins"].to(device)
-        is_border = cells_flat["is_border"].to(device)
+        R_in = cells_flat["coherence_R"].to(device).reshape(N)
+        rho_t = cells_flat["rho_total"].to(device).reshape(N)
+        is_border = cells_flat["is_border"].to(device).reshape(N).bool()
 
-        rho_seed = rho_seed_from_bins(
-            rho_bins_in.reshape(N, K), self.eta_z, is_border, self.eps,
-        )
-        ok_map = (~is_border).reshape(nH, nW)
-        interior = ok_map.to(dtype=rho_seed.dtype)
-        rho_out_flat = rho_seed.max(dim=-1).values * interior.reshape(N)
+        E_rel = relative_energy(
+            rho_t, nH, nW, self.eps,
+            radius=self.surround_radius,
+            sigma=self.surround_sigma,
+        ).reshape(N)
+
+        g_R = torch.sigmoid(self.a * (R_in - self.R0))
+        g_E = torch.sigmoid(self.b * torch.log(E_rel.clamp_min(1e-8)))
+        ok = (~is_border).to(dtype=g_R.dtype)
+        rho_out_flat = g_R * g_E * ok
 
         cf_out = dict(cells_flat)
+        cf_out["E_rel"] = E_rel.reshape(nH, nW)
+        cf_out["g_R"] = (g_R * ok).reshape(nH, nW)
+        cf_out["g_E"] = (g_E * ok).reshape(nH, nW)
 
         branch = torch.zeros(N, device=device, dtype=torch.long)
         z1 = torch.zeros(N, 1, device=device, dtype=rho_out_flat.dtype)
@@ -107,8 +159,12 @@ class CellSeed(nn.Module):
                     "mid_band_frac": float(
                         ((ra > 0.3) & (ra < 0.7)).float().mean().detach()
                     ) if ra.numel() else 0.0,
-                    "n_interior": int(ok_map.sum().item()),
+                    "n_interior": int(ok.sum().item()),
                 }],
             }
 
         return rho_out_flat, branch, rho_out_flat, z1, z1, cf_out, diags
+
+
+# Legacy alias
+CellSeed = AndGateSeed

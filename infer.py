@@ -1,6 +1,6 @@
 r"""infer.py — STRIATE single-image inference.
 
-Pipeline: L0 → L1 K-bin projection → seed NR (η_z) → splat boundary map
+Pipeline: L0 → z₂ moment pooling → AND-gate seed → splat boundary map
 ($\hat B = \bar\rho \cdot \mathrm{gate}$), optional ridge NMS along θ,
 then thresholded edge PNG (default τ = 0.5).
 """
@@ -18,7 +18,8 @@ from PIL import Image
 
 from params import L0, L1, SEED, RENDER, INFER
 from hci.L0 import compute_l0_rgb, compute_interior
-from hci.L1 import z_from_l0_harmonics, pad_for_patch_grid, run_l1
+from hci.L1 import z_from_l0_harmonics, pad_for_patch_grid, compute_cell_moments
+from hci.seed import relative_energy
 from hci.renderer import (
     compute_render_features,
     render_boundary_map_torch,
@@ -70,7 +71,6 @@ def _resolve_gt_path(gt_dir: str, stem: str, gt_format: str | None) -> tuple[str
 
 def build_model(ckpt, device):
     m = StriateE2E(
-        K=SEED.K,
         eps=SEED.EPS,
         render_cell_hidden=RENDER.CELL_HIDDEN,
         render_pixel_hidden=RENDER.PIXEL_HIDDEN,
@@ -87,7 +87,7 @@ def _sync(device):
         torch.cuda.synchronize()
 
 
-def run_l0_l1(img_path, device, *, von_mises_kappa: float | None = None):
+def run_l0_l1(img_path, device):
     timings = {}
 
     _sync(device)
@@ -110,6 +110,7 @@ def run_l0_l1(img_path, device, *, von_mises_kappa: float | None = None):
 
     bm_t = ~compute_interior(ir_p.shape[0], ir_p.shape[1], device)
     z1, z2 = z_from_l0_harmonics(s, bm_t)
+    _ = z1
 
     s_np = s.cpu().numpy()
     bm_np = bm_t.cpu().numpy()
@@ -124,21 +125,14 @@ def run_l0_l1(img_path, device, *, von_mises_kappa: float | None = None):
     timings["l0"] = time.perf_counter() - t0
 
     t1 = time.perf_counter()
-    cells = run_l1(
+    cells = compute_cell_moments(
         h2m,
-        z1,
         z2,
         L1.PATCH_SIZE,
         border_mask=bm_t,
         patch_overlap=L1.PATCH_OVERLAP,
         border_patch_max_frac=L1.BORDER_PATCH_MAX_FRAC,
         eps=L1.EPS,
-        K=L1.K,
-        bin_tuning=L1.COL_BIN_TUNING,
-        cos_power=L1.COL_COS_POWER,
-        von_mises_kappa=(
-            L1.COL_VON_MISES_KAPPA if von_mises_kappa is None else von_mises_kappa
-        ),
         device=device,
         verbose=False,
     )
@@ -158,10 +152,14 @@ def run_l0_l1(img_path, device, *, von_mises_kappa: float | None = None):
 
     cells_flat = build_cells_flat(cells)
 
-    rho_peak_grid = cells["rho_peak"].astype(np.float64, copy=True)
-    z0_grid = cells["z0"].astype(np.float64, copy=True)
+    rho_total_grid = cells["rho_total"].astype(np.float64, copy=True)
     coherence_R_grid = cells["coherence_R"].astype(np.float64, copy=True)
-    delta_grid = cells["delta"].astype(np.float64, copy=True)
+    E_rel_grid = relative_energy(
+        torch.from_numpy(rho_total_grid.astype(np.float32)),
+        nH,
+        nW,
+        SEED.EPS,
+    ).numpy().astype(np.float64)
     cx_grid = cells["cx"].astype(np.float64, copy=True)
     cy_grid = cells["cy"].astype(np.float64, copy=True)
     is_border_grid = cells["is_border"].copy()
@@ -181,10 +179,9 @@ def run_l0_l1(img_path, device, *, von_mises_kappa: float | None = None):
         "W0": W0,
         "nH": nH,
         "nW": nW,
-        "rho_peak_grid": rho_peak_grid,
-        "z0_grid": z0_grid,
+        "rho_total_grid": rho_total_grid,
         "coherence_R_grid": coherence_R_grid,
-        "delta_grid": delta_grid,
+        "E_rel_grid": E_rel_grid,
         "cx_grid": cx_grid,
         "cy_grid": cy_grid,
         "is_border_grid": is_border_grid,
@@ -341,7 +338,7 @@ def main():
         "-d",
         "--diagnostics",
         action="store_true",
-        help="Save additional diagnostics: base, l0_pinwheel, l1_rho_masses, "
+        help="Save additional diagnostics: base, l0_pinwheel, l1_moments, "
         "cell_rho, cell_coherence, cell_joint, render_softmap, render_theta_bins, overlay.",
     )
     ap.add_argument(
@@ -374,11 +371,7 @@ def main():
         print()
 
     img_path = os.path.join(args.input_dir, args.image)
-    prep, prep_t = run_l0_l1(
-        img_path,
-        device,
-        von_mises_kappa=float(model.l1_von_mises_kappa.detach().cpu()),
-    )
+    prep, prep_t = run_l0_l1(img_path, device)
 
     collect_diags = args.verbose or args.diagnostics
     (bmap, theta_map, rho_post, branch_grid, is_border, diags, _, fwd_t) = (
@@ -416,9 +409,9 @@ def main():
         viz_infer_l0_pinwheel(prep["h_np"], prep["img_pinwheel"], p_pin)
         saved_files.append(p_pin)
 
-        p_rho = os.path.join(od, f"{stem}_l1_rho_masses.png")
+        p_rho = os.path.join(od, f"{stem}_l1_moments.png")
         viz_infer_l1_rho_masses(
-            prep["rho_peak_grid"], prep["z0_grid"], is_border, p_rho,
+            prep["coherence_R_grid"], prep["rho_total_grid"], is_border, p_rho,
         )
         saved_files.append(p_rho)
 
@@ -431,7 +424,6 @@ def main():
             prep["coherence_R_grid"],
             is_border,
             p_coh,
-            delta=prep["delta_grid"],
         )
         saved_files.append(p_coh)
 
@@ -448,7 +440,7 @@ def main():
         p_joint = os.path.join(od, f"{stem}_joint.png")
         viz_infer_cell_joint(
             prep["coherence_R_grid"],
-            prep["z0_grid"],
+            prep["E_rel_grid"],
             is_border,
             prep["cx_grid"],
             prep["cy_grid"],
