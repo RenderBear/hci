@@ -232,7 +232,12 @@ def run_l1(
     Z1_sum = z1_patches.sum(dim=-1)
     Z2_sum = z2_patches.sum(dim=-1)
     z1_abs_sum = z1_patches.abs().sum(dim=-1).to(torch.float32)
+    z2_abs_sum = z2_patches.abs().sum(dim=-1).to(torch.float32)
     z1_bar = Z1_sum / n_pix_patch_f
+
+    coherence_R_flat = (
+        Z2_sum.abs().to(torch.float32) / (z2_abs_sum + eps)
+    ).clamp(0.0, 1.0).reshape(-1)
 
     theta_flat = (0.5 * torch.angle(Z2_sum)).to(torch.float32).reshape(-1)
 
@@ -258,6 +263,9 @@ def run_l1(
     theta_flat = torch.where(is_border_flat, torch.zeros_like(theta_flat), theta_flat)
     q_flat = torch.where(is_border_flat, torch.zeros_like(q_flat), q_flat)
     delta_flat = torch.where(is_border_flat, torch.zeros_like(delta_flat), delta_flat)
+    coherence_R_flat = torch.where(
+        is_border_flat, torch.zeros_like(coherence_R_flat), coherence_R_flat,
+    )
     rho_peak_flat = torch.where(is_border_flat, torch.zeros_like(rho_peak_flat), rho_peak_flat)
     rho_total_flat = torch.where(is_border_flat, torch.zeros_like(rho_total_flat), rho_total_flat)
     ib_grid = is_border_flat.reshape(nH, nW)
@@ -296,6 +304,7 @@ def run_l1(
         print(f"  rho_peak: mean={rp.mean():.2f} max={rp.max():.2f}")
         print(f"  rho_total: mean={rt.mean():.2f} max={rt.max():.2f}")
         print(f"  delta (peak/total): mean={float(delta_flat.mean()):.3f}")
+        print(f"  R (|Z2|/sum|z2|): mean={float(coherence_R_flat.mean()):.3f}")
         print(f"  |q|: mean={float(q_flat.abs().mean()):.3f}")
         print(f"  kappa: mean={float(kappa_flat.mean()):.3f}")
 
@@ -314,6 +323,7 @@ def run_l1(
             "theta": theta_flat.reshape(nH, nW),
             "q": q_flat.reshape(nH, nW),
             "delta": delta_flat.reshape(nH, nW),
+            "coherence_R": coherence_R_flat.reshape(nH, nW),
             "kappa": kappa_flat.reshape(nH, nW),
             "rho_peak": rho_peak_flat.reshape(nH, nW),
             "rho_bins": rho_bins,
@@ -342,6 +352,7 @@ def run_l1(
         "theta": _to_np(theta_flat.reshape(nH, nW)),
         "q": _to_np(q_flat.reshape(nH, nW)),
         "delta": _to_np(delta_flat.reshape(nH, nW)),
+        "coherence_R": _to_np(coherence_R_flat.reshape(nH, nW)),
         "kappa": _to_np(kappa_flat.reshape(nH, nW)),
         "rho_peak": _to_np(rho_peak_flat.reshape(nH, nW)),
         "rho_bins": _to_np(rho_bins),

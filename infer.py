@@ -30,6 +30,8 @@ from hci.diagnostics_viz import (
     viz_infer_l0_pinwheel,
     viz_infer_l1_rho_masses,
     viz_infer_cell_rho,
+    viz_infer_cell_coherence,
+    viz_infer_cell_joint,
     save_rho_png,
     viz_infer_shape_readout,
     viz_infer_base_edges_overlay,
@@ -44,7 +46,26 @@ from train import (
     format_renderer_param_lines,
     report_checkpoint_compatibility,
     upgrade_model_state_dict,
+    load_png_gt,
+    load_bsds_gt,
+    _find_gt_path_png,
 )
+
+
+def _load_infer_gt(gt_path: str, gt_format: str, H0: int, W0: int) -> np.ndarray:
+    if gt_format == "mat":
+        gt = load_bsds_gt(gt_path)
+    else:
+        gt = load_png_gt(gt_path)
+    return np.asarray(gt[:H0, :W0], dtype=np.float64)
+
+
+def _resolve_gt_path(gt_dir: str, stem: str, gt_format: str | None) -> tuple[str | None, str]:
+    if gt_format == "mat":
+        p = os.path.join(gt_dir, stem + ".mat")
+        return (p if os.path.isfile(p) else None), "mat"
+    p = _find_gt_path_png(gt_dir, stem)
+    return p, "png"
 
 
 def build_model(ckpt, device):
@@ -139,6 +160,10 @@ def run_l0_l1(img_path, device, *, von_mises_kappa: float | None = None):
 
     rho_peak_grid = cells["rho_peak"].astype(np.float64, copy=True)
     z0_grid = cells["z0"].astype(np.float64, copy=True)
+    coherence_R_grid = cells["coherence_R"].astype(np.float64, copy=True)
+    delta_grid = cells["delta"].astype(np.float64, copy=True)
+    cx_grid = cells["cx"].astype(np.float64, copy=True)
+    cy_grid = cells["cy"].astype(np.float64, copy=True)
     is_border_grid = cells["is_border"].copy()
     Hp, Wp = ir_p.shape[:2]
     del cells, ir_p
@@ -158,6 +183,10 @@ def run_l0_l1(img_path, device, *, von_mises_kappa: float | None = None):
         "nW": nW,
         "rho_peak_grid": rho_peak_grid,
         "z0_grid": z0_grid,
+        "coherence_R_grid": coherence_R_grid,
+        "delta_grid": delta_grid,
+        "cx_grid": cx_grid,
+        "cy_grid": cy_grid,
         "is_border_grid": is_border_grid,
         "h_np": h_np,
         "img_pinwheel": img_pinwheel,
@@ -313,7 +342,18 @@ def main():
         "--diagnostics",
         action="store_true",
         help="Save additional diagnostics: base, l0_pinwheel, l1_rho_masses, "
-        "cell_rho, render_softmap, render_theta_bins, overlay.",
+        "cell_rho, cell_coherence, cell_joint, render_softmap, render_theta_bins, overlay.",
+    )
+    ap.add_argument(
+        "--gt_dir",
+        default=None,
+        help="Optional GT directory (same stem as --image) for cell_joint η± coloring.",
+    )
+    ap.add_argument(
+        "--gt_format",
+        default=None,
+        choices=("png", "mat"),
+        help="GT file format when --gt_dir is set (default: png, or .mat if present).",
     )
     ap.add_argument("--device", default=None)
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -385,6 +425,39 @@ def main():
         p_cell = os.path.join(od, f"{stem}_cell_rho.png")
         viz_infer_cell_rho(rho_post, is_border, p_cell)
         saved_files.append(p_cell)
+
+        p_coh = os.path.join(od, f"{stem}_cell_coherence.png")
+        viz_infer_cell_coherence(
+            prep["coherence_R_grid"],
+            is_border,
+            p_coh,
+            delta=prep["delta_grid"],
+        )
+        saved_files.append(p_coh)
+
+        gt_arr: np.ndarray | None = None
+        if args.gt_dir:
+            gt_fmt = args.gt_format
+            gt_path, fmt = _resolve_gt_path(args.gt_dir, stem, gt_fmt)
+            if gt_path is None:
+                print(f"  warning: no GT for stem '{stem}' under {args.gt_dir}")
+            else:
+                use_fmt = gt_fmt or fmt
+                gt_arr = _load_infer_gt(gt_path, use_fmt, prep["H0"], prep["W0"])
+
+        p_joint = os.path.join(od, f"{stem}_joint.png")
+        viz_infer_cell_joint(
+            prep["coherence_R_grid"],
+            prep["z0_grid"],
+            is_border,
+            prep["cx_grid"],
+            prep["cy_grid"],
+            p_joint,
+            gt=gt_arr,
+            H0=prep["H0"],
+            W0=prep["W0"],
+        )
+        saved_files.append(p_joint)
 
     threshold = float(args.threshold)
 

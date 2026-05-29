@@ -643,6 +643,284 @@ def viz_infer_cell_rho(
     plt.close(fig)
 
 
+def viz_infer_cell_coherence(
+    coherence_R: np.ndarray,
+    is_border: np.ndarray,
+    out_path: str,
+    *,
+    delta: np.ndarray | None = None,
+    n_bins: int = 50,
+) -> None:
+    """Patch orientation coherence R: map, interior histogram, and CDF."""
+    r_map = apply_border_zero(np.asarray(coherence_R, dtype=np.float64), is_border)
+    ib = np.asarray(is_border, dtype=bool)
+    if ib.ndim == 1 and r_map.ndim == 2:
+        ib = ib.reshape(r_map.shape)
+    flat = r_map.ravel()[~ib.ravel()]
+    n_cells = int(flat.size)
+
+    fig = plt.figure(figsize=(14.0, 4.6), facecolor=VIZ.BG)
+    gs = fig.add_gridspec(1, 3, width_ratios=[2.4, 1.0, 1.0], wspace=0.32)
+    ax_m = fig.add_subplot(gs[0, 0])
+    ax_h = fig.add_subplot(gs[0, 1])
+    ax_c = fig.add_subplot(gs[0, 2])
+
+    ax_m.set_facecolor(VIZ.PANEL_BG)
+    im = ax_m.imshow(
+        r_map,
+        cmap="viridis",
+        vmin=0.0,
+        vmax=1.0,
+        interpolation="nearest",
+    )
+    ax_m.set_title(
+        rf"$R$ map  interior mean={float(flat.mean()) if n_cells else 0:.3g}",
+        fontsize=9,
+        color=VIZ.FG,
+        fontfamily="monospace",
+    )
+    ax_m.axis("off")
+    fig.colorbar(im, ax=ax_m, fraction=0.046, pad=0.02)
+
+    ax_h.set_facecolor(VIZ.PANEL_BG)
+    ax_h.hist(
+        flat,
+        bins=n_bins,
+        range=(0.0, 1.0),
+        color=VIZ.ACCENT,
+        edgecolor=VIZ.PANEL_BG,
+        linewidth=0.3,
+    )
+    ax_h.set_xlim(0.0, 1.0)
+    ax_h.set_title(
+        rf"interior histogram  n={n_cells}",
+        fontsize=9,
+        color=VIZ.FG,
+        fontfamily="monospace",
+    )
+    ax_h.set_xlabel("R", fontsize=8, color=VIZ.FG)
+    ax_h.set_ylabel("count", fontsize=8, color=VIZ.FG)
+    ax_h.tick_params(colors=VIZ.FG, labelsize=7)
+    for s in ax_h.spines.values():
+        s.set_color(VIZ.ACCENT)
+
+    ax_c.set_facecolor(VIZ.PANEL_BG)
+    if n_cells > 0:
+        xs = np.sort(flat.astype(np.float64, copy=False))
+        ys = np.arange(1, n_cells + 1, dtype=np.float64)
+        ax_c.plot(xs, ys, color=VIZ.FG, linewidth=1.2)
+    ax_c.set_xlim(0.0, 1.0)
+    ax_c.set_ylim(0.0, float(max(n_cells, 1)))
+    ax_c.set_title(
+        "empirical CDF",
+        fontsize=9,
+        color=VIZ.FG,
+        fontfamily="monospace",
+    )
+    ax_c.set_xlabel("R", fontsize=8, color=VIZ.FG)
+    ax_c.set_ylabel("cumulative count", fontsize=8, color=VIZ.FG)
+    ax_c.grid(True, alpha=0.25, color=VIZ.ACCENT)
+    ax_c.tick_params(colors=VIZ.FG, labelsize=7)
+    for s in ax_c.spines.values():
+        s.set_color(VIZ.ACCENT)
+
+    delta_note = ""
+    if delta is not None:
+        d = apply_border_zero(np.asarray(delta, dtype=np.float64), is_border)
+        d_flat = d.ravel()[~ib.ravel()]
+        if d_flat.size and flat.size:
+            corr = float(np.corrcoef(flat, d_flat)[0, 1])
+            delta_note = rf"  ($\delta$ corr={corr:.3f})"
+
+    fig.suptitle(
+        r"Patch orientation coherence "
+        r"$R = |Z_2| / (\sum_p |z_2(p)| + \varepsilon)$, "
+        r"$Z_2 = \sum_p z_2(p)$"
+        + delta_note,
+        fontsize=10,
+        color=VIZ.FG,
+        fontfamily="monospace",
+    )
+    fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
+    plt.close(fig)
+
+
+def _cell_gt_labels(
+    cx: np.ndarray,
+    cy: np.ndarray,
+    is_border: np.ndarray,
+    gt: np.ndarray,
+    *,
+    H0: int,
+    W0: int,
+    eta_pos: float = 0.5,
+    eta_neg: float = 0.5,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-interior-cell η± labels from GT sampled at rounded anchors (flat order)."""
+    ib2 = np.asarray(is_border, dtype=bool)
+    if ib2.ndim == 1:
+        side = int(round(np.sqrt(ib2.size)))
+        if side * side == ib2.size:
+            ib2 = ib2.reshape(side, side)
+        else:
+            raise ValueError("is_border must be 2-D or a square flattening")
+    nH, nW = ib2.shape
+    cx_a = np.broadcast_to(np.asarray(cx, dtype=np.float64), (nH, nW)).reshape(-1)
+    cy_a = np.broadcast_to(np.asarray(cy, dtype=np.float64), (nH, nW)).reshape(-1)
+    interior_flat = ~ib2.reshape(-1)
+    cy_i = np.rint(cy_a[interior_flat]).astype(np.int64)
+    cx_i = np.rint(cx_a[interior_flat]).astype(np.int64)
+    cy_i = np.clip(cy_i, 0, int(H0) - 1)
+    cx_i = np.clip(cx_i, 0, int(W0) - 1)
+    gt_c = np.asarray(gt, dtype=np.float64)[:H0, :W0]
+    gt_v = gt_c[cy_i, cx_i]
+    pos = gt_v >= float(eta_pos)
+    neg = gt_v < float(eta_neg)
+    ignore = ~(pos | neg)
+    return pos, neg, ignore
+
+
+def viz_infer_cell_joint(
+    coherence_R: np.ndarray,
+    rho_total: np.ndarray,
+    is_border: np.ndarray,
+    cx: np.ndarray,
+    cy: np.ndarray,
+    out_path: str,
+    *,
+    gt: np.ndarray | None = None,
+    H0: int | None = None,
+    W0: int | None = None,
+    eta_pos: float = 0.5,
+    eta_neg: float = 0.5,
+    r0_ref: float = 0.45,
+    bins_2d: int = 48,
+) -> None:
+    """Joint (R, ρ_total) with marginals; scatter colored by GT η± band when GT given."""
+    r_map = apply_border_zero(np.asarray(coherence_R, dtype=np.float64), is_border)
+    e_map = apply_border_zero(np.asarray(rho_total, dtype=np.float64), is_border)
+    ib = np.asarray(is_border, dtype=bool)
+    if ib.ndim == 1 and r_map.ndim == 2:
+        ib = ib.reshape(r_map.shape)
+    interior = ~ib
+    r_flat = r_map[interior]
+    e_flat = e_map[interior]
+    n_cells = int(r_flat.size)
+
+    has_gt = gt is not None and H0 is not None and W0 is not None
+    if has_gt:
+        pos, neg, ignore = _cell_gt_labels(
+            cx, cy, is_border, gt, H0=int(H0), W0=int(W0),
+            eta_pos=eta_pos, eta_neg=eta_neg,
+        )
+    else:
+        pos = neg = ignore = None
+
+    e_max = max(float(np.percentile(e_flat, 99)) if n_cells else 1.0, VIZ.EPS)
+    e_hi = e_max * 1.05
+
+    fig = plt.figure(figsize=(8.8, 7.6), facecolor=VIZ.BG)
+    gs = fig.add_gridspec(
+        2, 2, width_ratios=[4.0, 1.1], height_ratios=[1.1, 4.0],
+        hspace=0.06, wspace=0.06,
+    )
+    ax_top = fig.add_subplot(gs[0, 0])
+    ax_joint = fig.add_subplot(gs[1, 0])
+    ax_right = fig.add_subplot(gs[1, 1])
+    for ax in (ax_top, ax_joint, ax_right):
+        ax.set_facecolor(VIZ.PANEL_BG)
+
+    if n_cells > 0:
+        ax_joint.hist2d(
+            r_flat, e_flat, bins=bins_2d,
+            range=[[0.0, 1.0], [0.0, e_hi]],
+            cmap="Greys", alpha=0.35, norm=mcolors.LogNorm(vmin=1.0),
+        )
+
+    # |Z₂| = R · ρ_total level sets (plain product — sweeps into high-energy / low-R)
+    if n_cells > 0:
+        r_line = np.linspace(0.05, 1.0, 200)
+        z2_levels = np.percentile(r_flat * e_flat, [50, 75, 90])
+        for z2, ls in zip(z2_levels, ("--", ":", "-.")):
+            if z2 <= 0:
+                continue
+            ax_joint.plot(
+                r_line, z2 / np.clip(r_line, 0.08, None),
+                color="#aa66cc", lw=0.9, ls=ls, alpha=0.55,
+            )
+
+    ax_joint.axvline(r0_ref, color="#88aaff", lw=1.0, ls="--", alpha=0.7)
+
+    if has_gt and pos is not None:
+        styles = (
+            (pos, "#44dd88", rf"edge (GT $\geq${eta_pos:g})  n={int(pos.sum())}"),
+            (neg, "#ff8866", rf"non-edge (GT $<${eta_neg:g})  n={int(neg.sum())}"),
+        )
+        if ignore is not None and ignore.any():
+            styles = styles + (
+                (ignore, "#666666", rf"ignore band  n={int(ignore.sum())}"),
+            )
+        for mask, color, label in styles:
+            if not mask.any():
+                continue
+            ax_joint.scatter(
+                r_flat[mask], e_flat[mask],
+                s=8, c=color, alpha=0.55, edgecolors="none", label=label,
+            )
+        ax_joint.legend(
+            fontsize=7, loc="upper right", facecolor="#111",
+            edgecolor="#333", labelcolor=VIZ.FG,
+        )
+    else:
+        ax_joint.scatter(
+            r_flat, e_flat, s=6, c=VIZ.ACCENT, alpha=0.35, edgecolors="none",
+            label=rf"interior  n={n_cells}",
+        )
+        ax_joint.legend(
+            fontsize=7, loc="upper right", facecolor="#111",
+            edgecolor="#333", labelcolor=VIZ.FG,
+        )
+
+    ax_joint.set_xlim(0.0, 1.0)
+    ax_joint.set_ylim(0.0, e_hi)
+    ax_joint.set_xlabel(r"$R = |Z_2| / \sum|z_2|$", fontsize=9, color=VIZ.FG)
+    ax_joint.set_ylabel(r"$\rho_{\mathrm{total}}$", fontsize=9, color=VIZ.FG)
+    ax_joint.tick_params(colors=VIZ.FG, labelsize=7)
+    for s in ax_joint.spines.values():
+        s.set_color("#333")
+
+    ax_top.hist(r_flat, bins=bins_2d, range=(0.0, 1.0), color=VIZ.ACCENT, alpha=0.85)
+    ax_top.set_xlim(0.0, 1.0)
+    ax_top.tick_params(labelbottom=False, colors=VIZ.FG, labelsize=7)
+    ax_top.set_ylabel("count", fontsize=8, color=VIZ.FG)
+    for s in ax_top.spines.values():
+        s.set_color("#333")
+
+    ax_right.hist(
+        e_flat, bins=bins_2d, range=(0.0, e_hi),
+        orientation="horizontal", color=VIZ.ACCENT, alpha=0.85,
+    )
+    ax_right.set_ylim(0.0, e_hi)
+    ax_right.tick_params(labelleft=False, colors=VIZ.FG, labelsize=7)
+    ax_right.set_xlabel("count", fontsize=8, color=VIZ.FG)
+    for s in ax_right.spines.values():
+        s.set_color("#333")
+
+    gt_note = (
+        " — η± band from GT at cell anchors"
+        if has_gt
+        else " — pass --gt_dir for GT-colored bands"
+    )
+    fig.suptitle(
+        r"Joint $(R,\,\rho_{\mathrm{total}})$ per interior cell"
+        + gt_note
+        + r"  (dashed purple: $|Z_2|=R\cdot\rho_{\mathrm{total}}$ levels)",
+        fontsize=10, color=VIZ.FG, fontfamily="monospace",
+    )
+    fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
+    plt.close(fig)
+
+
 def viz_l2_bimodality_per_iter(
     bimodality: list[float] | np.ndarray,
     out_path: str,
