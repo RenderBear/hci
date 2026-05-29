@@ -2,8 +2,9 @@ r"""L2 — cell-grid ρ refinement via recurrent Naka–Rushton on convolved geo
 
 State: ρ(c, k) — K competing orientation hypotheses per cell.
 
-Seed (IC only; peak-relative bin profile → ρ⁽⁰⁾):
-       ρ_seed^(k) = ρ_bins^(k) / (ρ_peak + η_z + ε)   (anisotropy; learned floor η_z)
+Seed (IC only; total-normalize then per-bin NR → ρ⁽⁰⁾):
+       ρ_raw^(k) = ρ_bins^(k) / (ρ_total + ε)
+       ρ_seed^(k) = (ρ_raw^(k))² / ((ρ_raw^(k))² + η_z²)
 
   Per iteration t (ρ⁽⁰⁾ = ρ_seed; ρ_seed fixed in drive; cross from evolving ρ):
        drive^(k) = b_seed·ρ_seed^(k) + b_coll·ρ̃_coll^(k)
@@ -170,11 +171,14 @@ def rho_seed_from_bins(
     is_border: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    """Peak-relative seed: ρ_seed^(k) = ρ_bins^(k) / (ρ_peak + η_z + ε)."""
+    """ρ_raw = ρ_bins/(ρ_total+ε); ρ_seed = ρ_raw²/(ρ_raw²+η_z²)."""
     if is_border.dim() > 1:
         is_border = is_border.reshape(-1)
-    rho_peak = rho_bins.max(dim=-1, keepdim=True).values
-    rho_seed = rho_bins / (rho_peak + eta_z + eps)
+    rho_total = rho_bins.sum(dim=-1, keepdim=True)
+    rho_raw = rho_bins / (rho_total + eps)
+    rho_raw_sq = rho_raw * rho_raw
+    eta_z_sq = eta_z * eta_z
+    rho_seed = rho_raw_sq / (rho_raw_sq + eta_z_sq)
     mask = is_border.unsqueeze(-1) if is_border.dim() == 1 else is_border.unsqueeze(-1)
     return torch.where(mask, torch.zeros_like(rho_seed), rho_seed)
 

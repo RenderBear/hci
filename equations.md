@@ -7,8 +7,8 @@ This file records the **notation and equations implemented in this repository**:
 ## 1. End-to-end pipeline
 
 1. **L0** — RGB → split luminance / chrominance directional differences; per-direction min subtraction; independent Naka–Rushton per channel with **fixed** scalars $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ (`L0.ETA_LUM`, `L0.ETA_CHR`) and gain $\gamma$ (`L0.GAMMA`). Produces harmonic stack $s$, magnitudes $h_{1m}, h_{2m}$, and split $h_{2m}^{\mathrm{lum}}, h_{2m}^{\mathrm{chr}}$. Complex fields $z_1, z_2$ are read from $s$ (`z_from_l0_harmonics`). L0 is **precomputed and cached** for training; it is not updated during training.
-2. **L1** — Pixel $K$-bin von Mises (or $\cos^p$) projection of $h_{2m}$ (`L1.K`; von Mises $\kappa$ is **learned**, softplus, init `L1.COL_VON_MISES_KAPPA`$=8$); sum-pool over $P\times P$ patches → per-cell $\rho_{\mathrm{raw}}^{(k)}$, dominant $\theta$, polarity $q$, anisotropy $\delta$, optional $\kappa$, and $h_{2m}$-weighted splat anchors. **Precomputed and cached** with L0.
-3. **L2** (`TileDynamics`) — Per-bin NR seed from L1 $\rho_{\mathrm{bins}}^{(k)}$; then $T_{\mathrm{refine}}$ recurrent steps with grouped `conv2d` collinear / iso pools, dynamic cross (mean other-bin $\rho$), and divisive $\rho$ update. Runs **live each training step** so gradients reach the seven learned L2 scalars.
+2. **L1** — Pixel $K$-bin von Mises (or $\cos^p$) projection of $h_{2m}$ (`L1.K`; von Mises $\kappa$ is **learned**, softplus, init `L1.COL_VON_MISES_KAPPA`$=8$); sum-pool over $P\times P$ patches → per-cell $\rho_{\mathrm{bins}}^{(k)}$, dominant $\theta$, polarity $q$, anisotropy $\delta$, optional orientation $\kappa$, and $h_{2m}$-weighted splat anchors. **Precomputed and cached** with L0.
+3. **L2** (`TileDynamics`) — $K$-channel state $\rho^{(k)}(c)$: **seed** $\rho^{(0)}$ from $\rho_{\mathrm{bins}}$ (total-normalize → per-bin NR); **drive** $b_{\mathrm{seed}}\rho_{\mathrm{seed}}^{(k)} + b_{\mathrm{coll}}\tilde\rho_{\mathrm{coll}}^{(k)}$; **inhibition** iso + spatial cross; **NR pass** + **mixing** $\rho \leftarrow (1-\alpha)\rho + \alpha\rho_{\mathrm{nr}}$. Seven learned L2 scalars; runs **live each training step**.
 4. **Renderer** (`ModulationRenderer`) — Cell-grid $\theta$ combing and $\rho$-gated anchor smoothing; **Gaussian-line splat** of refined $\rho$ to pixels; coherence map; tangential / normal **stencils on $\bar\rho$**; **12→8→1** thinning MLP gate:
    $$\hat B(p) = \bar\rho(p)\,\mathrm{gate}(p).$$
 
@@ -71,11 +71,10 @@ $$
 \theta_{2m}(p) = \tfrac12 \arg z_2(p).
 $$
 
-**Pixel-level bin channels** (default: von Mises, `L1.COL_BIN_TUNING`, `L1.COL_VON_MISES_KAPPA` $= 4$):
+**Pixel-level bin channels** (default: von Mises, `L1.COL_BIN_TUNING`; $\kappa = \mathrm{softplus}(\tilde\kappa)$, init `L1.COL_VON_MISES_KAPPA` $= 8$):
 
 $$
-e_k(p) = h_{2m}(p)\,\exp\!\Bigl(\kappa\,\cos\bigl(2(\theta_{2m}(p) - \bar\theta_k)\bigr)\Bigr),
-\qquad \kappa = \texttt{COL\_VON\_MISES\_KAPPA}.
+e_k(p) = h_{2m}(p)\,\exp\!\Bigl(\kappa\,\cos\bigl(2(\theta_{2m}(p) - \bar\theta_k)\bigr)\Bigr).
 $$
 
 Alternate (`COL_BIN_TUNING` = `cos_pow`, `COL_COS_POWER` $= p$):
@@ -86,21 +85,21 @@ $$
 
 At $\kappa{=}0$ the von Mises factor is flat across bins; at $\kappa{=}4$ it is much sharper than $\cos^2$ tuning. Mass is **not** normalized across $k$ at the pixel (contrast comes from pooling and L2).
 
-**Per-cell raw bin mass** (sum over patch; implemented as sum-pool / `avg_pool2d` × $P^2$):
+**Per-cell bin mass** (sum over patch; implemented as sum-pool / `avg_pool2d` × $P^2$):
 
 $$
-\rho_{\mathrm{raw}}^{(k)}(c) = \sum_{p \in \mathrm{patch}(c)} e_k(p).
+\rho_{\mathrm{bins}}^{(k)}(c) = \sum_{p \in \mathrm{patch}(c)} e_k(p).
 $$
 
 **Dominant orientation and anisotropy**:
 
 $$
-k^\*(c) = \arg\max_k \rho_{\mathrm{raw}}^{(k)}(c), \qquad
-\theta(c) = \bar\theta_{k^\*(c)},
+k^\*(c) = \arg\max_k \rho_{\mathrm{bins}}^{(k)}(c), \qquad
+\theta(c) = \bar\theta_{k^\*(c)} \;\text{(parabolic sub-bin refinement in L1/L2 export)},
 $$
 $$
-\rho_{\mathrm{peak}}(c) = \rho_{\mathrm{raw}}^{(k^\*)}(c), \qquad
-\rho_{\mathrm{total}}(c) = \sum_k \rho_{\mathrm{raw}}^{(k)}(c),
+\rho_{\mathrm{peak}}(c) = \rho_{\mathrm{bins}}^{(k^\*)}(c), \qquad
+\rho_{\mathrm{total}}(c) = \sum_k \rho_{\mathrm{bins}}^{(k)}(c),
 $$
 $$
 \delta(c) = \frac{\rho_{\mathrm{peak}}(c)}{\rho_{\mathrm{total}}(c) + \varepsilon}.
@@ -126,32 +125,33 @@ $$
 
 | Key | Value |
 |-----|--------|
+| `rho_bins` | $(N, K)$ per-cell $\rho_{\mathrm{bins}}^{(k)}$ (L2 seed input) |
 | `rho_peak` | $\rho_{\mathrm{peak}}$ (max bin mass) |
 | `z0` | $\rho_{\mathrm{total}}$ (sum over bins) |
+| `theta`, `k_star`, … | orientation / parabolic $\theta$ export |
 
-Border cells zero $\theta, q, \delta, \kappa, \rho_{\mathrm{peak}}, \rho_{\mathrm{total}}$.
+Border cells zero $\theta, q, \delta, \kappa, \rho_{\mathrm{bins}}, \rho_{\mathrm{peak}}, \rho_{\mathrm{total}}$.
 
 ---
 
 ## 4. L2 — seed and tile dynamics (`TileDynamics`)
 
-Interior mask $\mathrm{ok}(c) = \neg\,\texttt{is\_border}(c)$. Hard orientation bin per cell ($K =$ `L2.K`, default 24):
+Interior mask $\mathrm{ok}(c) = \neg\,\texttt{is\_border}(c)$. State is **$K$ channels per cell** ($K =$ `L2.K`, default 24), not a single hard bin. Initial $\rho^{(0)}(c,k) = \rho_{\mathrm{seed}}^{(k)}(c)$; after refine, scalar export uses $\max_k \rho^{(k)}$ and parabolic $\theta$ from final bins (`collapse_rho_bins`).
+
+### Seed (IC only; fixed in drive)
+
+From L1 `rho_bins` (same $\rho_{\mathrm{bins}}^{(k)}$ as §3). Code names the normalized fraction `rho_raw`:
 
 $$
-b(c) = \left\lfloor \frac{\theta(c) \bmod \pi}{\pi/K} \right\rfloor \in \{0,\ldots,K-1\}.
+\rho_{\mathrm{total}}(c) = \sum_k \rho_{\mathrm{bins}}^{(k)}(c), \qquad
+\rho_{\mathrm{raw}}^{(k)}(c) = \frac{\rho_{\mathrm{bins}}^{(k)}(c)}{\rho_{\mathrm{total}}(c) + \varepsilon},
 $$
-
-### Seed (IC only)
-
-Peak-relative bin profile — equalizes contrast, preserves anisotropy (unlike $\rho_{\mathrm{total}}$ normalization):
-
 $$
-\rho_{\mathrm{peak}}(c) = \max_k \rho_{\mathrm{bins}}^{(k)}(c), \qquad
-\rho_{\mathrm{seed}}^{(k)}(c) = \frac{\rho_{\mathrm{bins}}^{(k)}(c)}{\rho_{\mathrm{peak}}(c) + \eta_z + \varepsilon}, \qquad
+\rho_{\mathrm{seed}}^{(k)}(c) = \frac{\bigl(\rho_{\mathrm{raw}}^{(k)}(c)\bigr)^2}{\bigl(\rho_{\mathrm{raw}}^{(k)}(c)\bigr)^2 + \eta_z^2}, \qquad
 \eta_z = \mathrm{softplus}(\tilde\eta_z).
 $$
 
-With $\eta_z \ll \rho_{\mathrm{peak}}$, peak bin $\approx 1$; $\eta_z$ floors weak cells. Off-peak bins are fractions relative to the peak. Edge: neighbors $\ll 1$; texture: neighbors $\approx 1$. Border cells: $\rho_{\mathrm{seed}}^{(k)} = 0$. With $T_{\mathrm{refine}}=0$ (`infer --no-dynamics`), $\rho^{(k)}$ stays at $\rho_{\mathrm{seed}}^{(k)}$ on interior cells.
+$\eta_z$ is NR half-saturation in $\rho_{\mathrm{raw}}$ units (default `ETA_Z_INIT = 0.15`; uniform cell $\rho_{\mathrm{raw}}^{(k)} \approx 1/K$). Border cells: $\rho_{\mathrm{seed}}^{(k)} = 0$. With $T_{\mathrm{refine}}=0$ (`infer --no-dynamics`), $\rho^{(k)}$ stays at $\rho_{\mathrm{seed}}^{(k)}$.
 
 ### Learned scalars (softplus of raw parameters)
 
@@ -192,14 +192,14 @@ $$
 c_{\mathrm{iso}}^{(k)} = \frac{W^{\mathrm{iso}}_k * (\rho^{(t)}_k)^2}{W^{\mathrm{iso}}_k * \mathbf{1} + \varepsilon}.
 $$
 
-**Cross** — spatial mean other-bin mass from **evolving** $\rho^{(t)}$ (per $k$; enters inhibition as $b_{\mathrm{cross}}\,c_{\mathrm{cross}}^{(k,t)}$):
+**Cross** — disk-pool each bin, then mean **other-bin** pooled mass (spatial neighborhood via $W^{\mathrm{disk}}$; enters inhibition as $b_{\mathrm{cross}}\,c_{\mathrm{cross}}^{(k,t)}$):
 
 $$
-\tilde\rho^{(k,t)} = \frac{W^{\mathrm{disk}} * \rho^{(k,t)}}{W^{\mathrm{disk}} * \mathbf{1} + \varepsilon}, \qquad
-c_{\mathrm{cross}}^{(k,t)}(c) = \mathrm{ok}(c)\cdot\frac{\sum_{k' \neq k} \tilde\rho^{(k',t)}(c)}{K - 1}.
+\bar\rho^{(k,t)}(c) = \frac{W^{\mathrm{disk}} * \rho^{(k,t)}}{W^{\mathrm{disk}} * \mathbf{1} + \varepsilon}, \qquad
+c_{\mathrm{cross}}^{(k,t)}(c) = \mathrm{ok}(c)\cdot\frac{\sum_{k' \neq k} \bar\rho^{(k',t)}(c)}{K - 1}.
 $$
 
-Clean edge with same-orientation neighbors: low $c_{\mathrm{cross}}^{(k^\star)}$ at the peak. T-junction / texture: high cross (neighbors in multiple bins). Diagnostics plot $\max_k c_{\mathrm{cross}}^{(k)}$ and $\max_k \rho^{(k)}$ (renderer scalar).
+Clean edge (neighbors weak in off-peak bins): low $c_{\mathrm{cross}}$ at the peak bin. Texture / mixed orientations in the disk: high cross. Diagnostics (`geometry` snapshots): $\max_k \tilde\rho_{\mathrm{coll}}$, $\max_k c_{\mathrm{iso}}$, $\max_k c_{\mathrm{cross}}$, $\max_k \rho^{(k)}$ at $t{=}0$ and $t{=}$last; `l2_rho_seed_post` also plots $\max_k \rho_{\mathrm{seed}}$, $\max_k \rho$, and $\Delta\rho = \rho - \rho_{\mathrm{seed}}$ on those scalars.
 
 ### Pass update ($t = 0,\ldots,T_{\mathrm{refine}}-1$, `L2.T_REFINE`)
 
@@ -207,7 +207,7 @@ $$
 \mathrm{drive}^{(t)}(c,k) = b_{\mathrm{seed}}\,\rho_{\mathrm{seed}}^{(k)}(c) + b_{\mathrm{coll}}\,\tilde\rho_{\mathrm{coll}}^{(k,t)}(c),
 $$
 $$
-\tilde\rho^{(k,t+1)}(c) = \mathrm{ok}(c)\cdot
+\rho_{\mathrm{nr}}^{(k,t+1)}(c) = \mathrm{ok}(c)\cdot
 \frac{\bigl(\mathrm{drive}^{(t)}(c,k)\bigr)^2}
 {\bigl(\mathrm{drive}^{(t)}(c,k)\bigr)^2
 + b_{\mathrm{iso}}\,c_{\mathrm{iso}}^{(k,t)}(c)
@@ -215,10 +215,10 @@ $$
 + \eta_p^2 + \varepsilon},
 $$
 $$
-\rho^{(k,t+1)}(c) = (1 - \alpha)\,\rho^{(k,t)}(c) + \alpha\,\tilde\rho^{(k,t+1)}(c),
+\rho^{(k,t+1)}(c) = (1 - \alpha)\,\rho^{(k,t)}(c) + \alpha\,\rho_{\mathrm{nr}}^{(k,t+1)}(c),
 \qquad \alpha = \mathrm{clamp}_{[0,1]}\!\bigl(\mathrm{softplus}(\tilde\alpha)\bigr),
 $$
-with default $\alpha \approx 0.5$ (`L2.ALPHA_INIT`). Mixing dampens step-to-step oscillation; $b_{\mathrm{seed}}$ vs $b_{\mathrm{coll}}$ balances own initial evidence vs collinear neighborhood consensus.
+with defaults `B_SEED_INIT = B_COLL_INIT = 0.5`, `ALPHA_INIT = 0.5`. **Mixing** dampens coll/iso/cross oscillation across steps. **Seed pin** ($b_{\mathrm{seed}}$) gives a minimum drive from the initial hypothesis so short edges without long collinear context do not collapse; $b_{\mathrm{seed}}$ vs $b_{\mathrm{coll}}$ trades local evidence vs neighborhood consensus.
 
 **TBPTT**: during training, $\rho$ is detached every `grad_window = max(1, T_{\mathrm{refine}} // \texttt{TRAIN.L2\_SNAPSHOT\_MAX})` steps to limit BPTT depth.
 
@@ -299,12 +299,13 @@ Checkpoints store `{"model_state": state_dict}` (`intermediate.pt`, `final.pt`).
 
 | Block | Count | Notes |
 |------:|------:|------|
-| $\tilde\eta_z, \tilde b_{\mathrm{seed}}, \tilde b_{\mathrm{coll}}, \tilde b_{\mathrm{iso}}, \tilde b_{\mathrm{cross}}, \tilde\eta_p, \tilde\alpha$ | 7 | Seed + drive / inhibition + mixing |
+| $\tilde\eta_z, \tilde b_{\mathrm{seed}}, \tilde b_{\mathrm{coll}}, \tilde b_{\mathrm{iso}}, \tilde b_{\mathrm{cross}}, \tilde\eta_p, \tilde\alpha$ | 7 | L2: seed NR floor + drive / inhibition + mixing |
+| $\tilde\kappa$ (L1 von Mises) | 1 | Bin sharpness in $e_k(p)$ |
 | $\tilde\sigma_\perp, s_t, s_n$ | 3 | Splat width + stencil spacings |
 | $\mathrm{MLP}_{\mathrm{thin}}$ (12→8→1) | 113 | $12\cdot 8 + 8 + 8 + 1$ |
-| **Total (`StriateE2E`)** | **123** | 7 L2 + 116 renderer |
+| **Total (`StriateE2E`)** | **124** | 7 L2 + 1 L1 $\kappa$ + 116 renderer |
 
-L0 $\eta$ and L1 geometry are **not** learned. Legacy checkpoints from older K-bin / 14-feature renderer architectures may load with missing/unexpected keys; use `upgrade_renderer_state_dict` and `load_state_dict(..., strict=False)` with `report_checkpoint_compatibility`.
+L0 $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ are **fixed** (`params.L0`). Legacy checkpoints from older K-bin / 14-feature renderer architectures may load with missing/unexpected keys; use `upgrade_renderer_state_dict` and `load_state_dict(..., strict=False)` with `report_checkpoint_compatibility`.
 
 ---
 
@@ -324,4 +325,4 @@ L0 $\eta$ and L1 geometry are **not** learned. Legacy checkpoints from older K-b
 
 ## 9. Revision note
 
-This document matches the **STRIATE** stack: L1 **K-bin projection** (§3), L2 **`TileDynamics`** (§4), **Gaussian-line splat** renderer (§5), **`StriateE2E`** (122 learned scalars).
+This document matches the **STRIATE** stack: L1 **K-bin projection** (§3), L2 **`TileDynamics`** — $\rho_{\mathrm{raw}}=\rho_{\mathrm{bins}}/\rho_{\mathrm{total}}$, NR seed, seed pin + coll drive, spatial cross, mixing (§4), **Gaussian-line splat** renderer (§5), **`StriateE2E`** (124 learned scalars).

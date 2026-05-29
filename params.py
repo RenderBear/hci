@@ -39,7 +39,7 @@ L2 = SimpleNamespace(
     K=24,
     T_REFINE=5,
     EPS=1e-9,
-    ETA_Z_INIT=1e04,  # seed: ρ_bins^(k)/(ρ_peak+η_z+ε); L1 mass floor in denom
+    ETA_Z_INIT=0.15,  # seed NR half-saturation on ρ_raw (after ρ_bins/ρ_total)
     LOGIT_CLAMP=1e-4,
     # drive / inhibition (softplus-positive, learned; constant over t)
     B_SEED_INIT=0.5,

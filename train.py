@@ -1,7 +1,7 @@
 r"""train.py — STRIATE training: cell-grid conv dynamics + harmonic render.
 
 Pipeline per image: L0 contrast/harmonics (cached) → L1 K-bin projection live each step
-→ L2 cell-grid ρ refinement (peak-relative seed; lateral refine + mixing)
+→ L2 cell-grid ρ refinement (ρ_raw + per-bin NR seed; lateral refine + mixing)
 → splat renderer ($\hat B = \bar\rho \cdot \mathrm{gate}$).
 Loss combines soft-Dice and per-pixel BCE on the same η± valid band
 (target≥η_pos or target<η_neg), weighted by ``--lam_dice`` and ``--lam_bce``
@@ -691,7 +691,7 @@ def format_l2_param_lines(d, *, indent: str = "  ") -> list[str]:
         f"{sub}b_iso={d.b_iso.item():.3f}  b_cross={d.b_cross.item():.3f}  "
         f"η_p={d.eta_p.item():.3f}  α={d.alpha.item():.3f}",
         f"{indent}seed:  η_z={d.eta_z.item():.4g}  "
-        f"ρ_seed^(k)=ρ_bins^(k)/(ρ_peak+η_z+ε)  "
+        f"ρ_raw=ρ_bins/ρ_total; ρ_seed=ρ_raw²/(ρ_raw²+η_z²)  "
         f"cross^(k)=mean_{{k'≠k}} W_disk*ρ^(k'))",
     ]
 
@@ -827,7 +827,7 @@ def main():
         f"Dynamics: R_fac={L2.R_FAC_POOL}  R_sup={L2.R_SUP_POOL}  K={L2.K}  "
         f"T={L2.T_REFINE}  "
         f"ρ←(1−α)ρ+α·NR(drive²/(drive²+b_iso·c_iso+b_cross·cross+η_p²)); "
-        f"ρ_seed^(k)=ρ_bins^(k)/(ρ_peak+η_z+ε); α init={L2.ALPHA_INIT}; "
+        f"ρ_seed=ρ_raw²/(ρ_raw²+η_z²), ρ_raw=ρ_bins/(ρ_total+ε); α init={L2.ALPHA_INIT}; "
         f"cross^(k)=mean_{{k'≠k}} W_disk*ρ^(k'); "
         f"  TBPTT: {TRAIN.L2_SNAPSHOT_MAX} segments  "
         f"window=max(1, T//{TRAIN.L2_SNAPSHOT_MAX})  (full grad per segment)"
