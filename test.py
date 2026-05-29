@@ -177,7 +177,7 @@ def run_image_inference(model, img_path, device):
         K=L1.K,
         bin_tuning=L1.COL_BIN_TUNING,
         cos_power=L1.COL_COS_POWER,
-        von_mises_kappa=L1.COL_VON_MISES_KAPPA,
+        von_mises_kappa=model.l1_von_mises_kappa,
         device=device,
         verbose=False,
     )
