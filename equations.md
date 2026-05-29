@@ -7,12 +7,12 @@ This file records the **notation and equations implemented in this repository**:
 ## 1. End-to-end pipeline
 
 1. **L0** — RGB → split luminance / chrominance directional differences; per-direction min subtraction; independent Naka–Rushton per channel with **fixed** scalars $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ (`L0.ETA_LUM`, `L0.ETA_CHR`) and gain $\gamma$ (`L0.GAMMA`). Produces harmonic stack $s$, magnitudes $h_{1m}, h_{2m}$, and split $h_{2m}^{\mathrm{lum}}, h_{2m}^{\mathrm{chr}}$. Complex fields $z_1, z_2$ are read from $s$ (`z_from_l0_harmonics`). L0 is **precomputed and cached** for training; it is not updated during training.
-2. **L1** — Pixel $K$-bin von Mises (or $\cos^p$) projection of $h_{2m}$ (`L1.K`; von Mises $\kappa$ is **learned**, softplus, init `L1.COL_VON_MISES_KAPPA`$=8$); sum-pool over $P\times P$ patches → per-cell $\rho_{\mathrm{bins}}^{(k)}$, dominant $\theta$, polarity $q$, anisotropy $\delta$, optional orientation $\kappa$, and $h_{2m}$-weighted splat anchors. **Precomputed and cached** with L0.
-3. **Seed** (`CellSeed`) — total-normalize L1 bin masses, min-subtract for orientation selectivity, per-bin Naka–Rushton with **learned** $\eta_z$ (init `SEED.ETA_Z_INIT`$=0.1$). Scalar export $\rho(c)=\max_k \rho_{\mathrm{seed}}^{(k)}(c)$ plus parabolic $\theta$ from seed bins.
+2. **L1** — Pixel $K$-bin von Mises (or $\cos^p$) projection of $h_{2m}$ (`L1.K`; von Mises $\kappa$ is **learned**, softplus, init `L1.COL_VON_MISES_KAPPA`$=8$); sum-pool over $P\times P$ patches → per-cell $\rho_{\mathrm{bins}}^{(k)}$, $\theta$ from patch-summed $z_2$, polarity $q$, anisotropy $\delta$, per-cell orientation confidence $\kappa$, and $h_{2m}$-weighted splat anchors. **Runs live** each training step from cached L0 (`run_l1_cells_flat` in `prepare_batch`); **not** written to the L0 disk cache.
+3. **Seed** (`CellSeed`) — total-normalize L1 bin masses, min-subtract for orientation selectivity, per-bin Naka–Rushton with **learned** $\eta_z$ (init `SEED.ETA_Z_INIT`$=0.1$). Scalar export $\rho(c)=\max_k \rho_{\mathrm{seed}}^{(k)}(c)$; $\theta(c)$ passes through from L1 unchanged.
 4. **Renderer** (`ModulationRenderer`) — Cell-grid $\theta$ combing and $\rho$-gated anchor smoothing; **Gaussian-line splat** of $\rho$ to pixels; coherence map; tangential / normal **9-tap stencils on $\bar\rho$**; **20→12→1** thinning MLP gate:
    $$\hat B(p) = \bar\rho(p)\,\mathrm{gate}(p).$$
 
-There is **no** spatial $\eta$-MLP and **no** second L0 pass inside the training graph. L1 $\kappa$ is computed but **not** fed to the renderer. `L1.K` must match `SEED.K`.
+There is **no** spatial $\eta$-MLP and **no** second L0 pass inside the training graph. L1 per-cell orientation confidence $\kappa$ is computed but **not** fed to the renderer (distinct from learned von Mises bin sharpness $\kappa$ in $e_k(p)$). `L1.K` must match `SEED.K`.
 
 At inference, optional **ridge NMS** (`ridge_nms`) thins $\hat B$ using splat-dominant orientation $\theta^\star(p)$.
 
@@ -91,11 +91,14 @@ $$
 \rho_{\mathrm{bins}}^{(k)}(c) = \sum_{p \in \mathrm{patch}(c)} e_k(p).
 $$
 
-**Dominant orientation and anisotropy**:
+**Peak bin, orientation, and anisotropy**:
 
 $$
 k^\*(c) = \arg\max_k \rho_{\mathrm{bins}}^{(k)}(c), \qquad
-\theta(c) = \bar\theta_{k^\*(c)} \;\text{(parabolic sub-bin refinement in L1/seed export)},
+Z_2(c) = \sum_{p \in \mathrm{patch}(c)} z_2(p),
+$$
+$$
+\theta(c) = \tfrac12 \arg Z_2(c) \quad \text{(patch vector sum; not sub-bin fit to } k^\*\text{)},
 $$
 $$
 \rho_{\mathrm{peak}}(c) = \rho_{\mathrm{bins}}^{(k^\*)}(c), \qquad
@@ -105,14 +108,14 @@ $$
 \delta(c) = \frac{\rho_{\mathrm{peak}}(c)}{\rho_{\mathrm{total}}(c) + \varepsilon}.
 $$
 
-**Polarity** (winning-bin $\theta$, patch sum of $z_1$):
+**Polarity** ($\theta(c)$ from $Z_2$, patch mean of $z_1$):
 
 $$
-q(c) = \Re\!\Bigl(\overline{Z_1(c)}\, e^{i\theta(c)}\Bigr), \qquad
-Z_1(c) = \sum_{p \in \mathrm{patch}(c)} z_1(p).
+\bar Z_1(c) = \frac{1}{P^2}\sum_{p \in \mathrm{patch}(c)} z_1(p), \qquad
+q(c) = \Re\!\Bigl(\overline{\bar Z_1(c)}\, e^{i\theta(c)}\Bigr).
 $$
 
-**Orientation confidence** $\kappa \in [0,1]$ (`_patch_orientation_kappa`): $z_1$ polarity agreement along the edge normal implied by $(\theta, q)$.
+**Orientation confidence** $\kappa_{\mathrm{cell}}(c) \in [0,1]$ (`_patch_orientation_kappa`): $z_1$ polarity agreement along the edge normal implied by $(\theta, q)$. Not the same as learned von Mises $\kappa$ in $e_k(p)$.
 
 **Splat anchors** ($h_{2m}$-weighted centroid within the patch; stored as `cx_z2`, `cy_z2`):
 
@@ -128,9 +131,11 @@ $$
 | `rho_bins` | $(N, K)$ per-cell $\rho_{\mathrm{bins}}^{(k)}$ (seed input) |
 | `rho_peak` | $\rho_{\mathrm{peak}}$ (max bin mass) |
 | `z0` | $\rho_{\mathrm{total}}$ (sum over bins) |
-| `theta`, `k_star`, … | orientation / parabolic $\theta$ export |
+| `theta` | $\theta(c) = \tfrac12 \arg Z_2(c)$ |
+| `k_star` | $k^\*(c) = \arg\max_k \rho_{\mathrm{bins}}^{(k)}$ (peak mass only; not used for $\theta$) |
+| `cx_z2`, `cy_z2` | $h_{2m}$-weighted splat anchors |
 
-Border cells zero $\theta, q, \delta, \kappa, \rho_{\mathrm{bins}}, \rho_{\mathrm{peak}}, \rho_{\mathrm{total}}$.
+Border cells zero $\theta, q, \delta, \kappa_{\mathrm{cell}}, \rho_{\mathrm{bins}}, \rho_{\mathrm{peak}}, \rho_{\mathrm{total}}$.
 
 ---
 
@@ -155,7 +160,7 @@ $$
 \rho(c) = \max_k \rho_{\mathrm{seed}}^{(k)}(c),
 $$
 
-with parabolic sub-bin $\theta(c)$ from the seed bin masses (`collapse_rho_bins`).
+on interior cells ($\times\,\mathrm{ok}(c)$; border → $0$). **Orientation** $\theta(c)$ is read from L1 (`cells_flat['theta']`); seed does not refine $\theta$.
 
 ---
 
@@ -259,4 +264,4 @@ L0 $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ are **fixed** (`params.L0`). Legac
 
 ## 9. Revision note
 
-This document matches the **STRIATE** stack: L1 **K-bin projection** (§3), **seed NR** (§4), **Gaussian-line splat** renderer with 9-tap stencils (§5), **`StriateE2E`** (270 learned scalars).
+This document matches the **STRIATE** stack: **live L1** K-bin projection (§3), **seed NR** (§4), **Gaussian-line splat** renderer with 9-tap stencils (§5), **`StriateE2E`** (270 learned parameters). L0 only is disk-cached for training (§6).
