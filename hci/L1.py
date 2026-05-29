@@ -2,7 +2,7 @@ r"""L1 — pixel K-bin orientation projection → cell grid (GPU-native).
 
 Per pixel (default von Mises): e_k = h_{2m} · exp(κ cos(2(θ_{2m} − kπ/K))).
 Alternate: e_k = h_{2m} · cos^p(θ_{2m} − kπ/K).  Sum-pool over P×P patches →
-ρ_raw^{(k)}(c).  k* + parabolic sub-bin θ for export/q/κ/renderer; k* for L2 hard bins.
+ρ_raw^{(k)}(c).  k* + parabolic sub-bin θ for export/q/κ/renderer.
 """
 
 from __future__ import annotations

@@ -1,9 +1,8 @@
 r"""infer.py — STRIATE single-image inference.
 
-Pipeline: L0 → L1 K-bin projection → L2 ρ-space cell-grid dynamics (optional; use
-``--no-dynamics`` to skip L2 and feed ρ_seed through the renderer)
-→ splat boundary map ($\hat B = \bar\rho \cdot \mathrm{gate}$),
-optional ridge NMS along θ, then thresholded edge PNG (default τ = 0.5).
+Pipeline: L0 → L1 K-bin projection → seed NR (η_z) → splat boundary map
+($\hat B = \bar\rho \cdot \mathrm{gate}$), optional ridge NMS along θ,
+then thresholded edge PNG (default τ = 0.5).
 """
 
 from __future__ import annotations
@@ -17,7 +16,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from params import L0, L1, L2, RENDER, INFER, TRAIN
+from params import L0, L1, SEED, RENDER, INFER
 from hci.L0 import compute_l0_rgb, compute_interior
 from hci.L1 import z_from_l0_harmonics, pad_for_patch_grid, run_l1
 from hci.renderer import (
@@ -32,93 +31,32 @@ from hci.diagnostics_viz import (
     viz_infer_l1_rho_masses,
     viz_infer_cell_rho_maps,
     viz_infer_rho_hist_cdf,
-    viz_l2_bimodality_per_iter,
-    viz_infer_l2_bin_dynamics,
-    viz_infer_l2_facilitation_factors,
-    viz_infer_l2_geometry,
-    viz_infer_l2_suppression_factors,
     save_rho_png,
     viz_infer_shape_readout,
     viz_infer_base_edges_overlay,
-    viz_infer_iters_snapshot,
 )
-from hci.L2 import (
-    l2_snapshot_steps,
-    rho_seed_from_bins,
-    collapse_rho_bins,
-)
+from hci.seed import rho_seed_from_bins
 from train import (
     StriateE2E,
     build_cells_flat,
     build_l0_pix,
     format_l1_param_lines,
-    format_l2_param_lines,
+    format_seed_param_lines,
     format_model_param_summary,
     format_renderer_param_lines,
     report_checkpoint_compatibility,
+    upgrade_model_state_dict,
 )
-
-
-def _rho_out_seed_only(
-    model,
-    cf_dev: dict,
-    device: torch.device,
-    *,
-    collect_diags: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict | None]:
-    """Match TileDynamics output with T=0: per-bin ρ_seed collapsed to scalar (no L2 refine)."""
-    d = model.dynamics
-    nH, nW = int(cf_dev["nH"]), int(cf_dev["nW"])
-    N = nH * nW
-    K = d.K
-    rho_bins = cf_dev["rho_bins"].to(device).reshape(N, K)
-    is_border = cf_dev["is_border"].to(device)
-    rho_seed = rho_seed_from_bins(
-        rho_bins, d.eta_z, is_border, d.eps,
-    )
-    rho_seed_3d = rho_seed.reshape(nH, nW, K)
-    rho_scalar, theta_out, k_star_out = collapse_rho_bins(
-        rho_seed_3d, K, d.eps, device=device,
-    )
-
-    interior = (~is_border).to(dtype=rho_scalar.dtype)
-    rho_out = rho_scalar.reshape(N) * interior
-
-    cf_out = dict(cf_dev)
-    cf_out["theta"] = theta_out.reshape(N, 1)
-    cf_out["k_star"] = k_star_out.reshape(N)
-
-    branch = torch.zeros(N, device=device, dtype=torch.long)
-    z1 = torch.zeros(N, 1, device=device, dtype=rho_out.dtype)
-
-    surface_diags = None
-    if collect_diags:
-        ra = rho_out[~is_border]
-        surface_diags = {
-            "iter_stats": [{
-                "rho_mean": float(rho_out.mean().detach()),
-                "rho_max": float(rho_out.max().detach()),
-                "mid_band_frac": float(
-                    ((ra > 0.3) & (ra < 0.7)).float().mean().detach()
-                ) if ra.numel() else 0.0,
-                "n_interior": int((~is_border).sum().item()),
-            }],
-            "no_dynamics": True,
-        }
-    return rho_out, branch, z1, cf_out, surface_diags
 
 
 def build_model(ckpt, device):
     m = StriateE2E(
-        r_fac_pool=L2.R_FAC_POOL,
-        r_sup_pool=L2.R_SUP_POOL,
-        K=L2.K,
-        t_refine=L2.T_REFINE,
-        eps=L2.EPS,
+        K=SEED.K,
+        eps=SEED.EPS,
         render_cell_hidden=RENDER.CELL_HIDDEN,
         render_pixel_hidden=RENDER.PIXEL_HIDDEN,
     )
-    sd = ckpt["model_state"]
+    sd = upgrade_model_state_dict(ckpt["model_state"])
     sd = upgrade_renderer_state_dict(sd, prefix="renderer.")
     incompatible = m.load_state_dict(sd, strict=False)
     report_checkpoint_compatibility(incompatible, context="infer build_model")
@@ -126,13 +64,11 @@ def build_model(ckpt, device):
 
 
 def _sync(device):
-
     if device.type == "cuda":
         torch.cuda.synchronize()
 
 
 def run_l0_l1(img_path, device, *, von_mises_kappa: float | None = None):
-
     timings = {}
 
     _sync(device)
@@ -197,11 +133,10 @@ def run_l0_l1(img_path, device, *, von_mises_kappa: float | None = None):
 
     t2 = time.perf_counter()
     nH, nW = cells["nH"], cells["nW"]
-    proj_info = compute_render_features(z2_image, ir_p, cells, bm_np, eps=L2.EPS)
+    proj_info = compute_render_features(z2_image, ir_p, cells, bm_np, eps=SEED.EPS)
     del z2_image, bm_np
     gc.collect()
 
-    N = nH * nW
     cells_flat = build_cells_flat(cells)
 
     rho_peak_grid = cells["rho_peak"].astype(np.float64, copy=True)
@@ -232,17 +167,14 @@ def run_l0_l1(img_path, device, *, von_mises_kappa: float | None = None):
     return prep, timings
 
 
-def _infer_l2_and_render(
+def _infer_seed_and_render(
     model,
     prep,
     device,
     *,
-    n_l2_iters: int,
     collect_diags: bool = False,
     apply_ridge_nms: bool = True,
-    infer_l2_kw: dict | None = None,
     timings: dict[str, float] | None = None,
-    no_dynamics: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, torch.Tensor, torch.Tensor, np.ndarray, dict | None, np.ndarray]:
     H0, W0 = prep["H0"], prep["W0"]
     Hp, Wp = prep["Hp"], prep["Wp"]
@@ -254,78 +186,37 @@ def _infer_l2_and_render(
     }
     l0_dev = {k: v.to(device) for k, v in prep["l0_pix"].items()}
     proj_dev = proj_to_device(prep["proj_info"], device)
-    l2_kw = {} if infer_l2_kw is None else infer_l2_kw
 
-    if no_dynamics:
+    with torch.no_grad():
         if timings is not None:
             _sync(device)
             t0 = time.perf_counter()
-        with torch.no_grad():
-            rho_out, branch, supp_nb, cf_out, surface_diags = _rho_out_seed_only(
-                model, cf_dev, device, collect_diags=collect_diags,
-            )
+        rho_out, branch, supp_nb, _, _, cf_out, surface_diags = model.seed(
+            cells_flat=cf_dev,
+            return_surface_diags=collect_diags,
+        )
         if timings is not None:
             _sync(device)
-            timings["l2"] = time.perf_counter() - t0
+            timings["seed"] = time.perf_counter() - t0
             t1 = time.perf_counter()
-        with torch.no_grad():
-            bmap_t, theta_t = render_boundary_map_torch(
-                rho_out,
-                proj_dev,
-                model.renderer,
-                cf_out,
-                Hp,
-                Wp,
-                l0_dev,
-                eps=model.render_eps,
-                training=False,
-                branch_pick=branch.reshape(-1).long(),
-                content_h=H0,
-                content_w=W0,
-                return_dominant_theta=True,
-            )
+        bmap_t, theta_t = render_boundary_map_torch(
+            rho_out,
+            proj_dev,
+            model.renderer,
+            cf_out,
+            Hp,
+            Wp,
+            l0_dev,
+            eps=model.render_eps,
+            training=False,
+            branch_pick=branch.reshape(-1).long(),
+            content_h=H0,
+            content_w=W0,
+            return_dominant_theta=True,
+        )
         if timings is not None:
             _sync(device)
             timings["render"] = time.perf_counter() - t1
-    else:
-        t_refine_saved = int(model.dynamics.T_refine)
-        model.dynamics.T_refine = int(n_l2_iters)
-        try:
-            with torch.no_grad():
-                if timings is not None:
-                    _sync(device)
-                    t0 = time.perf_counter()
-                rho_out, branch, _, _, supp_nb, cf_out, surface_diags = (
-                    model.dynamics(
-                        cells_flat=cf_dev,
-                        return_surface_diags=collect_diags,
-                        **l2_kw,
-                    )
-                )
-                if timings is not None:
-                    _sync(device)
-                    timings["l2"] = time.perf_counter() - t0
-                    t1 = time.perf_counter()
-                bmap_t, theta_t = render_boundary_map_torch(
-                    rho_out,
-                    proj_dev,
-                    model.renderer,
-                    cf_out,
-                    Hp,
-                    Wp,
-                    l0_dev,
-                    eps=model.render_eps,
-                    training=False,
-                    branch_pick=branch.reshape(-1).long(),
-                    content_h=H0,
-                    content_w=W0,
-                    return_dominant_theta=True,
-                )
-                if timings is not None:
-                    _sync(device)
-                    timings["render"] = time.perf_counter() - t1
-        finally:
-            model.dynamics.T_refine = t_refine_saved
 
     bmap = bmap_t.cpu().numpy()[:H0, :W0]
     theta_map = theta_t.cpu().numpy()[:H0, :W0]
@@ -337,49 +228,14 @@ def _infer_l2_and_render(
     return bmap, theta_map, rho_out, branch_grid, rho_post_grid, surface_diags, supp_nb_np
 
 
-def collect_iters_snapshot_softmaps(
-    model,
-    prep,
-    device,
-    iters: int,
-    bmap_final: np.ndarray,
-    *,
-    apply_ridge_nms: bool = True,
-    max_snapshots: int = TRAIN.L2_SNAPSHOT_MAX,
-    no_dynamics: bool = False,
-) -> tuple[list[int], list[np.ndarray]]:
-    """Softmaps at up to max_snapshots L2 steps evenly spaced in [0, iters]."""
-    if no_dynamics:
-        return [0], [np.asarray(bmap_final, dtype=np.float64)]
-    steps = l2_snapshot_steps(iters, max_snapshots=max_snapshots)
-    cache: dict[int, np.ndarray] = {int(iters): np.asarray(bmap_final, dtype=np.float64)}
-    for t in sorted(set(steps)):
-        if t in cache:
-            continue
-        bmap, *_ = _infer_l2_and_render(
-            model,
-            prep,
-            device,
-            n_l2_iters=t,
-            collect_diags=False,
-            apply_ridge_nms=apply_ridge_nms,
-            no_dynamics=no_dynamics,
-        )
-        cache[t] = bmap
-    return steps, [cache[t] for t in steps]
-
-
 def forward_with_diagnostics(
     model,
     prep,
     device,
     *,
-    infer_l2_kw,
     collect_diags,
     apply_ridge_nms=True,
-    no_dynamics: bool = False,
 ):
-
     timings: dict[str, float] = {}
     (
         bmap,
@@ -389,16 +245,13 @@ def forward_with_diagnostics(
         rho_post_grid,
         surface_diags,
         supp_nb_np,
-    ) = _infer_l2_and_render(
+    ) = _infer_seed_and_render(
         model,
         prep,
         device,
-        n_l2_iters=int(model.dynamics.T_refine),
         collect_diags=collect_diags,
         apply_ridge_nms=apply_ridge_nms,
-        infer_l2_kw=infer_l2_kw,
         timings=timings,
-        no_dynamics=no_dynamics,
     )
 
     return (
@@ -413,10 +266,7 @@ def forward_with_diagnostics(
     )
 
 
-def _format_model_summary(
-    model, device, diagnostics, *, l2_iters=None,
-):
-    d = model.dynamics
+def _format_model_summary(model, device, diagnostics):
     r = model.renderer
     lines = [
         "Model",
@@ -427,12 +277,12 @@ def _format_model_summary(
         "L1",
         *format_l1_param_lines(model),
         "",
-        "L2",
-        *format_l2_param_lines(d),
+        "Seed",
+        *format_seed_param_lines(model.seed),
+        "",
+        "Renderer",
+        *format_renderer_param_lines(r),
     ]
-    if l2_iters is not None and int(l2_iters) != int(d.T_refine):
-        lines.append(f"  T_infer={int(l2_iters)}")
-    lines += ["", "Renderer", *format_renderer_param_lines(r)]
     return lines
 
 
@@ -461,35 +311,11 @@ def main():
     )
     ap.add_argument("--shape_theta_bins", type=int, default=INFER.SHAPE_THETA_BINS)
     ap.add_argument(
-        "--l2_iters",
-        type=int,
-        default=INFER.L2_ITERS,
-        metavar="N",
-        help=(
-            "Number of L2 refine steps (default: checkpoint T_refine). "
-            "All interior cells update every step; the loop runs T_refine iterations."
-        ),
-    )
-    ap.add_argument(
         "-d",
         "--diagnostics",
         action="store_true",
-        help="Save additional diagnostics: base, l0_pinwheel, l1_rho_masses, geometry, "
-        "l2_rho_seed_post (seed, post, Δρ), l2_rho_hist_cdf, l2_bimodality_per_iter, "
-        "l2_facilitation_factors, "
-        "l2_suppression_factors, l2_bin_dynamics, render_softmap, "
-        f"iters_snapshot (up to {TRAIN.L2_SNAPSHOT_MAX} softmaps evenly spaced over L2 steps; "
-        "single map if --no-dynamics), "
-        "render_theta_bins, overlay (base RGB with thresholded edges).",
-    )
-    ap.add_argument(
-        "--no-dynamics",
-        action="store_true",
-        help=(
-            "Skip L2 refinement: use NR-normalized ρ_seed (same as TileDynamics IC), "
-            "same interior mask as TileDynamics, pass through the bilinear renderer; "
-            "threshold to edges and save softmap as usual."
-        ),
+        help="Save additional diagnostics: base, l0_pinwheel, l1_rho_masses, "
+        "cell_rho, rho_hist_cdf, render_softmap, render_theta_bins, overlay.",
     )
     ap.add_argument("--device", default=None)
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -503,20 +329,10 @@ def main():
 
     ckpt = torch.load(args.model, map_location="cpu", weights_only=False)
     model = build_model(ckpt, device)
-    t_refine_ckpt = int(model.dynamics.T_refine)
-    l2_iters = (
-        int(args.l2_iters) if args.l2_iters is not None else t_refine_ckpt
-    )
-    if not args.no_dynamics and l2_iters < 1:
-        ap.error("--l2_iters must be >= 1")
 
     if args.verbose:
-        for line in _format_model_summary(
-            model, device, args.diagnostics, l2_iters=l2_iters,
-        ):
+        for line in _format_model_summary(model, device, args.diagnostics):
             print(line)
-        if args.no_dynamics:
-            print("  mode:       --no-dynamics (ρ_seed → renderer, no L2)")
         print()
 
     img_path = os.path.join(args.input_dir, args.image)
@@ -527,31 +343,25 @@ def main():
     )
 
     collect_diags = args.verbose or args.diagnostics
-    model.dynamics.T_refine = l2_iters
-    try:
-        (bmap, theta_map, rho_post, branch_grid, is_border, diags, _, fwd_t) = (
-            forward_with_diagnostics(
-                model,
-                prep,
-                device,
-                infer_l2_kw={},
-                collect_diags=collect_diags,
-                apply_ridge_nms=args.ridge_nms,
-                no_dynamics=args.no_dynamics,
-            )
+    (bmap, theta_map, rho_post, branch_grid, is_border, diags, _, fwd_t) = (
+        forward_with_diagnostics(
+            model,
+            prep,
+            device,
+            collect_diags=collect_diags,
+            apply_ridge_nms=args.ridge_nms,
         )
-    finally:
-        model.dynamics.T_refine = t_refine_ckpt
+    )
 
-    d = model.dynamics
+    seed = model.seed
     cf = prep["cells_flat"]
     nH, nW = int(prep["nH"]), int(prep["nW"])
     N = nH * nW
-    K = d.K
+    K = seed.K
     rho_bins_t = cf["rho_bins"].to(device).float().reshape(N, K)
     ib_t = cf["is_border"].to(device).reshape(N)
     rho_seed_vis = (
-        rho_seed_from_bins(rho_bins_t, d.eta_z, ib_t, float(d.eps))
+        rho_seed_from_bins(rho_bins_t, seed.eta_z, ib_t, float(seed.eps))
         .max(dim=-1)
         .values
         .detach()
@@ -559,58 +369,15 @@ def main():
         .numpy()
         .reshape(nH, nW)
     )
-    if args.verbose and args.no_dynamics:
-        print("L2: skipped (--no-dynamics); ρ_seed on interior cells → bilinear ρ map.")
-    elif args.verbose and diags is not None and "iter_stats" in diags:
-        stats = diags["iter_stats"]
-        if stats and all(
-            k in stats[0]
-            for k in (
-                "iter",
-                "rho_mean",
-                "rho_min",
-                "rho_max",
-                "rho_delta_mean",
-                "rho_delta_max",
-                "mid_band_frac",
-            )
-        ):
-            print("L2 iter")
-            print(
-                "  iter   rho_mean   rho_min   rho_max   drho_mean   drho_max   midband"
-            )
-            for st in stats:
-                print(
-                    f"  {st['iter']:>4d}   "
-                    f"{st['rho_mean']:>9.6f}  "
-                    f"{st['rho_min']:>9.6f}  "
-                    f"{st['rho_max']:>9.6f}  "
-                    f"{st['rho_delta_mean']:>9.6f}  "
-                    f"{st['rho_delta_max']:>9.6f}  "
-                    f"{st['mid_band_frac']:>9.6f}"
-                )
-        elif stats:
-            st0 = stats[0]
-            if "n_interior" in st0:
-                print(f"  n_interior={st0['n_interior']}")
-            if "rho_mean" in st0:
-                print(f"  rho_mean={st0['rho_mean']:.6f}")
-            if "rho_max" in st0:
-                print(f"  rho_max={st0['rho_max']:.6f}")
-            if "mid_band_frac" in st0:
-                print(f"  midband={st0['mid_band_frac']:.6f}")
 
-    iters_snapshot: tuple[list[int], list[np.ndarray]] | None = None
-    if args.diagnostics:
-        iters_snapshot = collect_iters_snapshot_softmaps(
-            model,
-            prep,
-            device,
-            l2_iters,
-            bmap,
-            apply_ridge_nms=args.ridge_nms,
-            no_dynamics=args.no_dynamics,
-        )
+    if args.verbose and diags is not None and "iter_stats" in diags:
+        st0 = diags["iter_stats"][0] if diags["iter_stats"] else {}
+        if "n_interior" in st0:
+            print(f"  n_interior={st0['n_interior']}")
+        if "rho_mean" in st0:
+            print(f"  cell ρ mean={st0['rho_mean']:.6f}")
+        if "rho_max" in st0:
+            print(f"  cell ρ max={st0['rho_max']:.6f}")
 
     del model, ckpt
     gc.collect()
@@ -634,46 +401,16 @@ def main():
         )
         saved_files.append(p_rho)
 
-        p_maps = os.path.join(od, f"{stem}_l2_rho_seed_post.png")
+        p_maps = os.path.join(od, f"{stem}_cell_rho.png")
         viz_infer_cell_rho_maps(
             rho_seed_vis, rho_post, is_border, p_maps,
         )
         saved_files.append(p_maps)
 
-        p_hist = os.path.join(od, f"{stem}_l2_rho_hist_cdf.png")
+        p_hist = os.path.join(od, f"{stem}_cell_rho_hist_cdf.png")
         viz_infer_rho_hist_cdf(rho_seed_vis, rho_post, is_border, p_hist)
         saved_files.append(p_hist)
 
-        if diags is not None and diags.get("geometry"):
-            p_geom = os.path.join(od, f"{stem}_geometry.png")
-            if viz_infer_l2_geometry(diags, is_border, p_geom):
-                saved_files.append(p_geom)
-
-        if diags is not None and diags.get("bimodality_per_iter"):
-            p_bimod = os.path.join(od, f"{stem}_l2_bimodality_per_iter.png")
-            if viz_l2_bimodality_per_iter(diags["bimodality_per_iter"], p_bimod):
-                saved_files.append(p_bimod)
-
-        if diags is not None and (
-            "support_B" in diags
-            or "sigma_mag" in diags
-            or "rho_coll" in diags
-        ):
-            p_sig = os.path.join(od, f"{stem}_l2_facilitation_factors.png")
-            if viz_infer_l2_facilitation_factors(diags, is_border, p_sig):
-                saved_files.append(p_sig)
-
-        if diags is not None and (
-            "iso_pool" in diags or "cross_pool" in diags
-        ):
-            p_supp = os.path.join(od, f"{stem}_l2_suppression_factors.png")
-            if viz_infer_l2_suppression_factors(diags, is_border, p_supp):
-                saved_files.append(p_supp)
-
-        if diags is not None and diags.get("D_tile") is not None:
-            p_bin = os.path.join(od, f"{stem}_l2_bin_dynamics.png")
-            if viz_infer_l2_bin_dynamics(diags, is_border, p_bin, K=L2.K):
-                saved_files.append(p_bin)
     threshold = float(args.threshold)
 
     edges_u8 = ((np.asarray(bmap) >= threshold).astype(np.uint8)) * 255
@@ -690,12 +427,6 @@ def main():
         save_rho_png(bmap, p_ridge)
         saved_files.append(p_ridge)
 
-        if iters_snapshot is not None:
-            snap_steps, snap_maps = iters_snapshot
-            p_snap = os.path.join(od, f"{stem}_iters_snapshot.png")
-            viz_infer_iters_snapshot(snap_maps, snap_steps, p_snap)
-            saved_files.append(p_snap)
-
         p_orient = os.path.join(od, f"{stem}_render_theta_bins.png")
         viz_infer_shape_readout(
             theta_map,
@@ -711,7 +442,7 @@ def main():
         prep_t["l0"]
         + prep_t["l1"]
         + prep_t["render_precompute"]
-        + fwd_t["l2"]
+        + fwd_t["seed"]
         + fwd_t["render"]
     )
     elapsed_s = inference_s + save_s
@@ -720,7 +451,7 @@ def main():
         print("Timings")
         print(f"  L0={prep_t['l0']:.3f}s  L1={prep_t['l1']:.3f}s  "
               f"render_pre={prep_t['render_precompute']:.3f}s  "
-              f"L2={fwd_t['l2']:.3f}s  render={fwd_t['render']:.3f}s")
+              f"seed={fwd_t['seed']:.3f}s  render={fwd_t['render']:.3f}s")
         print(f"  inference={inference_s:.3f}s  save={save_s:.3f}s  elapsed={elapsed_s:.3f}s")
         print(f"  ridge_nms={int(args.ridge_nms)}  threshold={threshold:.4f}")
         print()

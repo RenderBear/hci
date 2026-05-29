@@ -1,6 +1,6 @@
 r"""test.py — STRIATE test-set evaluation (ODS, OIS, AP).
 
-Per image: same L0 to L1 to L2 to render path as inference (raw boundary map). Two
+Per image: same L0 → L1 → seed → render path as inference (raw boundary map). Two
 prediction tracks: ``c_eval`` without ridge NMS; ``s_eval`` with ridge NMS
 along dominant theta. BSDS-style matching uses about 0.75% of the image
 diagonal.
@@ -26,7 +26,7 @@ import torch
 from PIL import Image
 from scipy.ndimage import binary_dilation
 
-from params import L0, L1, L2, RENDER, TEST
+from params import L0, L1, SEED, RENDER, TEST
 from hci.L0 import compute_l0_rgb, compute_interior
 from hci.L1 import z_from_l0_harmonics, pad_for_patch_grid, run_l1
 from hci.renderer import (
@@ -41,6 +41,7 @@ from train import (
     build_cells_flat,
     build_l0_pix,
     report_checkpoint_compatibility,
+    upgrade_model_state_dict,
 )
 
 EVAL_THRESHOLDS = np.linspace(0.01, 0.99, TEST.THRESHOLD_COUNT)
@@ -48,15 +49,12 @@ EVAL_THRESHOLDS = np.linspace(0.01, 0.99, TEST.THRESHOLD_COUNT)
 
 def build_model(ckpt, device):
     m = StriateE2E(
-        r_fac_pool=L2.R_FAC_POOL,
-        r_sup_pool=L2.R_SUP_POOL,
-        K=L2.K,
-        t_refine=L2.T_REFINE,
-        eps=L2.EPS,
+        K=SEED.K,
+        eps=SEED.EPS,
         render_cell_hidden=RENDER.CELL_HIDDEN,
         render_pixel_hidden=RENDER.PIXEL_HIDDEN,
     )
-    sd = ckpt["model_state"]
+    sd = upgrade_model_state_dict(ckpt["model_state"])
     sd = upgrade_renderer_state_dict(sd, prefix="renderer.")
     incompatible = m.load_state_dict(sd, strict=False)
     report_checkpoint_compatibility(incompatible, context="test build_model")
@@ -188,7 +186,7 @@ def run_image_inference(model, img_path, device):
     )
 
     nH, nW = cells["nH"], cells["nW"]
-    proj = compute_render_features(z2_img, ir_p, cells, bm_np, eps=L2.EPS)
+    proj = compute_render_features(z2_img, ir_p, cells, bm_np, eps=SEED.EPS)
     del z2_img, bm_np
     gc.collect()
 
@@ -205,7 +203,7 @@ def run_image_inference(model, img_path, device):
     proj_dev = proj_to_device(proj, device)
 
     with torch.no_grad():
-        rho_out, branch, _, _, _, cf_out, _ = model.dynamics(cells_flat=cf_dev)
+        rho_out, branch, _, _, _, cf_out, _ = model.seed(cells_flat=cf_dev)
         bmap_t, theta_t = render_boundary_map_torch(
             rho_out,
             proj_dev,

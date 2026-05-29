@@ -32,22 +32,11 @@ L1 = SimpleNamespace(
     COL_COS_POWER=2,
 )
 
-# ── L2: cell-grid conv dynamics (ρ refinement) ───────────────────────────────
-L2 = SimpleNamespace(
-    R_FAC_POOL=5,   # collinear (facilitation) pool radius
-    R_SUP_POOL=10,   # iso / cross (suppression) pool radius
+# ── Seed: NR orientation selectivity on L1 bin masses ────────────────────────
+SEED = SimpleNamespace(
     K=12,
-    T_REFINE=5,
     EPS=1e-9,
-    ETA_Z_INIT=1e4,  # seed NR half-saturation on ρ̃ (min-subtracted ρ_bins; learned)
-    LOGIT_CLAMP=1e-4,
-    # drive / inhibition (softplus-positive, learned; constant over t)
-    B_SEED_INIT=0.5,
-    B_COLL_INIT=0.5,
-    B_ISO_INIT=0.3,
-    B_CROSS_INIT=0.3,
-    ETA_P_INIT=0.1,  # NR floor η_p² in ρ update denominator
-    ALPHA_INIT=0.5,  # refine mixing: ρ ← (1−α)ρ + α·NR(drive,inhib)
+    ETA_Z_INIT=0.1,  # NR half-saturation on ρ̃ (learned, softplus)
 )
 
 # ── Render: §2.5 anisotropic splat + ρ̄ gate G + perp conv (see striate/renderer.py) ─
@@ -68,6 +57,10 @@ RENDER = SimpleNamespace(
     SMOOTH_SIGMA_INIT=2.0,  # σ_s along-contour (softplus → ~2 px)
     SMOOTH_RADIUS=3,
     PRE_SMOOTH_RADIUS=3,
+    # Thinning head: F_p ∈ R^20 = [ρ̄, coh, tang9, norm9]; MLP 20→12→1
+    THINNING_IN=20,
+    THINNING_HIDDEN=12,
+    STENCIL_TAPS=9,  # j ∈ {-4,…,4} along tangent and normal
 )
 
 # ── Training ───────────────────────────────────────────────────────────────
@@ -79,17 +72,15 @@ TRAIN = SimpleNamespace(
     NUM_WORKERS=2,
     LAM_DICE=1.0,
     LAM_BCE=0.0,
-    # Bump when L0 / pad / ``l0_pix`` / GT schema changes — not L1 binning or L2.
+    # Bump when L0 / pad / ``l0_pix`` / GT schema changes — not L1 binning or seed.
     L0_CACHE_VERSION=1,
     # Legacy full-cache tag (pre-rho split); kept so old ``.pt`` files are rejected cleanly.
     CACHE_VERSION=44,
-    L2_SNAPSHOT_MAX=5,
 )
 
 # ── Inference ────────────────────────────────────────────────────────────────
 INFER = SimpleNamespace(
     DEFAULT_THRESHOLD=0.5,
-    L2_ITERS=None,
     SHAPE_THETA_BINS=12,
 )
 

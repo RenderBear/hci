@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from PIL import Image
 
-from params import L0, L2, VIZ
+from params import L0, VIZ
 
 
 def rho_heatmap_cmap():
@@ -542,9 +542,9 @@ def viz_infer_l1_rho_masses(
         is_border,
         out_path,
         suptitle=(
-            r"L1 bin masses (L2 seed: "
-            r"$\rho_{\mathrm{raw}}=\rho_{\mathrm{bins}}$; "
-            r"$\tilde\rho=\rho_{\mathrm{raw}}-\min_k\rho_{\mathrm{raw}}^{(k)}$; "
+            r"L1 bin masses (seed: "
+            r"$\hat\rho=\rho_{\mathrm{bins}}/(\rho_{\mathrm{total}}+\varepsilon)$; "
+            r"$\tilde\rho=\hat\rho-\min_k\hat\rho^{(k)}$; "
             r"$\rho_{\mathrm{seed}}=\tilde\rho^2/(\tilde\rho^2+\eta_z^2)$)"
         ),
     )
@@ -556,7 +556,7 @@ def viz_infer_cell_rho_maps(
     is_border: np.ndarray,
     out_path: str,
 ) -> None:
-    """Seed vs post-L2 ρ (max over K) and Δρ = post − seed."""
+    """Cell ρ (max over K seed bins) and duplicate panel for renderer input."""
     seed = apply_border_zero(np.asarray(rho_seed, dtype=np.float64), is_border)
     post = apply_border_zero(np.asarray(rho_post, dtype=np.float64), is_border)
     delta = post - seed
@@ -565,11 +565,10 @@ def viz_infer_cell_rho_maps(
     cmap_pos = rho_heatmap_cmap()
     fig, axes = plt.subplots(1, 3, figsize=(15, 5), facecolor=VIZ.BG)
     suptitle = (
-        r"Cell $\rho$ — seed IC, post-L2, and $\Delta\rho$ "
-        r"($\tilde\rho=\rho_{\mathrm{raw}}-\min_k\rho_{\mathrm{raw}}^{(k)}$, "
-        r"$\rho_{\mathrm{seed}}=\tilde\rho^2/(\tilde\rho^2+\eta_z^2)$, "
-        r"$\rho_{\mathrm{raw}}=\rho_{\mathrm{bins}}$; "
-        r"scalar maps = $\max_k \rho^{(k)}$)"
+        r"Cell $\rho$ — seed and renderer input "
+        r"($\hat\rho=\rho_{\mathrm{bins}}/(\rho_{\mathrm{total}}+\varepsilon)$; "
+        r"$\rho_{\mathrm{seed}}=\tilde\rho^2/(\tilde\rho^2+\eta_z^2)$; "
+        r"scalar $\rho=\max_k \rho_{\mathrm{seed}}^{(k)}$)"
     )
 
     for ax in axes:
@@ -577,8 +576,8 @@ def viz_infer_cell_rho_maps(
         ax.axis("off")
 
     panels_pos = (
-        (seed, r"seed $\rho^{(0)}$ (max over K)"),
-        (post, r"post-L2 $\rho$ (max over K)"),
+        (seed, r"seed $\rho$ (max over K)"),
+        (post, r"renderer $\rho$ (max over K)"),
     )
     for ax, (arr, title) in zip(axes[:2], panels_pos):
         m = max(float(np.max(arr)), VIZ.EPS)
@@ -634,10 +633,10 @@ def viz_infer_rho_hist_cdf(
 
     viz_hist_cdf_columns(
         [rho_seed, rho_post],
-        [r"seed $\rho^{(0)}$", "post-L2 ρ"],
+        [r"seed $\rho$", r"renderer $\rho$"],
         is_border,
         out_path,
-        suptitle="L2 dynamics — count vs ρ and empirical CDFs (cumulative count)",
+        suptitle="Cell ρ — count vs value and empirical CDFs (interior cells)",
     )
 
 

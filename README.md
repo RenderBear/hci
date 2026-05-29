@@ -13,7 +13,7 @@ STRIATE/
 ├── hci/
 │   ├── L0.py                # pixel-level contrast
 │   ├── L1.py                # cell-level K-bin projection
-│   ├── L2.py                # tile-level coupled dynamics
+│   ├── seed.py              # NR seed (learned η_z) → scalar ρ
 │   ├── renderer.py          # learned ridge projection
 │   └── diagnostics_viz.py   # visualisation utilities
 ├── data/                    # train, test, infer images (generic layout)
@@ -22,7 +22,7 @@ STRIATE/
     └── test/results.json
 ```
 
-**Equation and notation reference:** `equations.md` (code-aligned STRIATE pipeline: L0 → L1 K-bin → L2 → splat renderer) and `docs/docs.html` (open in a browser).
+**Equation and notation reference:** `equations.md` (code-aligned STRIATE pipeline: L0 → L1 K-bin → seed → splat renderer) and `docs/docs.html` (open in a browser).
 
 ## Requirements
 

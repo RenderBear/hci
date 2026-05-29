@@ -3,18 +3,18 @@ r"""Renderer — Gaussian-line splat + MLP thinning head (paper §2.5).
 Pipeline:
   1. Cell grid: ρ-weighted θ combing → ρ-gated anchor smoothing.
   2. Gaussian-line splat of ρ★ at |z₂|-weighted anchors with learned σ⊥ → ρ̄(p).
-  3. Per-pixel feature vector F_p = [ρ̄, coh, tang5, norm5] ∈ R¹².
+  3. Per-pixel feature vector F_p = [ρ̄, coh, tang9, norm9] ∈ R²⁰.
   4. Thinning head: B̂(p) = ρ̄(p) · σ(W₂ ReLU(W₁ F_p + b₁) + b₂).
   NMS at inference thins to single-pixel width.
 
 The splat deposits faithfully; the MLP can only thin (multiplicative gate ≤ 1).
-The MLP is initialised with structural priors (Mexican hat on norm5, flat smooth
-on tang5, near-identity gate at t=0) so training bends the gate where the priors
+The MLP is initialised with structural priors (Mexican hat on norm9, flat smooth
+on tang9, near-identity gate at t=0) so training bends the gate where the priors
 disagree with the data.
 
 Learned: σ⊥ (cross-ridge width), s_t and s_n (stencil spacings),
-         MLP 12→8→1 (96 + 8 + 8 + 1 = 113 params).
-         Total: 116 scalars.
+         MLP 20→12→1 (240 + 12 + 12 + 1 = 265 params).
+         Total: 268 scalars.
 """
 
 from __future__ import annotations
@@ -203,14 +203,15 @@ def _bilinear_sample_2d(
     return out.reshape(row.shape)
 
 
-def _sample_stencil_5(
+def _sample_stencil_9(
     field: torch.Tensor,
     theta: torch.Tensor,
     spacing: torch.Tensor,
     direction: str,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """5-tap stencil along tangent or normal. Returns (H, W, 5)."""
+    """9-tap stencil along tangent or normal (j ∈ {-4,…,4}). Returns (H, W, 9)."""
+    _ = eps
     H, W = field.shape
     device, dtype = field.device, field.dtype
     rows = torch.arange(H, device=device, dtype=dtype).unsqueeze(1).expand(H, W)
@@ -221,7 +222,7 @@ def _sample_stencil_5(
     else:  # normal
         dr, dc = -torch.sin(theta), torch.cos(theta)
     taps = []
-    for k in range(-2, 3):
+    for k in range(-4, 5):
         r_off = rows + k * sp * dr
         c_off = cols + k * sp * dc
         taps.append(_bilinear_sample_2d(field, r_off, c_off))
@@ -291,21 +292,32 @@ def _compute_coherence(
     return (sum_rho_cos2 / (sum_rho + eps)).reshape(H, W)
 
 
+# Feature layout: [ρ̄, coh, tang_{-4}…tang_4, norm_{-4}…norm_4] ∈ R^20
+_FEAT_DIM = int(getattr(RENDER, "THINNING_IN", 20))
+_TANG_SLICE = slice(2, 11)
+_NORM_SLICE = slice(11, 20)
+_THIN_HIDDEN = int(getattr(RENDER, "THINNING_HIDDEN", 12))
+
+
 # ═══════════════════════════════════════════════════════════════
-# Thinning head (12 → 8 → 1 MLP)
+# Thinning head (20 → 12 → 1 MLP)
 # ═══════════════════════════════════════════════════════════════
 
 class ThinningHead(nn.Module):
-    """12→8→1 MLP: σ(W₂ ReLU(W₁ F + b₁) + b₂).
+    """20→12→1 MLP: σ(W₂ ReLU(W₁ F + b₁) + b₂).
 
-    F = [ρ̄, coh, tang5(5), norm5(5)] ∈ R¹².
-    Initialised with structural priors per §A.10.
+    F = [ρ̄, coh, tang9(9), norm9(9)] ∈ R²⁰.
+    Initialised with structural priors per spec.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        in_dim: int = _FEAT_DIM,
+        hidden_dim: int = _THIN_HIDDEN,
+    ):
         super().__init__()
-        self.fc1 = nn.Linear(12, 8, bias=True)
-        self.fc2 = nn.Linear(8, 1, bias=True)
+        self.fc1 = nn.Linear(in_dim, hidden_dim, bias=True)
+        self.fc2 = nn.Linear(hidden_dim, 1, bias=True)
         self._init_priors()
 
     def _init_priors(self) -> None:
@@ -314,18 +326,19 @@ class ThinningHead(nn.Module):
             self.fc1.bias.zero_()
             self.fc2.weight.zero_()
 
-            # Unit 0: Mexican-hat on norm5 (channels 7–11)
-            mex_hat = torch.tensor([-0.25, -0.25, 1.0, -0.25, -0.25])
-            self.fc1.weight[0, 7:12] = mex_hat
+            # Unit 0: Mexican-hat on norm9 (non-max suppression)
+            mex_hat = torch.full((9,), -0.25)
+            mex_hat[4] = 1.0
+            self.fc1.weight[0, _NORM_SLICE] = mex_hat
 
-            # Unit 0: flat smoothing on tang5 (channels 2–6)
-            self.fc1.weight[0, 2:7] = 0.2
+            # Unit 1: flat 1/9 on tang9 (along-contour smooth)
+            self.fc1.weight[1, _TANG_SLICE] = 1.0 / 9.0
 
-            # b₂ = 2 so σ(0 + 2) ≈ 0.88 — near-identity gate at t=0
+            # W₂ = 0, b₂ = 2 → gate ≈ σ(2) ≈ 0.88 at init (near-identity)
             self.fc2.bias.fill_(2.0)
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
-        """features: (N, 12). Returns: (N,) gate in (0, 1)."""
+        """features: (N, 20). Returns: (N,) gate in (0, 1)."""
         h = F.relu(self.fc1(features))
         return torch.sigmoid(self.fc2(h).squeeze(-1))
 
@@ -337,8 +350,8 @@ class ThinningHead(nn.Module):
 class ModulationRenderer(nn.Module):
     """Gaussian splat + thinning head (paper §2.5).
 
-    Learned: σ⊥ (1), s_t (1), s_n (1), ThinningHead 12→8→1 (113).
-    Total: 116 parameters.
+    Learned: σ⊥ (1), s_t (1), s_n (1), ThinningHead 20→12→1 (265).
+    Total: 268 parameters.
     """
 
     def __init__(self, hidden: int | None = None, **kwargs):
@@ -472,7 +485,7 @@ def render_boundary_map_torch(
             return out, torch.zeros_like(out)
         return out
 
-    # Detach anchors and θ: no coordinate gradients back to L2
+    # Detach anchors and θ: no coordinate gradients back to seed
     cx_det, cy_det = _cx.detach(), _cy.detach()
     theta_det = theta_c.detach()
     rho_splat = torch.where(is_border, torch.zeros_like(rho_flat), rho_flat)
@@ -492,18 +505,18 @@ def render_boundary_map_torch(
     )
 
     # ── Step 4: Feature vector F_p ────────────────────────────
-    tang5 = _sample_stencil_5(rho_bar, theta_star, renderer.s_t, "tangent", eps)
-    norm5 = _sample_stencil_5(rho_bar, theta_star, renderer.s_n, "normal", eps)
-    # F_p = [ρ̄, coh, tang5(5), norm5(5)] ∈ R¹²
+    tang9 = _sample_stencil_9(rho_bar, theta_star, renderer.s_t, "tangent", eps)
+    norm9 = _sample_stencil_9(rho_bar, theta_star, renderer.s_n, "normal", eps)
+    # F_p = [ρ̄, coh, tang9(9), norm9(9)] ∈ R²⁰
     features = torch.cat([
         rho_bar.unsqueeze(-1),
         coh.unsqueeze(-1),
-        tang5,
-        norm5,
-    ], dim=-1)  # (H, W, 12)
+        tang9,
+        norm9,
+    ], dim=-1)  # (H, W, 20)
 
     # ── Step 5: Thinning head → B̂(p) = ρ̄(p) · gate(p) ──────
-    feat_flat = features.reshape(H * W, 12)
+    feat_flat = features.reshape(H * W, _FEAT_DIM)
     gate = renderer.thinning(feat_flat).reshape(H, W)
     bmap = rho_bar * gate
 

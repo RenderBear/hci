@@ -1,8 +1,7 @@
-r"""train.py — STRIATE training: cell-grid conv dynamics + harmonic render.
+r"""train.py — STRIATE training: L1 projection + seed NR + harmonic render.
 
 Pipeline per image: L0 contrast/harmonics (cached) → L1 K-bin projection live each step
-→ L2 cell-grid ρ refinement (ρ_raw + per-bin NR seed; lateral refine + mixing)
-→ splat renderer ($\hat B = \bar\rho \cdot \mathrm{gate}$).
+→ seed NR (η_z) → splat renderer ($\hat B = \bar\rho \cdot \mathrm{gate}$).
 Loss combines soft-Dice and per-pixel BCE on the same η± valid band
 (target≥η_pos or target<η_neg), weighted by ``--lam_dice`` and ``--lam_bce``
 (each can be 0).
@@ -36,14 +35,14 @@ from hci.L1 import (
     pad_for_patch_grid,
     run_l1,
 )
-from hci.L2 import TileDynamics, _inv_softplus
+from hci.seed import CellSeed, _inv_softplus
 from hci.renderer import (
     ModulationRenderer,
     render_boundary_map_torch,
     proj_to_device,
     upgrade_renderer_state_dict,
 )
-from params import L0, L1, L2, RENDER, TRAIN, VIZ
+from params import L0, L1, SEED, RENDER, TRAIN, VIZ
 
 
 def build_l0_pix(
@@ -86,7 +85,7 @@ def build_l0_pix(
 
 
 def proj_info_from_grid(H: int, W: int, P: int, patch_overlap: int) -> dict:
-    """Render/L2 grid metadata without running L1."""
+    """Render grid metadata without running L1."""
     S = stride_from_patch_overlap(P, patch_overlap)
     nH = (H - P) // S + 1 if H >= P else 0
     nW = (W - P) // S + 1 if W >= P else 0
@@ -94,7 +93,7 @@ def proj_info_from_grid(H: int, W: int, P: int, patch_overlap: int) -> dict:
 
 
 def build_cells_flat_torch(cells: dict) -> dict:
-    """Flatten ``run_l1(..., return_torch=True)`` grids for L2 / renderer."""
+    """Flatten ``run_l1(..., return_torch=True)`` grids for seed / renderer."""
     nH, nW = int(cells["nH"]), int(cells["nW"])
     N = nH * nW
     return {
@@ -181,27 +180,16 @@ def build_cells_flat(cells: dict) -> dict:
 class StriateE2E(nn.Module):
     def __init__(
         self,
-        r_fac_pool: int,
-        r_sup_pool: int,
-        K: int,
-        t_refine: int,
-        eps: float,
-        eta_z_init: float = L2.ETA_Z_INIT,
+        K: int = SEED.K,
+        eps: float = SEED.EPS,
+        eta_z_init: float = SEED.ETA_Z_INIT,
         render_cell_hidden: int = RENDER.CELL_HIDDEN,
         render_pixel_hidden: int = RENDER.PIXEL_HIDDEN,
         **kw,
     ):
         super().__init__()
-        _ = kw  # legacy kwargs (e.g. stride, r_pool) ignored
-        self.dynamics = TileDynamics(
-            r_fac_pool=r_fac_pool,
-            r_sup_pool=r_sup_pool,
-            K=K,
-            t_refine=t_refine,
-            eps=eps,
-            eta_z_init=eta_z_init,
-            tbptt_n_segments=TRAIN.L2_SNAPSHOT_MAX,
-        )
+        _ = kw  # legacy kwargs (e.g. r_fac_pool, t_refine) ignored
+        self.seed = CellSeed(K=K, eps=eps, eta_z_init=eta_z_init)
         _ = render_cell_hidden
         self.renderer = ModulationRenderer(hidden=render_pixel_hidden)
         self._l1_von_mises_kappa_raw = nn.Parameter(
@@ -221,7 +209,7 @@ class StriateE2E(nn.Module):
         bmaps = []
         for m in meta_list:
             cf_flat = m["cells_flat_dev"]
-            rho_out, branch, _, _, _, cf_out, _ = self.dynamics(cells_flat=cf_flat)
+            rho_out, branch, _, _, _, cf_out, _ = self.seed(cells_flat=cf_flat)
             bmap = render_boundary_map_torch(
                 rho_out,
                 m["proj_dev"],
@@ -556,17 +544,27 @@ def bce_loss_with_ignore(
     return (bce * v).sum() / v.sum().clamp_min(eps)
 
 
-def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
-    """One training batch: drive term stats + ∂loss/∂(b_coll, η_iso, …)."""
+def upgrade_model_state_dict(state_dict: dict) -> dict:
+    """Map legacy ``dynamics.*`` keys to ``seed.*``; drop removed L2 params."""
+    out: dict = {}
+    for k, v in state_dict.items():
+        if k == "dynamics._eta_z_raw":
+            out["seed._eta_z_raw"] = v
+        elif k.startswith("dynamics."):
+            continue
+        else:
+            out[k] = v
+    return out
+
+
+def debug_seed_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
+    """One training batch: seed stats + ∂loss/∂η_z."""
     model.train()
-    d = model.dynamics
     meta = meta_list[0]
     cf = meta["cells_flat_dev"]
 
     model.zero_grad(set_to_none=True)
-    rho_out, _, _, _, _, cf_out, diags = d(
-        cf, return_drive_debug=True,
-    )
+    rho_out, _, _, _, _, cf_out, diags = model.seed(cf, return_surface_diags=True)
     bmap = render_boundary_map_torch(
         rho_out,
         meta["proj_dev"],
@@ -590,33 +588,18 @@ def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
         )
     loss.backward()
 
-    print("\n--- L2 drive debug (last refine step, interior cells) ---")
-    if diags and "drive_debug" in diags:
-        for k, v in diags["drive_debug"].items():
-            print(f"  {k}: {v:.4f}")
-    print("\n  learned (value):")
-    for name in (
-        "b_coll", "b_seed", "b_iso", "b_cross",
-        "eta_p", "eta_z", "alpha", "l1_von_mises_kappa",
-    ):
-        p = getattr(d, name)
-        val = float(p.detach()) if not isinstance(p, torch.Tensor) else float(p.item())
-        print(f"    {name}={val:.4f}")
-    print("\n  |grad| on raw params:")
-    for raw, label in (
-        ("_b_coll_raw", "b_coll"),
-        ("_b_iso_raw", "b_iso"),
-        ("_b_cross_raw", "b_cross"),
-        ("_eta_p_raw", "eta_p"),
-        ("_eta_z_raw", "eta_z"),
-        ("_alpha_raw", "alpha"),
-        ("_l1_von_mises_kappa_raw", "l1_von_mises_kappa"),
-    ):
-        t = getattr(d, raw, None)
-        if t is None or t.grad is None:
-            print(f"    {label}: grad=None")
-        else:
-            print(f"    {label}: |grad|={t.grad.abs().mean().item():.2e}")
+    print("\n--- seed debug ---")
+    if diags and "iter_stats" in diags and diags["iter_stats"]:
+        st = diags["iter_stats"][0]
+        for key in ("rho_mean", "rho_max", "mid_band_frac", "n_interior"):
+            if key in st:
+                print(f"  {key}: {st[key]}")
+    print(f"\n  η_z={model.seed.eta_z.item():.4g} (learned)")
+    t = model.seed._eta_z_raw
+    if t.grad is None:
+        print("  |grad| η_z: grad=None")
+    else:
+        print(f"  |grad| η_z: {t.grad.abs().mean().item():.2e}")
     print(f"\n  loss={loss.item():.4f}  requires_grad={loss.requires_grad}\n")
 
 
@@ -629,7 +612,7 @@ def plot_training_curves(history, out_dir):
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 5), facecolor=VIZ.BG)
     fig.suptitle(
-        "STRIATE unified dynamics  learned ridge render",
+        "STRIATE seed + learned ridge render",
         fontsize=12,
         color=VIZ.FG,
         fontfamily="monospace",
@@ -679,67 +662,38 @@ def format_l1_param_lines(model: StriateE2E, *, indent: str = "  ") -> list[str]
     ]
 
 
-def format_l2_param_lines(d, *, indent: str = "  ") -> list[str]:
-    """Multi-line L2 learned-parameter summary (infer / train logging)."""
-    sub = indent + "  "
+def format_seed_param_lines(seed, *, indent: str = "  ") -> list[str]:
     return [
-        f"{indent}geometry:  K={d.K}  R_fac={d.R_fac}  R_sup={d.R_sup}  T_refine={d.T_refine}",
-        f"{indent}binning:   K-channel ρ state (per-orientation hypotheses)",
-        f"{indent}drive:",
-        f"{sub}b_seed={d.b_seed.item():.3f}  b_coll={d.b_coll.item():.3f}",
-        f"{indent}inhibition:",
-        f"{sub}b_iso={d.b_iso.item():.3f}  b_cross={d.b_cross.item():.3f}  "
-        f"η_p={d.eta_p.item():.3f}  α={d.alpha.item():.3f}",
-        f"{indent}seed:  η_z={d.eta_z.item():.4g} (learned)  "
-        f"ρ̃=ρ_bins−min_k ρ_bins; ρ_seed=ρ̃²/(ρ̃²+η_z²)  "
-        f"cross^(k)=mean_{{k'≠k}} W_disk*ρ^(k'))",
+        f"{indent}η_z={seed.eta_z.item():.4g} (learned)  "
+        f"ρ̂=ρ_bins/(ρ_total+ε); ρ̃=ρ̂−min_k ρ̂; "
+        f"ρ_seed=ρ̃²/(ρ̃²+η_z²); export ρ=max_k ρ_seed",
     ]
 
 
 def format_renderer_param_lines(r, *, indent: str = "  ") -> list[str]:
-    _ = (r, indent)
+    sig = float(r.sigma_perp.detach())
+    st = float(r.s_t.detach())
+    sn = float(r.s_n.detach())
     return [
-        f"{indent}cell→pixel: bilinear resize (ρ and θ via double-angle); no render params",
+        f"{indent}σ⊥={sig:.3f}  s_t={st:.3f}  s_n={sn:.3f}  "
+        f"thinning MLP 20→12→1",
     ]
-
-
-def _format_dynamics_params(model):
-    d = model.dynamics
-    parts = [
-        "\n--- L2 ---\n",
-        *[ln + "\n" for ln in format_l2_param_lines(d, indent="")],
-        "\n--- dynamics ---\n",
-        "drive = b_seed·ρ_seed^(k) + b_coll·ρ_coll^(k)\n",
-        "ρ̃ = NR(drive², b_iso·c_iso + b_cross·cross + η_p²); "
-        "ρ ← (1−α)ρ + α·ρ̃\n",
-        "cross^(k) = mean_{k'≠k} count-norm(W_disk * ρ^(k')); grouped conv2d pools each step\n",
-    ]
-    return "".join(parts)
 
 
 def format_model_param_counts(model: StriateE2E) -> tuple[int, int, int, int]:
-    """Returns (total, L2 dynamics, L1 von Mises κ, renderer)."""
-    n_l2 = sum(p.numel() for p in model.dynamics.parameters())
+    """Returns (total, seed η_z, L1 von Mises κ, renderer)."""
+    n_seed = sum(p.numel() for p in model.seed.parameters())
     n_l1 = model._l1_von_mises_kappa_raw.numel()
     n_renderer = sum(p.numel() for p in model.renderer.parameters())
     n_total = sum(p.numel() for p in model.parameters())
-    return n_total, n_l2, n_l1, n_renderer
+    return n_total, n_seed, n_l1, n_renderer
 
 
 def format_model_param_summary(model: StriateE2E) -> str:
-    n_tot, n_l2, n_l1, n_r = format_model_param_counts(model)
+    n_tot, n_seed, n_l1, n_r = format_model_param_counts(model)
     return (
-        f"{n_tot} total = L2 dynamics {n_l2} + L1 von Mises κ {n_l1} "
+        f"{n_tot} total = seed η_z {n_seed} + L1 von Mises κ {n_l1} "
         f"(bin sharpness, not per-cell κ) + renderer {n_r}"
-    )
-
-
-def _format_render_params(model):
-    r = model.renderer
-    n_r = sum(p.numel() for p in r.parameters())
-    return (
-        f"renderer={n_r} params  "
-        f"(bilinear ρ / θ upsample; no learned σ)"
     )
 
 
@@ -805,9 +759,9 @@ def main():
         help="weight on BCE term (0 disables)",
     )
     ap.add_argument(
-        "--debug-drive",
+        "--debug-seed",
         action="store_true",
-        help="Run one batch, print drive term stats and param gradients, then exit",
+        help="Run one batch, print seed stats and η_z gradient, then exit",
     )
     args = ap.parse_args()
 
@@ -824,16 +778,12 @@ def main():
         f"  max_train={mt}"
     )
     print(
-        f"Dynamics: R_fac={L2.R_FAC_POOL}  R_sup={L2.R_SUP_POOL}  K={L2.K}  "
-        f"T={L2.T_REFINE}  "
-        f"ρ←(1−α)ρ+α·NR(drive²/(drive²+b_iso·c_iso+b_cross·cross+η_p²)); "
-        f"ρ_seed=ρ_raw²/(ρ_raw²+η_z²), ρ_raw=ρ_bins/(ρ_total+ε); α init={L2.ALPHA_INIT}; "
-        f"cross^(k)=mean_{{k'≠k}} W_disk*ρ^(k'); "
-        f"  TBPTT: max {TRAIN.L2_SNAPSHOT_MAX} refine steps/segment; "
-        f"detach every {TRAIN.L2_SNAPSHOT_MAX} steps only if T>{TRAIN.L2_SNAPSHOT_MAX}"
+        f"Seed: ρ̂=ρ_bins/(ρ_total+ε); ρ̃=ρ̂−min_k ρ̂; "
+        f"ρ_seed=ρ̃²/(ρ̃²+η_z²); η_z init={SEED.ETA_Z_INIT} (learned)"
     )
     print(
-        f"Render: bilinear cell grid → pixel ρ (and θ); no render MLP / no splat"
+        f"Render: Gaussian-line splat + stencil thinning MLP → "
+        f"$\\hat B = \\bar\\rho \\cdot \\mathrm{{gate}}$"
     )
     print(
         f"Loss: λ_dice·soft-Dice + λ_bce·BCE (η± edge band)  "
@@ -862,11 +812,8 @@ def main():
     print(f"  training on all {len(fit_stems)} images (no held-out val)")
 
     model = StriateE2E(
-        r_fac_pool=L2.R_FAC_POOL,
-        r_sup_pool=L2.R_SUP_POOL,
-        K=L2.K,
-        t_refine=L2.T_REFINE,
-        eps=L2.EPS,
+        K=SEED.K,
+        eps=SEED.EPS,
         render_cell_hidden=RENDER.CELL_HIDDEN,
         render_pixel_hidden=RENDER.PIXEL_HIDDEN,
     ).to(device)
@@ -888,13 +835,13 @@ def main():
         collate_fn=collate_fn,
     )
 
-    if args.debug_drive:
+    if args.debug_seed:
         batch = next(iter(train_loader))
         moved = []
         for item in batch:
             (gi, gt, Hp, Wp, Hg, Wg, H0, W0, l0_pix, border_mask, img) = item
             moved.append((gi, gt, Hp, Wp, Hg, Wg, H0, W0, l0_pix, border_mask, img))
-        debug_drive_batch(
+        debug_seed_batch(
             model,
             prepare_batch(moved, device, model),
             device,
