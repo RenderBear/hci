@@ -544,7 +544,8 @@ def viz_infer_l1_rho_masses(
         suptitle=(
             r"L1 bin masses (L2 seed: "
             r"$\rho_{\mathrm{raw}}=\rho_{\mathrm{bins}}/\rho_{\mathrm{total}}$; "
-            r"$\rho_{\mathrm{seed}}=\rho_{\mathrm{raw}}^2/(\rho_{\mathrm{raw}}^2+\eta_z^2)$)"
+            r"$\tilde\rho=\rho_{\mathrm{raw}}-\min_k\rho_{\mathrm{raw}}^{(k)}$; "
+            r"$\rho_{\mathrm{seed}}=\tilde\rho^2/(\tilde\rho^2+\eta_z^2)$)"
         ),
     )
 
@@ -565,7 +566,8 @@ def viz_infer_cell_rho_maps(
     fig, axes = plt.subplots(1, 3, figsize=(15, 5), facecolor=VIZ.BG)
     suptitle = (
         r"Cell $\rho$ — seed IC, post-L2, and $\Delta\rho$ "
-        r"($\rho_{\mathrm{seed}}=\rho_{\mathrm{raw}}^2/(\rho_{\mathrm{raw}}^2+\eta_z^2)$, "
+        r"($\tilde\rho=\rho_{\mathrm{raw}}-\min_k\rho_{\mathrm{raw}}^{(k)}$, "
+        r"$\rho_{\mathrm{seed}}=\tilde\rho^2/(\tilde\rho^2+\eta_z^2)$, "
         r"$\rho_{\mathrm{raw}}=\rho_{\mathrm{bins}}/\rho_{\mathrm{total}}$; "
         r"scalar maps = $\max_k \rho^{(k)}$)"
     )

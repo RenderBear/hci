@@ -186,20 +186,18 @@ class StriateE2E(nn.Module):
         K: int,
         t_refine: int,
         eps: float,
-        eta_z_init: float = L2.ETA_Z_INIT,
         render_cell_hidden: int = RENDER.CELL_HIDDEN,
         render_pixel_hidden: int = RENDER.PIXEL_HIDDEN,
         **kw,
     ):
         super().__init__()
-        _ = kw  # legacy kwargs (e.g. stride, r_pool) ignored
+        _ = kw  # legacy kwargs (e.g. stride, r_pool, eta_z_init) ignored
         self.dynamics = TileDynamics(
             r_fac_pool=r_fac_pool,
             r_sup_pool=r_sup_pool,
             K=K,
             t_refine=t_refine,
             eps=eps,
-            eta_z_init=eta_z_init,
             tbptt_n_segments=TRAIN.L2_SNAPSHOT_MAX,
         )
         _ = render_cell_hidden
@@ -597,7 +595,7 @@ def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
     print("\n  learned (value):")
     for name in (
         "b_coll", "b_seed", "b_iso", "b_cross",
-        "eta_p", "eta_z", "alpha", "l1_von_mises_kappa",
+        "eta_p", "alpha", "l1_von_mises_kappa",
     ):
         p = getattr(d, name)
         val = float(p.detach()) if not isinstance(p, torch.Tensor) else float(p.item())
@@ -608,7 +606,6 @@ def debug_drive_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
         ("_b_iso_raw", "b_iso"),
         ("_b_cross_raw", "b_cross"),
         ("_eta_p_raw", "eta_p"),
-        ("_eta_z_raw", "eta_z"),
         ("_alpha_raw", "alpha"),
         ("_l1_von_mises_kappa_raw", "l1_von_mises_kappa"),
     ):
@@ -690,8 +687,8 @@ def format_l2_param_lines(d, *, indent: str = "  ") -> list[str]:
         f"{indent}inhibition:",
         f"{sub}b_iso={d.b_iso.item():.3f}  b_cross={d.b_cross.item():.3f}  "
         f"η_p={d.eta_p.item():.3f}  α={d.alpha.item():.3f}",
-        f"{indent}seed:  η_z={d.eta_z.item():.4g}  "
-        f"ρ_raw=ρ_bins/ρ_total; ρ_seed=ρ_raw²/(ρ_raw²+η_z²)  "
+        f"{indent}seed:  η_z={d.eta_z:.4g} (fixed)  "
+        f"ρ̃=ρ_raw−min_k ρ_raw; ρ_seed=ρ̃²/(ρ̃²+η_z²)  "
         f"cross^(k)=mean_{{k'≠k}} W_disk*ρ^(k'))",
     ]
 

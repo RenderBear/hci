@@ -39,7 +39,7 @@ L2 = SimpleNamespace(
     K=12,
     T_REFINE=5,
     EPS=1e-9,
-    ETA_Z_INIT=0.15,  # seed NR half-saturation on ρ_raw (after ρ_bins/ρ_total)
+    ETA_Z=0.05,  # seed NR half-saturation on ρ̃ (min-subtracted ρ_raw; fixed, like L0 η)
     LOGIT_CLAMP=1e-4,
     # drive / inhibition (softplus-positive, learned; constant over t)
     B_SEED_INIT=0.5,
