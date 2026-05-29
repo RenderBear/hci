@@ -550,94 +550,97 @@ def viz_infer_l1_rho_masses(
     )
 
 
-def viz_infer_cell_rho_maps(
-    rho_seed: np.ndarray,
-    rho_post: np.ndarray,
+def viz_infer_cell_rho(
+    rho: np.ndarray,
     is_border: np.ndarray,
     out_path: str,
+    *,
+    n_bins: int = 50,
 ) -> None:
-    """Cell ρ (max over K seed bins) and duplicate panel for renderer input."""
-    seed = apply_border_zero(np.asarray(rho_seed, dtype=np.float64), is_border)
-    post = apply_border_zero(np.asarray(rho_post, dtype=np.float64), is_border)
-    delta = post - seed
-    interior = ~np.asarray(is_border, dtype=bool)
+    """Single row: cell ρ map, interior histogram, and empirical CDF."""
+    g = apply_border_zero(np.asarray(rho, dtype=np.float64), is_border)
+    ib = np.asarray(is_border, dtype=bool)
+    if ib.ndim == 1 and g.ndim == 2:
+        ib = ib.reshape(g.shape)
+    flat = g.ravel()[~ib.ravel()]
+    n_cells = int(flat.size)
 
-    cmap_pos = rho_heatmap_cmap()
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5), facecolor=VIZ.BG)
-    suptitle = (
-        r"Cell $\rho$ — seed and renderer input "
-        r"($\hat\rho=\rho_{\mathrm{bins}}/(\rho_{\mathrm{total}}+\varepsilon)$; "
-        r"$\rho_{\mathrm{seed}}=\tilde\rho^2/(\tilde\rho^2+\eta_z^2)$; "
-        r"scalar $\rho=\max_k \rho_{\mathrm{seed}}^{(k)}$)"
-    )
+    fig = plt.figure(figsize=(14.0, 4.6), facecolor=VIZ.BG)
+    gs = fig.add_gridspec(1, 3, width_ratios=[2.4, 1.0, 1.0], wspace=0.32)
+    ax_m = fig.add_subplot(gs[0, 0])
+    ax_h = fig.add_subplot(gs[0, 1])
+    ax_c = fig.add_subplot(gs[0, 2])
 
-    for ax in axes:
-        ax.set_facecolor(VIZ.PANEL_BG)
-        ax.axis("off")
-
-    panels_pos = (
-        (seed, r"seed $\rho$ (max over K)"),
-        (post, r"renderer $\rho$ (max over K)"),
-    )
-    for ax, (arr, title) in zip(axes[:2], panels_pos):
-        m = max(float(np.max(arr)), VIZ.EPS)
-        ax.imshow(
-            arr / m,
-            cmap=cmap_pos,
-            vmin=0.0,
-            vmax=1.0,
-            interpolation="nearest",
-        )
-        ax.set_title(
-            f"{title}\nraw max={m:.4g}",
-            fontsize=9,
-            color=VIZ.FG,
-            fontfamily="monospace",
-        )
-
-    ax_d = axes[2]
-    if interior.any():
-        lim = max(float(np.max(np.abs(delta[interior]))), VIZ.EPS)
-    else:
-        lim = 1.0
-    im_d = ax_d.imshow(
-        delta,
-        cmap="coolwarm",
-        vmin=-lim,
-        vmax=lim,
+    cmap = rho_heatmap_cmap()
+    m = max(float(np.max(g)), VIZ.EPS)
+    ax_m.set_facecolor(VIZ.PANEL_BG)
+    ax_m.imshow(
+        g / m,
+        cmap=cmap,
+        vmin=0.0,
+        vmax=1.0,
         interpolation="nearest",
     )
-    ax_d.set_title(
-        r"$\Delta\rho$ = post $-$ seed"
-        f"\ninterior range [{float(delta[interior].min()) if interior.any() else 0:.4g}, "
-        f"{float(delta[interior].max()) if interior.any() else 0:.4g}]",
+    ax_m.set_title(
+        rf"cell $\rho$ (max over K)  raw max={m:.4g}",
         fontsize=9,
         color=VIZ.FG,
         fontfamily="monospace",
     )
-    cbar = fig.colorbar(im_d, ax=ax_d, fraction=0.046, pad=0.04)
-    cbar.ax.tick_params(colors=VIZ.FG, labelsize=7)
+    ax_m.axis("off")
 
-    fig.suptitle(suptitle, fontsize=10, color=VIZ.FG, fontfamily="monospace")
-    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    ax_h.set_facecolor(VIZ.PANEL_BG)
+    ax_h.hist(
+        flat,
+        bins=n_bins,
+        range=(0.0, 1.0),
+        color=VIZ.ACCENT,
+        edgecolor=VIZ.PANEL_BG,
+        linewidth=0.3,
+    )
+    ax_h.set_xlim(0.0, 1.0)
+    ax_h.set_title(
+        rf"interior histogram  n={n_cells}",
+        fontsize=9,
+        color=VIZ.FG,
+        fontfamily="monospace",
+    )
+    ax_h.set_xlabel("ρ", fontsize=8, color=VIZ.FG)
+    ax_h.set_ylabel("count", fontsize=8, color=VIZ.FG)
+    ax_h.tick_params(colors=VIZ.FG, labelsize=7)
+    for s in ax_h.spines.values():
+        s.set_color(VIZ.ACCENT)
+
+    ax_c.set_facecolor(VIZ.PANEL_BG)
+    if n_cells > 0:
+        xs = np.sort(flat.astype(np.float64, copy=False))
+        ys = np.arange(1, n_cells + 1, dtype=np.float64)
+        ax_c.plot(xs, ys, color=VIZ.FG, linewidth=1.2)
+    ax_c.set_xlim(0.0, 1.0)
+    ax_c.set_ylim(0.0, float(max(n_cells, 1)))
+    ax_c.set_title(
+        "empirical CDF",
+        fontsize=9,
+        color=VIZ.FG,
+        fontfamily="monospace",
+    )
+    ax_c.set_xlabel("ρ", fontsize=8, color=VIZ.FG)
+    ax_c.set_ylabel("cumulative count", fontsize=8, color=VIZ.FG)
+    ax_c.grid(True, alpha=0.25, color=VIZ.ACCENT)
+    ax_c.tick_params(colors=VIZ.FG, labelsize=7)
+    for s in ax_c.spines.values():
+        s.set_color(VIZ.ACCENT)
+
+    fig.suptitle(
+        r"Cell $\rho$ — map and interior distribution "
+        r"($\rho_{\mathrm{seed}}=\tilde\rho^2/(\tilde\rho^2+\eta_z^2)$; "
+        r"scalar $\rho=\max_k \rho_{\mathrm{seed}}^{(k)}$)",
+        fontsize=10,
+        color=VIZ.FG,
+        fontfamily="monospace",
+    )
     fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
     plt.close(fig)
-
-
-def viz_infer_rho_hist_cdf(
-    rho_seed: np.ndarray,
-    rho_post: np.ndarray,
-    is_border: np.ndarray,
-    out_path: str,
-) -> None:
-
-    viz_hist_cdf_columns(
-        [rho_seed, rho_post],
-        [r"seed $\rho$", r"renderer $\rho$"],
-        is_border,
-        out_path,
-        suptitle="Cell ρ — count vs value and empirical CDFs (interior cells)",
-    )
 
 
 def viz_l2_bimodality_per_iter(

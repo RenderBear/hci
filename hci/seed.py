@@ -5,7 +5,8 @@ Per cell, from L1 ``rho_bins``:
   ρ̃^(k) = ρ̂^(k) − min_j ρ̂^(j)
   ρ_seed^(k) = ρ̃^(k)² / (ρ̃^(k)² + η_z²)
 
-Scalar export to renderer: ρ(c) = max_k ρ_seed^(k)(c), with parabolic θ from bins.
+Scalar export to renderer: ρ(c) = max_k ρ_seed^(k)(c).  Orientation θ comes
+from L1 (½ arg Σ z₂); this stage does not refine θ.
 
 Learned: η_z only (softplus, init 0.1).
 """
@@ -45,27 +46,6 @@ def rho_seed_from_bins(
     rho_seed = rho_tilde_sq / (rho_tilde_sq + eta_z_sq)
     mask = is_border.unsqueeze(-1) if is_border.dim() == 1 else is_border.unsqueeze(-1)
     return torch.where(mask, torch.zeros_like(rho_seed), rho_seed)
-
-
-def collapse_rho_bins(
-    rho_bins: torch.Tensor,
-    K: int,
-    eps: float,
-    device: torch.device | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Parabolic sub-bin θ and max_k ρ from (nH, nW, K) or (N, K) bin masses."""
-    dev = device if device is not None else rho_bins.device
-    rho_peak, k_star = rho_bins.max(dim=-1)
-    k_left = (k_star - 1) % K
-    k_right = (k_star + 1) % K
-    r_left = rho_bins.gather(-1, k_left.unsqueeze(-1)).squeeze(-1)
-    r_right = rho_bins.gather(-1, k_right.unsqueeze(-1)).squeeze(-1)
-    denom = 2.0 * rho_peak - r_left - r_right
-    frac = (r_left - r_right) / (denom + eps) * 0.5
-    frac = frac.clamp(-0.5, 0.5)
-    bar_theta = torch.linspace(0, math.pi, K + 1, device=dev, dtype=rho_bins.dtype)[:-1]
-    theta = bar_theta[k_star] + frac * (math.pi / K)
-    return rho_peak, theta, k_star
 
 
 class CellSeed(nn.Module):
@@ -108,18 +88,11 @@ class CellSeed(nn.Module):
         rho_seed = rho_seed_from_bins(
             rho_bins_in.reshape(N, K), self.eta_z, is_border, self.eps,
         )
-        rho_seed_3d = rho_seed.reshape(nH, nW, K)
         ok_map = (~is_border).reshape(nH, nW)
-
-        rho_scalar, theta_out, k_star_out = collapse_rho_bins(
-            rho_seed_3d, K, self.eps, device=device,
-        )
-        interior = ok_map.to(dtype=rho_scalar.dtype)
-        rho_out_flat = rho_scalar.reshape(N) * interior.reshape(N)
+        interior = ok_map.to(dtype=rho_seed.dtype)
+        rho_out_flat = rho_seed.max(dim=-1).values * interior.reshape(N)
 
         cf_out = dict(cells_flat)
-        cf_out["theta"] = theta_out.reshape(N, 1)
-        cf_out["k_star"] = k_star_out.reshape(N)
 
         branch = torch.zeros(N, device=device, dtype=torch.long)
         z1 = torch.zeros(N, 1, device=device, dtype=rho_out_flat.dtype)

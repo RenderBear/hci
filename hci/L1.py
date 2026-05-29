@@ -2,7 +2,8 @@ r"""L1 — pixel K-bin orientation projection → cell grid (GPU-native).
 
 Per pixel (default von Mises): e_k = h_{2m} · exp(κ cos(2(θ_{2m} − kπ/K))).
 Alternate: e_k = h_{2m} · cos^p(θ_{2m} − kπ/K).  Sum-pool over P×P patches →
-ρ_raw^{(k)}(c).  k* + parabolic sub-bin θ for export/q/κ/renderer.
+ρ_bins^{(k)}(c).  Orientation θ(c) = ½ arg(Σ_p z₂(p)) within patch; k* from
+peak bin mass (seed only).
 """
 
 from __future__ import annotations
@@ -221,27 +222,24 @@ def run_l1(
 
     rho_total = rho_bins.sum(dim=-1)
     rho_peak, k_star = rho_bins.max(dim=-1)
-    k_left = (k_star - 1) % K
-    k_right = (k_star + 1) % K
-    r_left = rho_bins.gather(-1, k_left.unsqueeze(-1)).squeeze(-1)
-    r_right = rho_bins.gather(-1, k_right.unsqueeze(-1)).squeeze(-1)
-    denom = 2.0 * rho_peak - r_left - r_right
-    frac = (r_left - r_right) / (denom + eps) * 0.5
-    frac = frac.clamp(-0.5, 0.5)
-    theta_2d = bar_theta[k_star] + frac * (math.pi / K)
-    theta_flat = theta_2d.reshape(-1)
 
     delta_2d = (rho_peak / (rho_total + eps)).clamp(0.0, 1.0)
     delta_flat = delta_2d.reshape(-1)
 
+    n_pix_patch_f = float(P * P)
     z1_patches = _extract_patches_torch(z1, nH, nW, P, S)
+    z2_patches = _extract_patches_torch(z2, nH, nW, P, S)
     Z1_sum = z1_patches.sum(dim=-1)
+    Z2_sum = z2_patches.sum(dim=-1)
     z1_abs_sum = z1_patches.abs().sum(dim=-1).to(torch.float32)
+    z1_bar = Z1_sum / n_pix_patch_f
+
+    theta_flat = (0.5 * torch.angle(Z2_sum)).to(torch.float32).reshape(-1)
 
     exp_ith = torch.complex(
         torch.cos(theta_flat), torch.sin(theta_flat),
     )
-    q_flat = (Z1_sum.conj() * exp_ith).real.to(torch.float32)
+    q_flat = (z1_bar.conj() * exp_ith).real.to(torch.float32)
 
     kappa_flat = _patch_orientation_kappa(
         z1_patches,
@@ -250,10 +248,8 @@ def run_l1(
         P,
         eps,
     )
-    del z1_patches
+    del z1_patches, z2_patches
 
-    n_pix_patch_f = float(P * P)
-    z1_bar = Z1_sum / n_pix_patch_f
     z1_bar_abs_flat = z1_bar.abs().to(torch.float32)
     phi_z1_flat = torch.angle(z1_bar).to(torch.float32)
 

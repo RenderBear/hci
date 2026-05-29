@@ -29,13 +29,11 @@ from hci.renderer import (
 from hci.diagnostics_viz import (
     viz_infer_l0_pinwheel,
     viz_infer_l1_rho_masses,
-    viz_infer_cell_rho_maps,
-    viz_infer_rho_hist_cdf,
+    viz_infer_cell_rho,
     save_rho_png,
     viz_infer_shape_readout,
     viz_infer_base_edges_overlay,
 )
-from hci.seed import rho_seed_from_bins
 from train import (
     StriateE2E,
     build_cells_flat,
@@ -315,7 +313,7 @@ def main():
         "--diagnostics",
         action="store_true",
         help="Save additional diagnostics: base, l0_pinwheel, l1_rho_masses, "
-        "cell_rho, rho_hist_cdf, render_softmap, render_theta_bins, overlay.",
+        "cell_rho, render_softmap, render_theta_bins, overlay.",
     )
     ap.add_argument("--device", default=None)
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -353,23 +351,6 @@ def main():
         )
     )
 
-    seed = model.seed
-    cf = prep["cells_flat"]
-    nH, nW = int(prep["nH"]), int(prep["nW"])
-    N = nH * nW
-    K = seed.K
-    rho_bins_t = cf["rho_bins"].to(device).float().reshape(N, K)
-    ib_t = cf["is_border"].to(device).reshape(N)
-    rho_seed_vis = (
-        rho_seed_from_bins(rho_bins_t, seed.eta_z, ib_t, float(seed.eps))
-        .max(dim=-1)
-        .values
-        .detach()
-        .cpu()
-        .numpy()
-        .reshape(nH, nW)
-    )
-
     if args.verbose and diags is not None and "iter_stats" in diags:
         st0 = diags["iter_stats"][0] if diags["iter_stats"] else {}
         if "n_interior" in st0:
@@ -401,15 +382,9 @@ def main():
         )
         saved_files.append(p_rho)
 
-        p_maps = os.path.join(od, f"{stem}_cell_rho.png")
-        viz_infer_cell_rho_maps(
-            rho_seed_vis, rho_post, is_border, p_maps,
-        )
-        saved_files.append(p_maps)
-
-        p_hist = os.path.join(od, f"{stem}_cell_rho_hist_cdf.png")
-        viz_infer_rho_hist_cdf(rho_seed_vis, rho_post, is_border, p_hist)
-        saved_files.append(p_hist)
+        p_cell = os.path.join(od, f"{stem}_cell_rho.png")
+        viz_infer_cell_rho(rho_post, is_border, p_cell)
+        saved_files.append(p_cell)
 
     threshold = float(args.threshold)
 
