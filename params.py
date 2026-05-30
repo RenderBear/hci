@@ -41,7 +41,7 @@ SEED = SimpleNamespace(
 RENDER = SimpleNamespace(
     CELL_HIDDEN=16,  # legacy StriateE2E arg (unused)
     PIXEL_HIDDEN=6,  # legacy StriateE2E arg (unused)
-    SIGMA_PAR_INIT=8.0,
+    SIGMA_PAR_INIT=2.0,  # along-edge width; init ≈ L1 stride S (= P − overlap)
     SIGMA_PERP_INIT=1.0,
     SIGMA_PAR_MAX=32.0,
     SIGMA_PERP_MAX=8.0,

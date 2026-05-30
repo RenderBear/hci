@@ -1,6 +1,6 @@
 r"""infer.py — STRIATE single-image inference.
 
-Pipeline: L0 → z₂ moment pooling → AND-gate seed → splat boundary map
+Pipeline: L0 → z₂ moment pooling → association-field seed → splat boundary map
 ($\hat B = \bar\rho \cdot \mathrm{gate}$), optional ridge NMS along θ,
 then thresholded edge PNG (default τ = 0.5).
 """

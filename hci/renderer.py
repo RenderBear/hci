@@ -1,20 +1,14 @@
-r"""Renderer — Gaussian-line splat + MLP thinning head (paper §2.5).
+r"""Renderer — anisotropic Gaussian splat + MLP thinning head (paper §2.5).
 
 Pipeline:
   1. Cell grid: ρ-weighted θ combing → ρ-gated anchor smoothing.
-  2. Gaussian-line splat of ρ★ at |z₂|-weighted anchors with learned σ⊥ → ρ̄(p).
+  2. 2D anisotropic Gaussian splat of ρ at z₂ anchors → ρ̄(p) = Σ_c ρ_c φ_c(p).
   3. Per-pixel feature vector F_p = [ρ̄, coh, tang9, norm9] ∈ R²⁰.
   4. Thinning head: B̂(p) = ρ̄(p) · σ(W₂ ReLU(W₁ F_p + b₁) + b₂).
   NMS at inference thins to single-pixel width.
 
-The splat deposits faithfully; the MLP can only thin (multiplicative gate ≤ 1).
-The MLP is initialised with structural priors (Mexican hat on norm9, flat smooth
-on tang9, near-identity gate at t=0) so training bends the gate where the priors
-disagree with the data.
-
-Learned: σ⊥ (cross-ridge width), s_t and s_n (stencil spacings),
-         MLP 20→12→1 (240 + 12 + 12 + 1 = 265 params).
-         Total: 268 scalars.
+Learned: σ⊥, σ∥ (splat widths), s_t and s_n (stencil spacings),
+         MLP 20→12→1 (265 params).  Total: 269 scalars.
 """
 
 from __future__ import annotations
@@ -36,8 +30,9 @@ from params import RENDER
 
 _SIGMA_PERP_INIT = getattr(RENDER, "SIGMA_PERP_INIT", 1.5)
 _SIGMA_PERP_MAX = getattr(RENDER, "SIGMA_PERP_MAX", 8.0)
+_SIGMA_PAR_INIT = getattr(RENDER, "SIGMA_PAR_INIT", 2.0)
+_SIGMA_PAR_MAX = getattr(RENDER, "SIGMA_PAR_MAX", 32.0)
 _SPLAT_RADIUS_SIGMAS = getattr(RENDER, "SPLAT_RADIUS_SIGMAS", 3.0)
-_SPLAT_HALF_W_PERP = getattr(RENDER, "SPLAT_HALF_W_PERP", 3)
 
 
 def _inv_softplus(x: float) -> float:
@@ -107,33 +102,71 @@ def _smooth_anchors_rho_gated(
 
 
 # ═══════════════════════════════════════════════════════════════
-# Gaussian-line splat (vectorized scatter_add)
+# Anisotropic 2D Gaussian splat (vectorized scatter_add)
 # ═══════════════════════════════════════════════════════════════
 
-def _gaussian_line_splat(
+def _aniso_kernel_phi(
+    ox: torch.Tensor,
+    oy: torch.Tensor,
+    cos_a: torch.Tensor,
+    sin_a: torch.Tensor,
+    sig_perp: torch.Tensor,
+    sig_par: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """φ = exp(−d⊥²/2σ⊥² − d∥²/2σ∥²) with offsets (ox, oy) from anchor to pixel."""
+    d_perp = ox.unsqueeze(0) * cos_a.unsqueeze(1) - oy.unsqueeze(0) * sin_a.unsqueeze(1)
+    d_par = ox.unsqueeze(0) * sin_a.unsqueeze(1) + oy.unsqueeze(0) * cos_a.unsqueeze(1)
+    return torch.exp(
+        -d_perp * d_perp / (2.0 * sig_perp * sig_perp + eps)
+        - d_par * d_par / (2.0 * sig_par * sig_par + eps)
+    )
+
+
+def _splat_footprint_radius(sig_perp: torch.Tensor, sig_par: torch.Tensor, S: int) -> int:
+    sp = float(sig_perp.detach().clamp(min=0.3, max=_SIGMA_PERP_MAX))
+    sa = float(sig_par.detach().clamp(min=0.3, max=_SIGMA_PAR_MAX))
+    r = max(
+        int(math.ceil(_SPLAT_RADIUS_SIGMAS * sp)),
+        int(math.ceil(_SPLAT_RADIUS_SIGMAS * sa)),
+        int(math.ceil(_SPLAT_RADIUS_SIGMAS * S)),
+        1,
+    )
+    return r
+
+
+def _anisotropic_gaussian_splat(
     values: torch.Tensor,
     cx: torch.Tensor, cy: torch.Tensor,
     theta: torch.Tensor, is_border: torch.Tensor,
     sigma_perp: torch.Tensor,
+    sigma_par: torch.Tensor,
     H: int, W: int, S: int,
     radius_sigmas: float = _SPLAT_RADIUS_SIGMAS,
-    half_w_perp: int = _SPLAT_HALF_W_PERP,
     eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Deposit values + compute dominant θ★ per pixel (scatter-max by ρ★φ).
+    """Deposit ρ̄ = Σ_c ρ_c φ_c; θ★ = scatter-max argmax ρ_c φ_c.
 
-    Returns: (rho_bar, theta_star) both (H, W).
+    φ_c is a finite 2D anisotropic Gaussian centered at anchor (c_x, c_y).
     """
+    _ = radius_sigmas
     device, dtype = values.device, values.dtype
-    sig = sigma_perp.to(dtype=dtype, device=device).clamp(min=0.3, max=_SIGMA_PERP_MAX)
-    foot_r = max(int(math.ceil(radius_sigmas * S)), half_w_perp + 1)
+    sig_perp = sigma_perp.to(dtype=dtype, device=device).clamp(
+        min=0.3, max=_SIGMA_PERP_MAX,
+    )
+    sig_par = sigma_par.to(dtype=dtype, device=device).clamp(
+        min=0.3, max=_SIGMA_PAR_MAX,
+    )
+    foot_r = _splat_footprint_radius(sig_perp, sig_par, S)
+    cut_perp = _SPLAT_RADIUS_SIGMAS * sig_perp
+    cut_par = _SPLAT_RADIUS_SIGMAS * sig_par
 
     active = (~is_border) & (values.abs() > eps)
     active_idx = active.nonzero(as_tuple=True)[0]
     A = active_idx.shape[0]
     if A == 0:
-        return (torch.zeros(H, W, device=device, dtype=dtype),
-                torch.zeros(H, W, device=device, dtype=dtype))
+        z = torch.zeros(H, W, device=device, dtype=dtype)
+        return z, z
 
     val_a = values[active_idx]
     cx_a, cy_a = cx[active_idx], cy[active_idx]
@@ -145,44 +178,42 @@ def _gaussian_line_splat(
     oy, ox = torch.meshgrid(offsets, offsets, indexing="ij")
     oy, ox = oy.reshape(-1), ox.reshape(-1)
     P = oy.shape[0]
+    n_pix = H * W
 
-    sum_wv = torch.zeros(H * W, device=device, dtype=dtype)
-    sum_w = torch.zeros(H * W, device=device, dtype=dtype)
-    # For dominant θ: track max(ρ★·φ) per pixel
-    max_rho_phi = torch.full((H * W,), -1.0, device=device, dtype=dtype)
-    theta_star = torch.zeros(H * W, device=device, dtype=dtype)
+    sum_rho_phi = torch.zeros(n_pix, device=device, dtype=dtype)
+    max_rho_phi = torch.full((n_pix,), -1.0, device=device, dtype=dtype)
+    theta_star = torch.zeros(n_pix, device=device, dtype=dtype)
 
     max_batch = max(1, 4_000_000 // P)
     for b0 in range(0, A, max_batch):
         b1 = min(b0 + max_batch, A)
         py_b = cy_a[b0:b1].unsqueeze(1) + oy.unsqueeze(0)
         px_b = cx_a[b0:b1].unsqueeze(1) + ox.unsqueeze(0)
-        d_perp = (ox.unsqueeze(0) * cos_a[b0:b1].unsqueeze(1)
-                  - oy.unsqueeze(0) * sin_a[b0:b1].unsqueeze(1))
-        valid = ((py_b >= 0) & (py_b < H) &
-                 (px_b >= 0) & (px_b < W) &
-                 (d_perp.abs() <= (half_w_perp + 0.5)))
-        phi = torch.exp(-d_perp * d_perp / (2.0 * sig * sig + eps)) * valid.to(dtype=dtype)
-        flat_idx = (py_b.long() * W + px_b.long()).clamp(0, H * W - 1)
-        wv = val_a[b0:b1].unsqueeze(1) * phi
-        sum_wv.scatter_add_(0, flat_idx.reshape(-1), wv.reshape(-1))
-        sum_w.scatter_add_(0, flat_idx.reshape(-1), phi.reshape(-1))
+        d_perp = ox.unsqueeze(0) * cos_a[b0:b1].unsqueeze(1) - oy.unsqueeze(0) * sin_a[b0:b1].unsqueeze(1)
+        d_par = ox.unsqueeze(0) * sin_a[b0:b1].unsqueeze(1) + oy.unsqueeze(0) * cos_a[b0:b1].unsqueeze(1)
+        in_bounds = (
+            (py_b >= 0) & (py_b < H) & (px_b >= 0) & (px_b < W)
+            & (d_perp.abs() <= cut_perp) & (d_par.abs() <= cut_par)
+        )
+        phi = _aniso_kernel_phi(
+            ox, oy, cos_a[b0:b1], sin_a[b0:b1], sig_perp, sig_par, eps,
+        ) * in_bounds.to(dtype=dtype)
+        flat_idx = (py_b.long() * W + px_b.long()).clamp(0, n_pix - 1)
 
-        # Dominant θ: per pixel, θ of the cell with largest ρ★·φ
-        rho_phi = val_a[b0:b1].unsqueeze(1) * phi  # (B, P)
-        th_expand = th_a[b0:b1].unsqueeze(1).expand_as(rho_phi)  # (B, P)
+        rho_phi = val_a[b0:b1].unsqueeze(1) * phi
+        sum_rho_phi.scatter_add_(0, flat_idx.reshape(-1), rho_phi.reshape(-1))
+
+        th_expand = th_a[b0:b1].unsqueeze(1).expand_as(rho_phi)
         rp_flat = rho_phi.reshape(-1)
         th_flat = th_expand.reshape(-1)
         fi_flat = flat_idx.reshape(-1)
-        # Update where rho_phi exceeds current max
         update = rp_flat > max_rho_phi[fi_flat]
         update_idx = fi_flat[update]
         if update_idx.numel() > 0:
             max_rho_phi[update_idx] = rp_flat[update]
             theta_star[update_idx] = th_flat[update]
 
-    rho_bar = (sum_wv / (sum_w + eps)).reshape(H, W)
-    return rho_bar, theta_star.reshape(H, W)
+    return sum_rho_phi.reshape(H, W), theta_star.reshape(H, W)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -240,13 +271,22 @@ def _compute_coherence(
     cx: torch.Tensor, cy: torch.Tensor,
     theta: torch.Tensor, is_border: torch.Tensor,
     sigma_perp: torch.Tensor,
+    sigma_par: torch.Tensor,
     H: int, W: int, S: int,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """coh(p) = Σ_c ρ★_c cos²(θ_c − θ★_p) / (Σ_c ρ★_c + ε), within splat footprint."""
+    """coh(p) = Σ_c ρ_c φ_c cos²(θ_c − θ★) / (Σ_c ρ_c φ_c + ε)."""
+    _ = rho_bar
     device, dtype = values.device, values.dtype
-    sig = sigma_perp.to(dtype=dtype, device=device).clamp(min=0.3, max=_SIGMA_PERP_MAX)
-    foot_r = max(int(math.ceil(_SPLAT_RADIUS_SIGMAS * S)), _SPLAT_HALF_W_PERP + 1)
+    sig_perp = sigma_perp.to(dtype=dtype, device=device).clamp(
+        min=0.3, max=_SIGMA_PERP_MAX,
+    )
+    sig_par = sigma_par.to(dtype=dtype, device=device).clamp(
+        min=0.3, max=_SIGMA_PAR_MAX,
+    )
+    foot_r = _splat_footprint_radius(sig_perp, sig_par, S)
+    cut_perp = _SPLAT_RADIUS_SIGMAS * sig_perp
+    cut_par = _SPLAT_RADIUS_SIGMAS * sig_par
 
     active = (~is_border) & (values.abs() > eps)
     active_idx = active.nonzero(as_tuple=True)[0]
@@ -264,25 +304,28 @@ def _compute_coherence(
     oy, ox = torch.meshgrid(offsets, offsets, indexing="ij")
     oy, ox = oy.reshape(-1), ox.reshape(-1)
     P = oy.shape[0]
+    n_pix = H * W
 
-    sum_rho_cos2 = torch.zeros(H * W, device=device, dtype=dtype)
-    sum_rho = torch.zeros(H * W, device=device, dtype=dtype)
+    sum_rho_cos2 = torch.zeros(n_pix, device=device, dtype=dtype)
+    sum_rho = torch.zeros(n_pix, device=device, dtype=dtype)
 
     max_batch = max(1, 4_000_000 // P)
     for b0 in range(0, A, max_batch):
         b1 = min(b0 + max_batch, A)
         py_b = cy_a[b0:b1].unsqueeze(1) + oy.unsqueeze(0)
         px_b = cx_a[b0:b1].unsqueeze(1) + ox.unsqueeze(0)
-        d_perp = (ox.unsqueeze(0) * cos_a[b0:b1].unsqueeze(1)
-                  - oy.unsqueeze(0) * sin_a[b0:b1].unsqueeze(1))
-        valid = ((py_b >= 0) & (py_b < H) &
-                 (px_b >= 0) & (px_b < W) &
-                 (d_perp.abs() <= (_SPLAT_HALF_W_PERP + 0.5)))
-        phi = torch.exp(-d_perp * d_perp / (2.0 * sig * sig + eps)) * valid.to(dtype=dtype)
-        flat_idx = (py_b.long() * W + px_b.long()).clamp(0, H * W - 1)
+        d_perp = ox.unsqueeze(0) * cos_a[b0:b1].unsqueeze(1) - oy.unsqueeze(0) * sin_a[b0:b1].unsqueeze(1)
+        d_par = ox.unsqueeze(0) * sin_a[b0:b1].unsqueeze(1) + oy.unsqueeze(0) * cos_a[b0:b1].unsqueeze(1)
+        in_bounds = (
+            (py_b >= 0) & (py_b < H) & (px_b >= 0) & (px_b < W)
+            & (d_perp.abs() <= cut_perp) & (d_par.abs() <= cut_par)
+        )
+        phi = _aniso_kernel_phi(
+            ox, oy, cos_a[b0:b1], sin_a[b0:b1], sig_perp, sig_par, eps,
+        ) * in_bounds.to(dtype=dtype)
+        flat_idx = (py_b.long() * W + px_b.long()).clamp(0, n_pix - 1)
 
-        # cos²(θ_c − θ★_p) — use θ_star at each pixel
-        th_star_at_pix = theta_star.reshape(-1)[flat_idx]  # (B, P)
+        th_star_at_pix = theta_star.reshape(-1)[flat_idx]
         cos2_diff = torch.cos(th_a[b0:b1].unsqueeze(1) - th_star_at_pix).pow(2)
 
         rho_phi = val_a[b0:b1].unsqueeze(1) * phi
@@ -348,10 +391,10 @@ class ThinningHead(nn.Module):
 # ═══════════════════════════════════════════════════════════════
 
 class ModulationRenderer(nn.Module):
-    """Gaussian splat + thinning head (paper §2.5).
+    """Anisotropic Gaussian splat + thinning head (paper §2.5).
 
-    Learned: σ⊥ (1), s_t (1), s_n (1), ThinningHead 20→12→1 (265).
-    Total: 268 parameters.
+    Learned: σ⊥ (1), σ∥ (1), s_t (1), s_n (1), ThinningHead 20→12→1 (265).
+    Total: 269 parameters.
     """
 
     def __init__(self, hidden: int | None = None, **kwargs):
@@ -359,6 +402,9 @@ class ModulationRenderer(nn.Module):
         _ = (hidden, kwargs)
         self._sigma_perp_raw = nn.Parameter(
             torch.tensor(_inv_softplus(_SIGMA_PERP_INIT), dtype=torch.float32)
+        )
+        self._sigma_par_raw = nn.Parameter(
+            torch.tensor(_inv_softplus(_SIGMA_PAR_INIT), dtype=torch.float32)
         )
         self.s_t = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
         self.s_n = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
@@ -368,10 +414,11 @@ class ModulationRenderer(nn.Module):
     def sigma_perp(self) -> torch.Tensor:
         return F.softplus(self._sigma_perp_raw)
 
-    # Legacy compat
     @property
     def sigma_par(self) -> torch.Tensor:
-        return torch.zeros((), dtype=torch.float32)
+        return F.softplus(self._sigma_par_raw)
+
+    # Legacy compat
     @property
     def sigma_pre(self) -> torch.Tensor:
         return torch.zeros((), dtype=torch.float32)
@@ -387,7 +434,6 @@ class ModulationRenderer(nn.Module):
 
 def upgrade_renderer_state_dict(state_dict: dict, prefix: str = "") -> dict:
     remove = {
-        f"{prefix}_sigma_par_raw",
         f"{prefix}_sigma_pre_raw",
         f"{prefix}_eta_h_raw",
         f"{prefix}_smooth_sigma_raw",
@@ -396,7 +442,13 @@ def upgrade_renderer_state_dict(state_dict: dict, prefix: str = "") -> dict:
         f"{prefix}perp_conv.fc.weight",
         f"{prefix}perp_conv.fc.bias",
     }
-    return {k: v for k, v in state_dict.items() if k not in remove}
+    out = {k: v for k, v in state_dict.items() if k not in remove}
+    par_key = f"{prefix}_sigma_par_raw"
+    if par_key not in out:
+        out[par_key] = torch.tensor(
+            _inv_softplus(_SIGMA_PAR_INIT), dtype=torch.float32,
+        )
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -490,10 +542,11 @@ def render_boundary_map_torch(
     theta_det = theta_c.detach()
     rho_splat = torch.where(is_border, torch.zeros_like(rho_flat), rho_flat)
 
-    # ── Step 2: Gaussian-line splat → ρ̄(p), θ★(p) ────────────
-    rho_bar, theta_star = _gaussian_line_splat(
+    # ── Step 2: Anisotropic Gaussian splat → ρ̄(p), θ★(p) ─────
+    rho_bar, theta_star = _anisotropic_gaussian_splat(
         rho_splat, cx_det, cy_det, theta_det, is_border,
         sigma_perp=renderer.sigma_perp,
+        sigma_par=renderer.sigma_par,
         H=H, W=W, S=S, eps=eps,
     )
 
@@ -501,7 +554,7 @@ def render_boundary_map_torch(
     coh = _compute_coherence(
         rho_bar, theta_star,
         rho_splat, cx_det, cy_det, theta_det, is_border,
-        renderer.sigma_perp, H, W, S, eps=eps,
+        renderer.sigma_perp, renderer.sigma_par, H, W, S, eps=eps,
     )
 
     # ── Step 4: Feature vector F_p ────────────────────────────

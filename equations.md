@@ -141,13 +141,30 @@ Border cells → $0$ on $\rho, \theta$. **Orientation** $\theta(c)$ is read from
 
 **Step 1 — cell grid.** $\rho$-weighted double-angle $\theta$ smoothing (`RENDER.THETA_SMOOTH_PASSES`); $\rho$- and orientation-gated smoothing of anchors $(c_x^{z_2}, c_y^{z_2})$. Coordinates and $\theta$ are **detached** before splat (no coordinate gradients into seed).
 
-**Step 2 — Gaussian-line splat.** For each active cell $c$ with $\rho_c > 0$, deposit along normal to $\theta_c$ with learned width $\sigma_\perp = \mathrm{softplus}(\tilde\sigma_\perp)$:
+**Step 2 — Anisotropic Gaussian splat.** For each active cell $c$ with $\rho_c > 0$, deposit a finite oriented kernel centered at anchor $a_c = (c_x, c_y)$ with learned widths $\sigma_\perp = \mathrm{softplus}(\tilde\sigma_\perp)$, $\sigma_\parallel = \mathrm{softplus}(\tilde\sigma_\parallel)$ (init $\approx$ cell stride $S$):
 
 $$
-\phi_c(p) = \exp\!\left(-\frac{d_\perp(p,c)^2}{2\sigma_\perp^2}\right),
-\qquad
-\bar\rho(p) = \frac{\sum_c \rho_c\,\phi_c(p)}{\sum_c \phi_c(p) + \varepsilon}.
+\hat t_c = (\cos\theta_c,\,\sin\theta_c), \quad
+\hat n_c = (-\sin\theta_c,\,\cos\theta_c),
 $$
+$$
+d_\parallel(p,c) = (p - a_c)\cdot \hat t_c, \quad
+d_\perp(p,c) = (p - a_c)\cdot \hat n_c,
+$$
+$$
+\phi_c(p) = \exp\!\left(
+-\frac{d_\perp(p,c)^2}{2\sigma_\perp^2}
+-\frac{d_\parallel(p,c)^2}{2\sigma_\parallel^2}
+\right).
+$$
+
+**Amplitude** (unnormalized accumulation — dead cells contribute zero):
+
+$$
+\bar\rho(p) = \sum_c \rho_c\,\phi_c(p).
+$$
+
+At the anchor, $\phi_c(a_c)=1$ so $\bar\rho(a_c)=\rho_c$ when no overlap. Adjacent active cells sum constructively along edges.
 
 Dominant orientation per pixel (scatter-max by $\rho_c\,\phi_c$):
 
@@ -211,10 +228,10 @@ Checkpoints store `{"model_state": state_dict}` (`intermediate.pt`, `final.pt`).
 | Block | Count | Notes |
 |------:|------:|------|
 | $R_0, \tilde a, \tilde b$ | 3 | AND-gate scalars |
-| $\tilde\sigma_\perp, s_t, s_n$ | 3 | Renderer splat + stencils |
+| $\tilde\sigma_\perp, \tilde\sigma_\parallel, s_t, s_n$ | 4 | Splat widths + stencil spacings |
 | $\mathrm{MLP}_{\mathrm{thin}}$ (20→12→1) | 265 | $20\cdot 12 + 12 + 12 + 1$ |
-| **Renderer subtotal** | **268** | |
-| **Total (`StriateE2E`)** | **271** | 3 AND-gate + 268 renderer |
+| **Renderer subtotal** | **269** | |
+| **Total (`StriateE2E`)** | **272** | 3 AND-gate + 269 renderer |
 
 L0 $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ are **fixed** (`params.L0`). Legacy checkpoints may contain `_eta_z_raw`, `_l1_von_mises_kappa_raw`; `upgrade_model_state_dict` strips these and inits AND-gate params if missing. Renderer weights load unchanged via `upgrade_renderer_state_dict` and `load_state_dict(..., strict=False)` with `report_checkpoint_compatibility`.
 
@@ -236,4 +253,4 @@ L0 $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ are **fixed** (`params.L0`). Legac
 
 ## 9. Revision note
 
-This document matches the **STRIATE** stack: **z₂ moment pooling** (§3), **surround-normalized AND gate** (§4), **Gaussian-line splat** renderer with 9-tap stencils (§5), **`StriateE2E`** (271 learned parameters). L0 only is disk-cached for training (§6).
+This document matches the **STRIATE** stack: **z₂ moment pooling** (§3), **surround-normalized AND gate** (§4), **anisotropic Gaussian splat** renderer with 9-tap stencils (§5), **`StriateE2E`** (272 learned parameters). L0 only is disk-cached for training (§6).

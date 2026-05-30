@@ -1,7 +1,8 @@
-r"""train.py — STRIATE training: z₂ moments + AND-gate seed + harmonic render.
+r"""train.py — STRIATE training: z₂ moments + association-field seed + harmonic render.
 
 Pipeline per image: L0 contrast/harmonics (cached) → live z₂ moment pooling each step
-→ AND-gate seed (g_R · g_E) → splat renderer ($\hat B = \bar\rho \cdot \mathrm{gate}$).
+→ association-field seed (R + κ·facilitation − λ·surround, NR readout)
+→ splat renderer ($\hat B = \bar\rho \cdot \mathrm{gate}$).
 Loss combines soft-Dice and per-pixel BCE on the same η± valid band
 (target≥η_pos or target<η_neg), weighted by ``--lam_dice`` and ``--lam_bce``
 (each can be 0).
@@ -174,21 +175,13 @@ class StriateE2E(nn.Module):
     def __init__(
         self,
         eps: float = SEED.EPS,
-        R0_init: float = SEED.R0_INIT,
-        a_init: float = SEED.A_INIT,
-        b_init: float = SEED.B_INIT,
         render_cell_hidden: int = RENDER.CELL_HIDDEN,
         render_pixel_hidden: int = RENDER.PIXEL_HIDDEN,
         **kw,
     ):
         super().__init__()
-        _ = kw
-        self.seed = AndGateSeed(
-            eps=eps,
-            R0_init=R0_init,
-            a_init=a_init,
-            b_init=b_init,
-        )
+        _ = kw  # absorbs legacy R0_init / a_init / b_init if a caller still passes them
+        self.seed = AndGateSeed(eps=eps)  # alias → ContourSeed; init from params.SEED
         _ = render_cell_hidden
         self.renderer = ModulationRenderer(hidden=render_pixel_hidden)
         self.eps = eps
@@ -533,29 +526,32 @@ def bce_loss_with_ignore(
 
 
 def upgrade_model_state_dict(state_dict: dict) -> dict:
-    """Map legacy keys; drop K-bin / η_z / von Mises params; init AND-gate if missing."""
+    """Map legacy keys; drop dynamics / K-bin / η_z / von Mises / AND-gate scalars.
+
+    The association-field seed (κ, λ, η, σ_f) carries none of the old AND-gate
+    parameters, so legacy ``seed._R0`` / ``seed._a_raw`` / ``seed._b_raw`` (and the
+    earlier ``seed._eta_z_raw``) are dropped here and the new scalars initialise
+    fresh from ``params.SEED`` via ``load_state_dict(..., strict=False)``.
+    """
+    drop = {
+        "seed._eta_z_raw",
+        "_l1_von_mises_kappa_raw",
+        "seed._R0",
+        "seed._a_raw",
+        "seed._b_raw",
+    }
     out: dict = {}
     for k, v in state_dict.items():
         if k.startswith("dynamics."):
             continue
-        if k in ("seed._eta_z_raw", "_l1_von_mises_kappa_raw"):
+        if k in drop:
             continue
         out[k] = v
-    if "seed._R0" not in out:
-        out["seed._R0"] = torch.tensor(float(SEED.R0_INIT), dtype=torch.float32)
-    if "seed._a_raw" not in out:
-        out["seed._a_raw"] = torch.tensor(
-            [_inv_softplus(float(SEED.A_INIT))], dtype=torch.float32
-        )
-    if "seed._b_raw" not in out:
-        out["seed._b_raw"] = torch.tensor(
-            [_inv_softplus(float(SEED.B_INIT))], dtype=torch.float32
-        )
     return out
 
 
 def debug_seed_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
-    """One training batch: AND-gate stats + ∂loss/∂(R₀, a, b)."""
+    """One training batch: seed stats + ∂loss/∂(κ, λ, η, σ_f)."""
     model.train()
     meta = meta_list[0]
     cf = meta["cells_flat_dev"]
@@ -588,12 +584,21 @@ def debug_seed_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
     print("\n--- seed debug ---")
     if diags and "iter_stats" in diags and diags["iter_stats"]:
         st = diags["iter_stats"][0]
-        for key in ("rho_mean", "rho_max", "mid_band_frac", "n_interior"):
+        for key in ("rho_mean", "rho_max", "mid_band_frac", "n_interior",
+                    "fac_mean", "sur_mean"):
             if key in st:
                 print(f"  {key}: {st[key]}")
     seed = model.seed
-    print(f"\n  R₀={seed.R0.item():.4g}  a={seed.a.item():.4g}  b={seed.b.item():.4g} (learned)")
-    for name, t in (("R₀", seed._R0), ("a", seed._a_raw), ("b", seed._b_raw)):
+    print(
+        f"\n  κ={seed.kappa.item():.4g}  λ={seed.lam.item():.4g}  "
+        f"η={seed.eta.item():.4g}  σ_f={seed.sigma_f.item():.4g} (learned)"
+    )
+    for name, t in (
+        ("κ", seed._kappa_raw),
+        ("λ", seed._lambda_raw),
+        ("η", seed._eta_raw),
+        ("σ_f", seed._sigma_f_raw),
+    ):
         if t.grad is None:
             print(f"  |grad| {name}: grad=None")
         else:
@@ -662,23 +667,25 @@ def format_l1_param_lines(model: StriateE2E, *, indent: str = "  ") -> list[str]
 
 def format_seed_param_lines(seed, *, indent: str = "  ") -> list[str]:
     return [
-        f"{indent}R₀={seed.R0.item():.4g}  a={seed.a.item():.4g}  b={seed.b.item():.4g} (learned)  "
-        f"ρ=g_R(R)·g_E(E_rel)·ok;  g_R=σ(a(R−R₀));  g_E=σ(b log E_rel)",
+        f"{indent}κ={seed.kappa.item():.4g}  λ={seed.lam.item():.4g}  "
+        f"η={seed.eta.item():.4g}  σ_f={seed.sigma_f.item():.4g} (learned)  "
+        f"ρ=NR(R + κ·F − λ·S);  F=collinear facilitation;  S=⟨R⟩_surround",
     ]
 
 
 def format_renderer_param_lines(r, *, indent: str = "  ") -> list[str]:
-    sig = float(r.sigma_perp.detach())
+    sig_p = float(r.sigma_perp.detach())
+    sig_a = float(r.sigma_par.detach())
     st = float(r.s_t.detach())
     sn = float(r.s_n.detach())
     return [
-        f"{indent}σ⊥={sig:.3f}  s_t={st:.3f}  s_n={sn:.3f}  "
+        f"{indent}σ⊥={sig_p:.3f}  σ∥={sig_a:.3f}  s_t={st:.3f}  s_n={sn:.3f}  "
         f"thinning MLP 20→12→1",
     ]
 
 
 def format_model_param_counts(model: StriateE2E) -> tuple[int, int, int]:
-    """Returns (total, seed AND-gate, renderer)."""
+    """Returns (total, seed, renderer)."""
     n_seed = sum(p.numel() for p in model.seed.parameters())
     n_renderer = sum(p.numel() for p in model.renderer.parameters())
     n_total = sum(p.numel() for p in model.parameters())
@@ -687,7 +694,7 @@ def format_model_param_counts(model: StriateE2E) -> tuple[int, int, int]:
 
 def format_model_param_summary(model: StriateE2E) -> str:
     n_tot, n_seed, n_r = format_model_param_counts(model)
-    return f"{n_tot} total = seed AND-gate {n_seed} + renderer {n_r}"
+    return f"{n_tot} total = seed {n_seed} + renderer {n_r}"
 
 
 def save_checkpoint(model, path):
@@ -754,7 +761,7 @@ def main():
     ap.add_argument(
         "--debug-seed",
         action="store_true",
-        help="Run one batch, print AND-gate stats and R₀/a/b gradients, then exit",
+        help="Run one batch, print seed stats and κ/λ/η/σ_f gradients, then exit",
     )
     args = ap.parse_args()
 
@@ -771,8 +778,8 @@ def main():
         f"  max_train={mt}"
     )
     print(
-        f"Seed: g_R=σ(a(R−R₀)) · g_E=σ(b log E_rel) · ok; "
-        f"R₀ init={SEED.R0_INIT}  a init={SEED.A_INIT}  b init={SEED.B_INIT} (learned)"
+        f"Seed: ρ=NR(R + κ·F − λ·S)·ok;  F=collinear facilitation (along θ), "
+        f"S=⟨R⟩_surround (κ, λ, η, σ_f learned)"
     )
     print(
         f"Render: Gaussian-line splat + stencil thinning MLP → "
