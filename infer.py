@@ -31,7 +31,6 @@ from hci.diagnostics_viz import (
     viz_infer_l0_pinwheel,
     viz_infer_l1_rho_masses,
     viz_infer_cell_rho,
-    viz_infer_cell_coherence,
     save_rho_png,
     viz_infer_shape_readout,
     viz_infer_base_edges_overlay,
@@ -156,7 +155,6 @@ def run_l0_l1(img_path, device, metric=None):
 
     rho_total_grid = cells["rho_total"].astype(np.float64, copy=True)
     rho_peak_grid = cells["rho_peak"].astype(np.float64, copy=True)
-    coherence_R_grid = cells["coherence_R"].astype(np.float64, copy=True)
     E_rel_grid = relative_energy(
         torch.from_numpy(rho_total_grid.astype(np.float32)),
         nH,
@@ -184,7 +182,6 @@ def run_l0_l1(img_path, device, metric=None):
         "nW": nW,
         "rho_total_grid": rho_total_grid,
         "rho_peak_grid": rho_peak_grid,
-        "coherence_R_grid": coherence_R_grid,
         "E_rel_grid": E_rel_grid,
         "cx_grid": cx_grid,
         "cy_grid": cy_grid,
@@ -346,7 +343,7 @@ def main():
         "--diagnostics",
         action="store_true",
         help="Save additional diagnostics: base, l0_pinwheel, l1_moments, "
-        "cell_rho, cell_coherence, cell_joint, render_softmap, render_theta_bins, overlay.",
+        "cell_rho, render_softmap, render_theta_bins, overlay.",
     )
     ap.add_argument(
         "--gt_dir",
@@ -418,7 +415,6 @@ def main():
 
         p_rho = os.path.join(od, f"{stem}_l1_moments.png")
         viz_infer_l1_rho_masses(
-            prep["coherence_R_grid"],
             prep["rho_total_grid"],
             prep["rho_peak_grid"],
             is_border,
@@ -429,14 +425,6 @@ def main():
         p_cell = os.path.join(od, f"{stem}_cell_rho.png")
         viz_infer_cell_rho(rho_post, is_border, p_cell)
         saved_files.append(p_cell)
-
-        p_coh = os.path.join(od, f"{stem}_cell_coherence.png")
-        viz_infer_cell_coherence(
-            prep["coherence_R_grid"],
-            is_border,
-            p_coh,
-        )
-        saved_files.append(p_coh)
 
         gt_arr: np.ndarray | None = None
         if args.gt_dir:

@@ -46,7 +46,7 @@ except Exception:  # pragma: no cover - allow standalone import / testing
 
 
 # ── init defaults (read from params if present, else literal fallbacks) ──
-_BETA_INIT = float(getattr(SEED, "BETA_INIT", 0.30))     # coherence-alone floor (no collinear support)
+_BETA_INIT = float(getattr(SEED, "BETA_INIT", 0.30))     # drive-alone floor (no collinear support)
 _KAPPA_INIT = float(getattr(SEED, "KAPPA_INIT", 3.0))    # facilitation gain in e = R·(β + κ·F)
 _KAPPA_THETA_INIT = float(getattr(SEED, "KAPPA_THETA_INIT", 2.5))  # von Mises width in F
 _LAMBDA_INIT = float(getattr(SEED, "LAMBDA_INIT", 1.5))  # divisive surround gain
