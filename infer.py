@@ -40,6 +40,7 @@ from train import (
     StriateE2E,
     build_cells_flat,
     build_l0_pix,
+    format_l0_param_lines,
     format_l1_param_lines,
     format_seed_param_lines,
     format_model_param_summary,
@@ -86,7 +87,7 @@ def _sync(device):
         torch.cuda.synchronize()
 
 
-def run_l0_l1(img_path, device):
+def run_l0_l1(img_path, device, metric=None):
     timings = {}
 
     _sync(device)
@@ -97,13 +98,15 @@ def run_l0_l1(img_path, device):
     gc.collect()
 
     ir_t = torch.from_numpy(ir_p).to(device)
-    h, vld, _, _, _, s, h1m, h2m, h2m_lum, h2m_chr = compute_l0_rgb(
-        ir_t,
-        eta_lum=L0.ETA_LUM,
-        eta_chr=L0.ETA_CHR,
-        gamma=L0.GAMMA,
-        offsets=L0.OFFSETS,
-    )
+    with torch.no_grad():
+        h, vld, _, _, _, s, h1m, h2m, h2m_lum, h2m_chr = compute_l0_rgb(
+            ir_t,
+            eta_lum=L0.ETA_LUM,
+            eta_chr=L0.ETA_CHR,
+            gamma=L0.GAMMA,
+            offsets=L0.OFFSETS,
+            metric=metric,
+        )
     h_np = h.cpu().numpy()
     img_pinwheel = np.clip(ir_p[:H0, :W0].copy(), 0.0, 1.0)
 
@@ -152,6 +155,7 @@ def run_l0_l1(img_path, device):
     cells_flat = build_cells_flat(cells)
 
     rho_total_grid = cells["rho_total"].astype(np.float64, copy=True)
+    rho_peak_grid = cells["rho_peak"].astype(np.float64, copy=True)
     coherence_R_grid = cells["coherence_R"].astype(np.float64, copy=True)
     E_rel_grid = relative_energy(
         torch.from_numpy(rho_total_grid.astype(np.float32)),
@@ -179,6 +183,7 @@ def run_l0_l1(img_path, device):
         "nH": nH,
         "nW": nW,
         "rho_total_grid": rho_total_grid,
+        "rho_peak_grid": rho_peak_grid,
         "coherence_R_grid": coherence_R_grid,
         "E_rel_grid": E_rel_grid,
         "cx_grid": cx_grid,
@@ -297,6 +302,9 @@ def _format_model_summary(model, device, diagnostics):
         f"  device:      {device}",
         f"  diagnostics: {diagnostics}",
         "",
+        "L0",
+        *format_l0_param_lines(model),
+        "",
         "L1",
         *format_l1_param_lines(model),
         "",
@@ -370,7 +378,7 @@ def main():
         print()
 
     img_path = os.path.join(args.input_dir, args.image)
-    prep, prep_t = run_l0_l1(img_path, device)
+    prep, prep_t = run_l0_l1(img_path, device, metric=model.l0_metric)
 
     collect_diags = args.verbose or args.diagnostics
     (bmap, theta_map, rho_post, branch_grid, is_border, diags, _, fwd_t) = (
@@ -410,7 +418,11 @@ def main():
 
         p_rho = os.path.join(od, f"{stem}_l1_moments.png")
         viz_infer_l1_rho_masses(
-            prep["coherence_R_grid"], prep["rho_total_grid"], is_border, p_rho,
+            prep["coherence_R_grid"],
+            prep["rho_total_grid"],
+            prep["rho_peak_grid"],
+            is_border,
+            p_rho,
         )
         saved_files.append(p_rho)
 

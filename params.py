@@ -17,6 +17,10 @@ L0 = SimpleNamespace(
     ETA_CHR=0.05,
     ETA0=0.05,  # legacy alias for scripts still printing “η₀”
     GAMMA=1.0,
+    # ε inside chroma/harmonic norms — avoids ∂√0 = ∞ when backpropping through L0.
+    EPS=1e-6,
+    # Learned RGB metric W (M = WᵀW); trained end-to-end, init = orthonormal lum/chr.
+    LEARNED_METRIC=True,
 )
 
 # ── L1: patch geometry + z₂ moment pooling ─────────────────────────────────
@@ -80,7 +84,7 @@ TRAIN = SimpleNamespace(
     LAM_DICE=1.0,
     LAM_BCE=0.0,
     # Bump when L0 / pad / ``l0_pix`` / GT schema changes — not L1 binning or seed.
-    L0_CACHE_VERSION=1,
+    L0_CACHE_VERSION=2,
     # Legacy full-cache tag (pre-rho split); kept so old ``.pt`` files are rejected cleanly.
     CACHE_VERSION=44,
 )

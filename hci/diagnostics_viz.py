@@ -84,30 +84,22 @@ def _interior_vmin_vmax(arr: np.ndarray, interior: np.ndarray) -> tuple[float, f
 
 
 def viz_l1_rho_masses(
-    panel_a: np.ndarray,
-    panel_b: np.ndarray,
+    panels: list[tuple[np.ndarray, str]],
     is_border: np.ndarray,
     out_path: str,
     suptitle: str,
-    *,
-    label_a: str = r"$\rho_{\mathrm{peak}}$ (max bin)",
-    label_b: str = r"$\rho_{\mathrm{total}}$ (sum over bins)",
 ) -> None:
 
     cmap = "coolwarm"
-    a1 = apply_border_zero(panel_a, is_border)
-    a2 = apply_border_zero(panel_b, is_border)
     interior = ~np.asarray(is_border, dtype=bool)
+    n = len(panels)
+    fig_h = max(5.2 * n, 5.2)
 
-    panels = [
-        (a1, label_a),
-        (a2, label_b),
-    ]
-
-    fig, axes = plt.subplots(2, 1, figsize=(5.5, 5.2 * 2), facecolor=VIZ.BG)
+    fig, axes = plt.subplots(n, 1, figsize=(5.5, fig_h), facecolor=VIZ.BG)
     axes_flat = np.atleast_1d(axes).ravel()
 
-    for ax, (arr, title_base) in zip(axes_flat, panels):
+    for ax, (panel, label) in zip(axes_flat, panels):
+        arr = apply_border_zero(panel, is_border)
         ax.set_facecolor(VIZ.PANEL_BG)
         ax.axis("off")
         vmin, vmax = _interior_vmin_vmax(arr, interior)
@@ -119,7 +111,7 @@ def viz_l1_rho_masses(
             interpolation="nearest",
         )
         ax.set_title(
-            f"{title_base}\ninterior min={vmin:.4g}  max={vmax:.4g}",
+            f"{label}\ninterior min={vmin:.4g}  max={vmax:.4g}",
             fontsize=9,
             color=VIZ.FG,
             fontfamily="monospace",
@@ -535,18 +527,20 @@ def viz_infer_l0_pinwheel(
 def viz_infer_l1_rho_masses(
     coherence_R: np.ndarray,
     rho_total: np.ndarray,
+    rho_peak: np.ndarray,
     is_border: np.ndarray,
     out_path: str,
 ) -> None:
 
     viz_l1_rho_masses(
-        coherence_R,
-        rho_total,
+        [
+            (coherence_R, r"$R = |Z_2^{w}| / \sum h_{2m}|z_2|$"),
+            (rho_total, r"$\rho_{\mathrm{total}} = \sum|z_2|$"),
+            (rho_peak, r"$\rho_{\mathrm{peak}} = \max|z_2|$"),
+        ],
         is_border,
         out_path,
-        suptitle=r"L1 z₂ moments (R and $\rho_{\mathrm{total}}$ per cell)",
-        label_a=r"$R = |Z_2^{w}| / \sum h_{2m}|z_2|$",
-        label_b=r"$\rho_{\mathrm{total}} = \sum|z_2|$",
+        suptitle=r"L1 z₂ moments ($R$, $\rho_{\mathrm{total}}$, $\rho_{\mathrm{peak}}$ per cell)",
     )
 
 

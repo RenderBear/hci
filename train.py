@@ -29,6 +29,7 @@ from hci.L0 import (
     load_image,
     compute_l0_rgb,
     compute_interior,
+    L0LearnedMetric,
 )
 from hci.L1 import (
     stride_from_patch_overlap,
@@ -83,6 +84,40 @@ def build_l0_pix(
         hc[border_mask_np] = 0.0
         out["h2m_chr"] = torch.from_numpy(hc)
     return out
+
+
+def build_l0_pix_live(
+    img: torch.Tensor,
+    border_mask: torch.Tensor,
+    metric: L0LearnedMetric | None,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Differentiable L0 pixel features from cached RGB (for learned metric)."""
+    if not isinstance(img, torch.Tensor):
+        img = torch.as_tensor(np.asarray(img), dtype=torch.float32)
+    img_dev = img.to(device=device, dtype=torch.float32)
+    bm = border_mask.to(device=device).bool()
+    _, _, _, _, _, s, h1m, h2m, h2m_lum, h2m_chr = compute_l0_rgb(
+        img_dev,
+        eta_lum=L0.ETA_LUM,
+        eta_chr=L0.ETA_CHR,
+        gamma=L0.GAMMA,
+        offsets=L0.OFFSETS,
+        metric=metric,
+    )
+    z1_re, z1_im = s[..., 0], s[..., 1]
+    z2_re, z2_im = s[..., 2], s[..., 3]
+    inv = (~bm).float()
+    return {
+        "h1m": h1m * inv,
+        "h2m": h2m * inv,
+        "h2m_lum": h2m_lum * inv,
+        "h2m_chr": h2m_chr * inv,
+        "z1_re": z1_re * inv,
+        "z1_im": z1_im * inv,
+        "z2_re": z2_re * inv,
+        "z2_im": z2_im * inv,
+    }
 
 
 def proj_info_from_grid(H: int, W: int, P: int, patch_overlap: int) -> dict:
@@ -177,10 +212,12 @@ class StriateE2E(nn.Module):
         eps: float = SEED.EPS,
         render_cell_hidden: int = RENDER.CELL_HIDDEN,
         render_pixel_hidden: int = RENDER.PIXEL_HIDDEN,
+        use_l0_metric: bool = L0.LEARNED_METRIC,
         **kw,
     ):
         super().__init__()
         _ = kw  # absorbs legacy R0_init / a_init / b_init if a caller still passes them
+        self.l0_metric = L0LearnedMetric() if use_l0_metric else None
         self.seed = AndGateSeed(eps=eps)  # alias → ContourSeed; init from params.SEED
         _ = render_cell_hidden
         self.renderer = ModulationRenderer(hidden=render_pixel_hidden)
@@ -214,16 +251,22 @@ def prepare_batch(items, device, model: StriateE2E):
     meta = []
     for item in items:
         (gi, gt, Hp, Wp, Hg, Wg, H0, W0, l0_pix, border_mask, img) = item
+        if model.l0_metric is not None:
+            if img is None:
+                raise RuntimeError(
+                    "learned L0 metric requires cached RGB ``img``; "
+                    "rebuild cache (L0_CACHE_VERSION bump)."
+                )
+            l0_dev = build_l0_pix_live(img, border_mask, model.l0_metric, device)
+        else:
+            l0_dev = {k: v.to(device) for k, v in l0_pix.items()}
         cf_dev = run_moments_cells_flat(
-            l0_pix,
+            l0_dev,
             border_mask,
             H0,
             W0,
             device,
         )
-        l0_dev = {
-            k: v.to(device) for k, v in l0_pix.items()
-        }
         p_dev = proj_to_device(gi, device)
         meta.append(
             {
@@ -290,7 +333,7 @@ def precompute_image(img_path, gt_path, gt_format):
     l0_pix = build_l0_pix(
         s_np, h1m, h2m, border_mask_np, h2m_lum=h2m_lum, h2m_chr=h2m_chr,
     )
-    del h, vld, s, h1m, h2m, h2m_lum, h2m_chr, border_mask_t
+    del h, vld, s, h1m, h2m, h2m_lum, h2m_chr, border_mask_t, ir_t
     gc.collect()
 
     H_p, W_p = ir_p.shape[:2]
@@ -348,6 +391,9 @@ def _cache_entry_valid(data: dict) -> bool:
         return False
     bm = data.get("border_mask")
     if not isinstance(bm, torch.Tensor):
+        return False
+    img = data.get("img")
+    if img is None:
         return False
     l0 = data.get("l0_pix")
     if not isinstance(l0, dict):
@@ -661,6 +707,19 @@ def plot_training_curves(history, out_dir):
     print(f"  saved {p}")
 
 
+def format_l0_param_lines(model: StriateE2E, *, indent: str = "  ") -> list[str]:
+    m = model.l0_metric
+    if m is None:
+        return [f"{indent}fixed lum/chr split (no learned L0 metric)"]
+    w = m.W.detach().cpu()
+    return [
+        f"{indent}learned L0 metric W (3×3, M=WᵀW); row-0 lum, rows 1–2 chr",
+        f"{indent}W[0]={w[0].tolist()}",
+        f"{indent}W[1]={w[1].tolist()}",
+        f"{indent}W[2]={w[2].tolist()}",
+    ]
+
+
 def format_l1_param_lines(model: StriateE2E, *, indent: str = "  ") -> list[str]:
     _ = model
     return [
@@ -690,16 +749,19 @@ def format_renderer_param_lines(r, *, indent: str = "  ") -> list[str]:
     ]
 
 
-def format_model_param_counts(model: StriateE2E) -> tuple[int, int, int]:
-    """Returns (total, seed, renderer)."""
+def format_model_param_counts(model: StriateE2E) -> tuple[int, int, int, int]:
+    """Returns (total, l0, seed, renderer)."""
+    n_l0 = sum(p.numel() for p in model.l0_metric.parameters()) if model.l0_metric else 0
     n_seed = sum(p.numel() for p in model.seed.parameters())
     n_renderer = sum(p.numel() for p in model.renderer.parameters())
     n_total = sum(p.numel() for p in model.parameters())
-    return n_total, n_seed, n_renderer
+    return n_total, n_l0, n_seed, n_renderer
 
 
 def format_model_param_summary(model: StriateE2E) -> str:
-    n_tot, n_seed, n_r = format_model_param_counts(model)
+    n_tot, n_l0, n_seed, n_r = format_model_param_counts(model)
+    if n_l0:
+        return f"{n_tot} total = L0 {n_l0} + seed {n_seed} + renderer {n_r}"
     return f"{n_tot} total = seed {n_seed} + renderer {n_r}"
 
 
@@ -765,6 +827,11 @@ def main():
         help="weight on BCE term (0 disables)",
     )
     ap.add_argument(
+        "--no-l0-metric",
+        action="store_true",
+        help="Disable learned L0 RGB metric (use fixed lum/chr precompute)",
+    )
+    ap.add_argument(
         "--debug-seed",
         action="store_true",
         help="Run one batch, print seed stats and β/κ/κ_θ/λ/η/σ_f gradients, then exit",
@@ -798,10 +865,17 @@ def main():
     )
     if args.lam_dice == 0.0 and args.lam_bce == 0.0:
         print("  warning: both lambdas are 0 — loss is identically zero")
-    print(
-        f"L0 (precompute, fixed): η_lum={L0.ETA_LUM}  η_chr={L0.ETA_CHR}  "
-        f"γ={L0.GAMMA}  (tune in params.py)"
-    )
+    use_l0_metric = L0.LEARNED_METRIC and not args.no_l0_metric
+    if use_l0_metric:
+        print(
+            f"L0 (live, learned W): η_lum={L0.ETA_LUM}  η_chr={L0.ETA_CHR}  "
+            f"γ={L0.GAMMA}  (η fixed; W trained end-to-end)"
+        )
+    else:
+        print(
+            f"L0 (precompute, fixed): η_lum={L0.ETA_LUM}  η_chr={L0.ETA_CHR}  "
+            f"γ={L0.GAMMA}  (tune in params.py)"
+        )
 
     train_cache = os.path.join(args.cache_dir, "train")
     print(f"\nprecomputing train...")
@@ -822,6 +896,7 @@ def main():
         eps=SEED.EPS,
         render_cell_hidden=RENDER.CELL_HIDDEN,
         render_pixel_hidden=RENDER.PIXEL_HIDDEN,
+        use_l0_metric=use_l0_metric,
     ).to(device)
 
     active_params = list(model.parameters())
@@ -906,6 +981,16 @@ def main():
             loss.backward()
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(active_params, args.grad_clip)
+            if not torch.isfinite(loss):
+                print(f"    [warn] non-finite loss={loss.item()} — skipping step")
+                continue
+            bad_grad = [
+                n for n, p in model.named_parameters()
+                if p.grad is not None and not torch.isfinite(p.grad).all()
+            ]
+            if bad_grad:
+                print(f"    [warn] non-finite grad in {bad_grad[:3]} — skipping step")
+                continue
             optimizer.step()
 
             n_img += len(meta_list)

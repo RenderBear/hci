@@ -18,6 +18,10 @@ Second-harmonic magnitudes from split fields (renderer + L1 photometry):
 η_lum and η_chr are read from ``params.L0`` at precompute time only; they are not model
 parameters and are not updated during training.
 
+Optional learned RGB metric ``L0LearnedMetric``: ``d = ‖W Δc‖₂`` with ``M = WᵀW``,
+row 0 = luminance, rows 1–2 = chrominance at init (orthonormal). Trained end-to-end
+when ``params.L0.LEARNED_METRIC`` is enabled.
+
 Non-RGB ``compute_contrast_field`` (divisive NR) is unchanged for grayscale / generic C.
 """
 
@@ -28,8 +32,58 @@ from typing import Union
 
 import numpy as np
 import torch
+import torch.nn as nn
 
-EtaArg = Union[float, Callable[[], float]]
+try:
+    from params import L0 as _L0_PARAMS
+except Exception:  # pragma: no cover
+    class _L0_PARAMS:  # type: ignore
+        EPS = 1e-6
+
+_L0_EPS = float(getattr(_L0_PARAMS, "EPS", 1e-6))
+
+
+# ═══════════════════════════════════════════════════════════════
+# Learned RGB difference metric (M = WᵀW, row-0 lum / rows 1–2 chr)
+# ═══════════════════════════════════════════════════════════════
+
+def orthonormal_lum_chroma_basis() -> torch.Tensor:
+    """3×3 orthonormal rows: luminance, then two chrominance directions."""
+    s3 = 3.0 ** -0.5
+    s2 = 2.0 ** -0.5
+    s6 = 6.0 ** -0.5
+    return torch.tensor(
+        [
+            [s3, s3, s3],
+            [s2, -s2, 0.0],
+            [s6, s6, -2.0 * s6],
+        ],
+        dtype=torch.float32,
+    )
+
+
+class L0LearnedMetric(nn.Module):
+    r"""Learned inner product on linear RGB differences.
+
+    Directional distance uses ``d = ‖W Δc‖₂`` with ``M = WᵀW ≽ 0``.
+    Row 0 spans luminance (|ΔL| at init); rows 1–2 span chrominance
+    (‖ΔC‖₂ at init).  η_lum / η_chr Naka–Rushton channels are unchanged.
+    """
+
+    def __init__(self, *, learnable: bool = True) -> None:
+        super().__init__()
+        init = orthonormal_lum_chroma_basis()
+        if learnable:
+            self.W = nn.Parameter(init.clone())
+        else:
+            self.register_buffer("W", init)
+
+    def project_diff(self, delta_rgb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Map ``(..., 3)`` RGB difference to ``(|lum|, ‖chr‖₂)``."""
+        proj = torch.einsum("...i,ji->...j", delta_rgb, self.W)
+        d_lum = proj[..., 0].abs()
+        d_chr = (proj[..., 1:].square().sum(dim=-1) + _L0_EPS).sqrt()
+        return d_lum, d_chr
 
 
 def resolve_eta(eta: EtaArg) -> float:
@@ -130,15 +184,22 @@ def _compute_d(img: torch.Tensor, offsets: list[tuple[int, int]]) -> torch.Tenso
 def _compute_d_lum_chroma(
     img_rgb: torch.Tensor,
     offsets: list[tuple[int, int]],
+    metric: L0LearnedMetric | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Scalar |ΔL| and vector chroma L2 ‖ΔC‖₂ (no /√3 normalization)."""
+    """Scalar lum and chroma distance per direction.
+
+    Default: |ΔL| and ‖ΔC‖₂ on the orthonormal split.
+    With ``metric``: |W₀·ΔRGB| and ‖W₁:₂·ΔRGB‖₂ (learned M = WᵀW).
+    """
     H, W, _ = img_rgb.shape
     N = len(offsets)
-    R = img_rgb[..., 0]
-    G = img_rgb[..., 1]
-    B = img_rgb[..., 2]
-    L = (R + G + B) * (1.0 / 3.0)
-    C = torch.stack([R - L, G - L, B - L], dim=-1)
+    use_metric = metric is not None
+    if not use_metric:
+        R = img_rgb[..., 0]
+        G = img_rgb[..., 1]
+        B = img_rgb[..., 2]
+        L = (R + G + B) * (1.0 / 3.0)
+        C = torch.stack([R - L, G - L, B - L], dim=-1)
 
     d_lum = torch.empty(H, W, N, dtype=torch.float32, device=img_rgb.device)
     d_chr = torch.empty(H, W, N, dtype=torch.float32, device=img_rgb.device)
@@ -148,10 +209,16 @@ def _compute_d_lum_chroma(
         c0s, c1s = max(0, -dx), min(W, W - dx)
         r0d, r1d = max(0, dy), min(H, H + dy)
         c0d, c1d = max(0, dx), min(W, W + dx)
-        dL = L[r0s:r1s, c0s:c1s] - L[r0d:r1d, c0d:c1d]
-        dC = C[r0s:r1s, c0s:c1s] - C[r0d:r1d, c0d:c1d]
-        d_lum[r0d:r1d, c0d:c1d, k] = dL.abs()
-        d_chr[r0d:r1d, c0d:c1d, k] = (dC * dC).sum(dim=-1).sqrt()
+        if use_metric:
+            diff = img_rgb[r0s:r1s, c0s:c1s] - img_rgb[r0d:r1d, c0d:c1d]
+            d_l, d_c = metric.project_diff(diff)
+            d_lum[r0d:r1d, c0d:c1d, k] = d_l
+            d_chr[r0d:r1d, c0d:c1d, k] = d_c
+        else:
+            dL = L[r0s:r1s, c0s:c1s] - L[r0d:r1d, c0d:c1d]
+            dC = C[r0s:r1s, c0s:c1s] - C[r0d:r1d, c0d:c1d]
+            d_lum[r0d:r1d, c0d:c1d, k] = dL.abs()
+            d_chr[r0d:r1d, c0d:c1d, k] = (dC.square().sum(dim=-1) + _L0_EPS).sqrt()
         if dy > 0:
             d_lum[:dy, :, k] = 0.0
             d_chr[:dy, :, k] = 0.0
@@ -246,6 +313,7 @@ def compute_l0_rgb(
     eta_chr: EtaArg,
     gamma: float,
     offsets: list[tuple[int, int]],
+    metric: L0LearnedMetric | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -274,7 +342,7 @@ def compute_l0_rgb(
     gamma_used = float(gamma)
 
     vld = compute_valid(H, W, offsets, device)
-    d_lum, d_chr = _compute_d_lum_chroma(img_rgb, offsets)
+    d_lum, d_chr = _compute_d_lum_chroma(img_rgb, offsets, metric=metric)
 
     h_lum = _naka_per_direction(d_lum, eta_l, gamma_used, device)
     h_chr = _naka_per_direction(d_chr, eta_c, gamma_used, device)
@@ -300,8 +368,8 @@ def compute_harmonics(
     unit = _make_unit(offsets).to(h.device)
     fm = _make_F(unit).to(h.device)
     s = (h.reshape(-1, N) @ fm.T).reshape(H, W, 4)
-    h1m = (s[..., 0] ** 2 + s[..., 1] ** 2).sqrt()
-    h2m = (s[..., 2] ** 2 + s[..., 3] ** 2).sqrt()
+    h1m = (s[..., 0] ** 2 + s[..., 1] ** 2 + _L0_EPS).sqrt()
+    h2m = (s[..., 2] ** 2 + s[..., 3] ** 2 + _L0_EPS).sqrt()
     return s, h1m, h2m
 
 
@@ -342,6 +410,7 @@ def run_l0(
     gamma: float,
     offsets: list[tuple[int, int]],
     verbose: bool = True,
+    metric: L0LearnedMetric | None = None,
 ) -> dict:
     H, W = ir.shape[:2]
     device = ir.device
@@ -362,7 +431,12 @@ def run_l0(
             h2m_lum,
             h2m_chr,
         ) = compute_l0_rgb(
-            ir, eta_lum=eta_lum, eta_chr=eta_chr, gamma=gamma, offsets=offsets,
+            ir,
+            eta_lum=eta_lum,
+            eta_chr=eta_chr,
+            gamma=gamma,
+            offsets=offsets,
+            metric=metric,
         )
         eta_used_print = float(eta_l)
     else:

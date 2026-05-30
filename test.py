@@ -142,13 +142,15 @@ def run_image_inference(model, img_path, device):
     gc.collect()
 
     ir_t = torch.from_numpy(ir_p).to(device)
-    h, vld, _, _, _, s, h1m, h2m, h2m_lum, h2m_chr = compute_l0_rgb(
-        ir_t,
-        eta_lum=L0.ETA_LUM,
-        eta_chr=L0.ETA_CHR,
-        gamma=L0.GAMMA,
-        offsets=L0.OFFSETS,
-    )
+    with torch.no_grad():
+        h, vld, _, _, _, s, h1m, h2m, h2m_lum, h2m_chr = compute_l0_rgb(
+            ir_t,
+            eta_lum=L0.ETA_LUM,
+            eta_chr=L0.ETA_CHR,
+            gamma=L0.GAMMA,
+            offsets=L0.OFFSETS,
+            metric=getattr(model, "l0_metric", None),
+        )
     bm_t = ~compute_interior(ir_p.shape[0], ir_p.shape[1], device)
     z1, z2 = z_from_l0_harmonics(s, bm_t)
     _ = z1
