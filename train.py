@@ -551,7 +551,7 @@ def upgrade_model_state_dict(state_dict: dict) -> dict:
 
 
 def debug_seed_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
-    """One training batch: seed stats + ∂loss/∂(κ, λ, η, σ_f)."""
+    """One training batch: seed stats + ∂loss/∂(β, κ, λ, η, σ_f)."""
     model.train()
     meta = meta_list[0]
     cf = meta["cells_flat_dev"]
@@ -590,10 +590,11 @@ def debug_seed_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
                 print(f"  {key}: {st[key]}")
     seed = model.seed
     print(
-        f"\n  κ={seed.kappa.item():.4g}  λ={seed.lam.item():.4g}  "
+        f"\n  β={seed.beta.item():.4g}  κ={seed.kappa.item():.4g}  λ={seed.lam.item():.4g}  "
         f"η={seed.eta.item():.4g}  σ_f={seed.sigma_f.item():.4g} (learned)"
     )
     for name, t in (
+        ("β", seed._beta_raw),
         ("κ", seed._kappa_raw),
         ("λ", seed._lambda_raw),
         ("η", seed._eta_raw),
@@ -667,9 +668,10 @@ def format_l1_param_lines(model: StriateE2E, *, indent: str = "  ") -> list[str]
 
 def format_seed_param_lines(seed, *, indent: str = "  ") -> list[str]:
     return [
-        f"{indent}κ={seed.kappa.item():.4g}  λ={seed.lam.item():.4g}  "
-        f"η={seed.eta.item():.4g}  σ_f={seed.sigma_f.item():.4g} (learned)  "
-        f"ρ=NR(R + κ·F − λ·S);  F=collinear facilitation;  S=⟨R⟩_surround",
+        f"{indent}β={seed.beta.item():.4g}  κ={seed.kappa.item():.4g}  "
+        f"λ={seed.lam.item():.4g}  η={seed.eta.item():.4g}  σ_f={seed.sigma_f.item():.4g} "
+        f"(learned)  [{seed.surround_mode} surround]",
+        f"{indent}e=R·(β+κ·F);  ρ=e²/(e²+η²+(λ·⟨e⟩_𝒩)²);  F=collinear facilitation",
     ]
 
 
@@ -761,7 +763,7 @@ def main():
     ap.add_argument(
         "--debug-seed",
         action="store_true",
-        help="Run one batch, print seed stats and κ/λ/η/σ_f gradients, then exit",
+        help="Run one batch, print seed stats and β/κ/λ/η/σ_f gradients, then exit",
     )
     args = ap.parse_args()
 
@@ -778,8 +780,8 @@ def main():
         f"  max_train={mt}"
     )
     print(
-        f"Seed: ρ=NR(R + κ·F − λ·S)·ok;  F=collinear facilitation (along θ), "
-        f"S=⟨R⟩_surround (κ, λ, η, σ_f learned)"
+        f"Seed: e=R·(β+κ·F);  ρ=e²/(e²+η²+(λ·⟨e⟩_𝒩)²)·ok;  "
+        f"F=collinear facilitation (along θ), broadside surround (β,κ,λ,η,σ_f learned)"
     )
     print(
         f"Render: Gaussian-line splat + stencil thinning MLP → "

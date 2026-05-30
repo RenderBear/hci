@@ -1,8 +1,8 @@
 r"""Cell-grid contour seed — association-field pooling of coherence.
 
-Coherence R is the base signal. A single oriented pooling step mixes
-collinear facilitation (excitatory, along θ) with surround suppression
-(inhibitory, isotropic), and the result is read out as ρ.
+Coherence R is the base signal. Collinear support GATES it (rather than topping it
+up), and an isotropic surround over the resulting drive normalises it DIVISIVELY —
+so suppression is relative to the local neighbourhood, never a flat DC offset.
 
 From L1 moments (R = |Z₂|/Σ|z₂|, θ = ½ arg Z₂, ρ_total):
 
@@ -13,13 +13,17 @@ From L1 moments (R = |Z₂|/Σ|z₂|, θ = ½ arg Z₂, ρ_total):
                           (t̂_c = (cosθ, sinθ) tangent — renderer convention, so the
                            facilitation axis coincides with the splat's σ∥ axis)
 
-  surround suppression    S(c) = ⟨R⟩_𝒩  (center-excluded Gaussian, reflect-padded)
+  gated excitation        e(c) = R(c) · (β + κ·F(c))
+                          (β = coherence-alone floor; no collinear support ⇒ ~β·R,
+                           which removes the R≈⟨R⟩ noise pedestal at the source)
 
-  single-step mix         drive(c) = R(c) + κ·F(c) − λ·S(c)
-  Naka–Rushton readout    ρ(c)     = drive₊² / (drive₊² + η²) · ok(c)
+  selective surround      S(c) = ⟨e⟩_𝒩   (center-excluded Gaussian over the drive;
+                           spatially varying because e is structured)
 
-Learned (softplus-positive): κ (facilitation gain), λ (surround gain),
-η (NR semi-saturation), σ_f (facilitation length, cell units).
+  divisive readout        ρ(c) = e² / (e² + η² + (λ·S)²) · ok(c)
+
+Learned (softplus-positive): β (floor), κ (facilitation gain), λ (surround gain),
+η (semi-saturation), σ_f (facilitation length, cell units).
 θ passes through from L1 unchanged. ``branch`` is a vestigial all-zero index.
 """
 
@@ -45,9 +49,10 @@ except Exception:  # pragma: no cover - allow standalone import / testing
 
 
 # ── init defaults (read from params if present, else literal fallbacks) ──
-_KAPPA_INIT = float(getattr(SEED, "KAPPA_INIT", 1.5))   # facilitation gain
-_LAMBDA_INIT = float(getattr(SEED, "LAMBDA_INIT", 0.8))  # surround-suppression gain
-_ETA_INIT = float(getattr(SEED, "ETA_INIT", 0.35))       # NR semi-saturation
+_BETA_INIT = float(getattr(SEED, "BETA_INIT", 0.30))     # coherence-alone floor (no collinear support)
+_KAPPA_INIT = float(getattr(SEED, "KAPPA_INIT", 3.0))    # collinear facilitation gain
+_LAMBDA_INIT = float(getattr(SEED, "LAMBDA_INIT", 1.5))  # divisive surround gain
+_ETA_INIT = float(getattr(SEED, "ETA_INIT", 0.30))       # semi-saturation (empty-surround knee)
 _SIGMA_F_INIT = float(getattr(SEED, "SIGMA_F_INIT", 1.3))  # facilitation length (cells)
 _FACIL_RADIUS = int(getattr(SEED, "FACIL_RADIUS", 2))      # neighbourhood radius (cells)
 
@@ -175,16 +180,58 @@ def collinear_facilitation(
     return torch.relu(fac_raw)
 
 
+def broadside_surround(
+    e: torch.Tensor,
+    theta: torch.Tensor,
+    *,
+    sigma: float,
+    radius: int,
+    eps: float,
+) -> torch.Tensor:
+    """⟨e⟩ over a center-excluded surround weighted toward the NORMAL of θ.
+
+    w_perp(δ) = G(|δ|) · (δ·n̂_c)²/|δ|²  — the complement of the collinear
+    facilitation lobe. A thin contour's own continuation lies along the tangent
+    and is down-weighted here, so the contour does not suppress itself; flanking
+    (broadside) texture still does. Shapes (nH, nW).
+    """
+    nH, nW = e.shape
+    dtype, dev = e.dtype, e.device
+    ct, st = torch.cos(theta), torch.sin(theta)          # tangent t̂ = (cosθ, sinθ)
+    sig2 = 2.0 * float(sigma) * float(sigma)
+    pad = int(radius)
+    Se = torch.zeros_like(e)
+    Wm = torch.zeros_like(e)
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            if dy == 0 and dx == 0:
+                continue
+            d2 = float(dy * dy + dx * dx)
+            G = math.exp(-d2 / sig2)
+            n_proj = -float(dy) * st + float(dx) * ct     # δ · n̂
+            perp = (n_proj * n_proj) / (d2 + eps)         # broadside fraction in [0,1]
+            w = G * perp
+            Se = Se + w * _shift(e, dy, dx, pad)
+            Wm = Wm + w
+    return Se / (Wm + eps)
+
+
 # ═══════════════════════════════════════════════════════════════
 # Seed module
 # ═══════════════════════════════════════════════════════════════
 
 class ContourSeed(nn.Module):
-    """Association-field gate: R base · (collinear facilitation − surround) → NR ρ."""
+    """Divisive association-field gate.
+
+      e   = R · (β + κ·F)                     facilitation-GATED coherence (β = floor)
+      S   = ⟨e⟩_𝒩                             selective surround over structured drive
+      ρ   = e² / (e² + η² + (λ·S)²) · ok      divisive normalisation (relative, not DC)
+    """
 
     def __init__(
         self,
         eps: float = SEED.EPS,
+        beta_init: float = _BETA_INIT,
         kappa_init: float = _KAPPA_INIT,
         lambda_init: float = _LAMBDA_INIT,
         eta_init: float = _ETA_INIT,
@@ -192,6 +239,7 @@ class ContourSeed(nn.Module):
         facil_radius: int = _FACIL_RADIUS,
         surround_radius: int = SEED.SURROUND_RADIUS,
         surround_sigma: float = SEED.SURROUND_SIGMA,
+        surround_mode: str = str(getattr(SEED, "SURROUND_MODE", "broadside")),
         **kw,  # absorbs legacy R0_init / a_init / b_init etc.
     ):
         super().__init__()
@@ -200,10 +248,16 @@ class ContourSeed(nn.Module):
         self.facil_radius = int(facil_radius)
         self.surround_radius = int(surround_radius)
         self.surround_sigma = float(surround_sigma)
+        self.surround_mode = str(surround_mode)  # "broadside" (oriented) | "isotropic"
+        self._beta_raw = nn.Parameter(torch.tensor(_inv_softplus(beta_init)))
         self._kappa_raw = nn.Parameter(torch.tensor(_inv_softplus(kappa_init)))
         self._lambda_raw = nn.Parameter(torch.tensor(_inv_softplus(lambda_init)))
         self._eta_raw = nn.Parameter(torch.tensor(_inv_softplus(eta_init)))
         self._sigma_f_raw = nn.Parameter(torch.tensor(_inv_softplus(sigma_f_init)))
+
+    @property
+    def beta(self) -> torch.Tensor:
+        return Fn.softplus(self._beta_raw).view(())
 
     @property
     def kappa(self) -> torch.Tensor:
@@ -244,29 +298,44 @@ class ContourSeed(nn.Module):
         F = collinear_facilitation(
             Rb, theta, sigma_f=self.sigma_f, radius=self.facil_radius, eps=eps,
         )
-        S = surround_mean(
-            Rb, nH, nW, radius=self.surround_radius, sigma=self.surround_sigma,
-        )
 
-        drive = Rb + self.kappa * F - self.lam * S
-        drive_p = torch.relu(drive)
-        eta2 = (self.eta * self.eta)
-        rho = drive_p * drive_p / (drive_p * drive_p + eta2 + eps)
-        rho = rho * ok
+        # Excitation: coherence GATED (not topped up) by collinear support.
+        # A high-R cell with no collinear neighbours (a noise fluctuation) yields
+        # only β·R, so the R≈⟨R⟩ noise pedestal is removed at the source.
+        e = Rb * (self.beta + self.kappa * F)
+
+        # Selective surround: pool the *structured* excitation, applied DIVISIVELY.
+        # ⟨e⟩_𝒩 varies spatially (low in empty regions, high in clutter), so this
+        # is a relative normalisation, not the flat DC offset that ⟨R⟩ produced.
+        # "broadside" pools off the tangent so a contour doesn't suppress itself.
+        if self.surround_mode == "isotropic":
+            S = surround_mean(
+                e, nH, nW, radius=self.surround_radius, sigma=self.surround_sigma,
+            )
+        else:
+            S = broadside_surround(
+                e, theta, sigma=self.surround_sigma,
+                radius=self.surround_radius, eps=eps,
+            )
+
+        e2 = e * e
+        denom = e2 + (self.eta * self.eta) + (self.lam * S) * (self.lam * S) + eps
+        rho = (e2 / denom) * ok
 
         rho_flat = rho.reshape(N)
 
         cf_out = dict(cells_flat)
         cf_out["fac"] = (F * ok).reshape(nH, nW)
+        cf_out["exc"] = (e * ok).reshape(nH, nW)
         cf_out["sur"] = (S * ok).reshape(nH, nW)
-        cf_out["drive"] = (drive_p * ok).reshape(nH, nW)
+        cf_out["drive"] = (e * ok).reshape(nH, nW)
         cf_out["rho_seed"] = rho
         # legacy keys kept so existing diagnostics don't KeyError
         cf_out["E_rel"] = relative_energy(
             rho_t, nH, nW, eps,
             radius=self.surround_radius, sigma=self.surround_sigma,
         )
-        cf_out["g_R"] = (torch.relu(self.kappa * F) * ok).reshape(nH, nW)
+        cf_out["g_R"] = ((self.beta + self.kappa * F) * ok).reshape(nH, nW)
         cf_out["g_E"] = (S * ok).reshape(nH, nW)
 
         branch = torch.zeros(N, device=device, dtype=torch.long)
