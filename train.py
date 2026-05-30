@@ -528,7 +528,7 @@ def bce_loss_with_ignore(
 def upgrade_model_state_dict(state_dict: dict) -> dict:
     """Map legacy keys; drop dynamics / K-bin / η_z / von Mises / AND-gate scalars.
 
-    The association-field seed (κ, λ, η, σ_f) carries none of the old AND-gate
+    The association-field seed (κ, κ_θ, λ, η, σ_f) carries none of the old AND-gate
     parameters, so legacy ``seed._R0`` / ``seed._a_raw`` / ``seed._b_raw`` (and the
     earlier ``seed._eta_z_raw``) are dropped here and the new scalars initialise
     fresh from ``params.SEED`` via ``load_state_dict(..., strict=False)``.
@@ -551,7 +551,7 @@ def upgrade_model_state_dict(state_dict: dict) -> dict:
 
 
 def debug_seed_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
-    """One training batch: seed stats + ∂loss/∂(β, κ, λ, η, σ_f)."""
+    """One training batch: seed stats + ∂loss/∂(β, κ, κ_θ, λ, η, σ_f)."""
     model.train()
     meta = meta_list[0]
     cf = meta["cells_flat_dev"]
@@ -590,12 +590,14 @@ def debug_seed_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
                 print(f"  {key}: {st[key]}")
     seed = model.seed
     print(
-        f"\n  β={seed.beta.item():.4g}  κ={seed.kappa.item():.4g}  λ={seed.lam.item():.4g}  "
+        f"\n  β={seed.beta.item():.4g}  κ={seed.kappa.item():.4g}  "
+        f"κ_θ={seed.kappa_theta.item():.4g}  λ={seed.lam.item():.4g}  "
         f"η={seed.eta.item():.4g}  σ_f={seed.sigma_f.item():.4g} (learned)"
     )
     for name, t in (
         ("β", seed._beta_raw),
         ("κ", seed._kappa_raw),
+        ("κ_θ", seed._kappa_theta_raw),
         ("λ", seed._lambda_raw),
         ("η", seed._eta_raw),
         ("σ_f", seed._sigma_f_raw),
@@ -669,9 +671,11 @@ def format_l1_param_lines(model: StriateE2E, *, indent: str = "  ") -> list[str]
 def format_seed_param_lines(seed, *, indent: str = "  ") -> list[str]:
     return [
         f"{indent}β={seed.beta.item():.4g}  κ={seed.kappa.item():.4g}  "
-        f"λ={seed.lam.item():.4g}  η={seed.eta.item():.4g}  σ_f={seed.sigma_f.item():.4g} "
+        f"κ_θ={seed.kappa_theta.item():.4g}  λ={seed.lam.item():.4g}  "
+        f"η={seed.eta.item():.4g}  σ_f={seed.sigma_f.item():.4g} "
         f"(learned)  [{seed.surround_mode} surround]",
-        f"{indent}e=R·(β+κ·F);  ρ=e²/(e²+η²+(λ·⟨e⟩_𝒩)²);  F=collinear facilitation",
+        f"{indent}e=R·(β+κ·F);  ρ=e²/(e²+η²+(λ·⟨e⟩_𝒩)²);  "
+        f"F=von Mises collinear (a_κ=exp(κ_θ(cos Δ−1)))",
     ]
 
 
@@ -763,7 +767,7 @@ def main():
     ap.add_argument(
         "--debug-seed",
         action="store_true",
-        help="Run one batch, print seed stats and β/κ/λ/η/σ_f gradients, then exit",
+        help="Run one batch, print seed stats and β/κ/κ_θ/λ/η/σ_f gradients, then exit",
     )
     args = ap.parse_args()
 
@@ -781,7 +785,8 @@ def main():
     )
     print(
         f"Seed: e=R·(β+κ·F);  ρ=e²/(e²+η²+(λ·⟨e⟩_𝒩)²)·ok;  "
-        f"F=collinear facilitation (along θ), broadside surround (β,κ,λ,η,σ_f learned)"
+        f"F=von Mises collinear (κ_θ window), broadside surround "
+        f"(β,κ,κ_θ,λ,η,σ_f learned)"
     )
     print(
         f"Render: Gaussian-line splat + stencil thinning MLP → "

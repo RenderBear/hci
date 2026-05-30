@@ -8,7 +8,8 @@ From L1 moments (R = |Z₂|/Σ|z₂|, θ = ½ arg Z₂, ρ_total):
 
   double-angle field      q(c) = R(c) · e^{i 2θ(c)}            (u = R cos2θ, v = R sin2θ)
 
-  collinear facilitation  F(c) = relu( Σ_𝒩 w·R'·cos2(θ'−θ) / Σ_𝒩 w )
+  collinear facilitation  F(c) = relu( Σ_𝒩 w·R'·a_κ(θ'−θ) / Σ_𝒩 w )
+                          a_κ(Δ) = exp(κ_θ·(cos Δ − 1)),  Δ wrapped to (−π/2,π/2]
                           w(δ) = G(|δ|) · pos(δ;θ_c),  pos = (δ·t̂_c)²/|δ|²
                           (t̂_c = (cosθ, sinθ) tangent — renderer convention, so the
                            facilitation axis coincides with the splat's σ∥ axis)
@@ -22,8 +23,8 @@ From L1 moments (R = |Z₂|/Σ|z₂|, θ = ½ arg Z₂, ρ_total):
 
   divisive readout        ρ(c) = e² / (e² + η² + (λ·S)²) · ok(c)
 
-Learned (softplus-positive): β (floor), κ (facilitation gain), λ (surround gain),
-η (semi-saturation), σ_f (facilitation length, cell units).
+Learned (softplus-positive): β (floor), κ (facilitation gain), κ_θ (orientation
+window width in F), λ (surround gain), η (semi-saturation), σ_f (facilitation length).
 θ passes through from L1 unchanged. ``branch`` is a vestigial all-zero index.
 """
 
@@ -50,7 +51,8 @@ except Exception:  # pragma: no cover - allow standalone import / testing
 
 # ── init defaults (read from params if present, else literal fallbacks) ──
 _BETA_INIT = float(getattr(SEED, "BETA_INIT", 0.30))     # coherence-alone floor (no collinear support)
-_KAPPA_INIT = float(getattr(SEED, "KAPPA_INIT", 3.0))    # collinear facilitation gain
+_KAPPA_INIT = float(getattr(SEED, "KAPPA_INIT", 3.0))    # facilitation gain in e = R·(β + κ·F)
+_KAPPA_THETA_INIT = float(getattr(SEED, "KAPPA_THETA_INIT", 2.5))  # von Mises width in F
 _LAMBDA_INIT = float(getattr(SEED, "LAMBDA_INIT", 1.5))  # divisive surround gain
 _ETA_INIT = float(getattr(SEED, "ETA_INIT", 0.30))       # semi-saturation (empty-surround knee)
 _SIGMA_F_INIT = float(getattr(SEED, "SIGMA_F_INIT", 1.3))  # facilitation length (cells)
@@ -142,42 +144,45 @@ def collinear_facilitation(
     theta: torch.Tensor,
     *,
     sigma_f: torch.Tensor,
+    kappa_theta: torch.Tensor,
     radius: int,
     eps: float,
 ) -> torch.Tensor:
-    """F(c) = relu( Σ_𝒩 w·R'·cos2(θ'−θ) / Σ_𝒩 w ),  w = G(|δ|)·pos(δ;θ_c).
+    """F(c) = relu( Σ_𝒩 w·R'·a_κ(θ'−θ) / Σ_𝒩 w ),  w = G(|δ|)·pos(δ;θ_c).
 
-    Co-oriented neighbours lying along the cell's tangent add constructively;
-    random-orientation neighbours cancel in the vector sum. Shapes (nH, nW).
+    a_κ(Δ) = exp(κ_θ·(cos Δ − 1)) on single-angle Δ (π-periodic, wrapped). The window
+    alone gates orientation agreement; mildly turned neighbours on a curve survive,
+    orthogonal noise is suppressed. Shapes (nH, nW).
     """
     nH, nW = R.shape
     dtype, dev = R.dtype, R.device
-    c2, s2 = torch.cos(2.0 * theta), torch.sin(2.0 * theta)
     ct, st = torch.cos(theta), torch.sin(theta)          # tangent t̂ = (cosθ, sinθ)
-    u, v = R * c2, R * s2                                 # q = R e^{i2θ}
+    kθ = kappa_theta
 
     sig2 = (2.0 * sigma_f * sigma_f).clamp_min(eps)
     pad = int(radius)
 
-    Vu = torch.zeros_like(R)
-    Vv = torch.zeros_like(R)
-    Wm = torch.zeros_like(R)
+    num = torch.zeros_like(R)
+    den = torch.zeros_like(R)
     for dy in range(-radius, radius + 1):
         for dx in range(-radius, radius + 1):
             if dy == 0 and dx == 0:
                 continue
             d2 = float(dy * dy + dx * dx)
-            # differentiable in σ_f:
             G = torch.exp(torch.tensor(-d2, dtype=dtype, device=dev) / sig2)
-            # squared projection of δ onto the per-cell tangent  → collinearity in [0,1]
             t_proj = float(dy) * ct + float(dx) * st
             pos = (t_proj * t_proj) / (d2 + eps)
-            w = G * pos                                  # (nH, nW)
-            Vu = Vu + w * _shift(u, dy, dx, pad)
-            Vv = Vv + w * _shift(v, dy, dx, pad)
-            Wm = Wm + w
-    fac_raw = (c2 * Vu + s2 * Vv) / (Wm + eps)           # ⟨R'·cos2(θ'−θ)⟩_w
-    return torch.relu(fac_raw)
+            w = G * pos
+            th_sh = _shift(theta, dy, dx, pad)
+            R_sh = _shift(R, dy, dx, pad)
+            dtheta = 0.5 * torch.atan2(
+                torch.sin(2.0 * (th_sh - theta)),
+                torch.cos(2.0 * (th_sh - theta)),
+            )
+            a_k = torch.exp(kθ * (torch.cos(dtheta) - 1.0))
+            num = num + w * R_sh * a_k
+            den = den + w
+    return torch.relu(num / (den + eps))
 
 
 def cocircular_facilitation(
@@ -281,6 +286,7 @@ class ContourSeed(nn.Module):
         eps: float = SEED.EPS,
         beta_init: float = _BETA_INIT,
         kappa_init: float = _KAPPA_INIT,
+        kappa_theta_init: float = _KAPPA_THETA_INIT,
         lambda_init: float = _LAMBDA_INIT,
         eta_init: float = _ETA_INIT,
         sigma_f_init: float = _SIGMA_F_INIT,
@@ -301,6 +307,7 @@ class ContourSeed(nn.Module):
         self.surround_mode = str(surround_mode)  # "broadside" (oriented) | "isotropic"
         self._beta_raw = nn.Parameter(torch.tensor(_inv_softplus(beta_init)))
         self._kappa_raw = nn.Parameter(torch.tensor(_inv_softplus(kappa_init)))
+        self._kappa_theta_raw = nn.Parameter(torch.tensor(_inv_softplus(kappa_theta_init)))
         self._lambda_raw = nn.Parameter(torch.tensor(_inv_softplus(lambda_init)))
         self._eta_raw = nn.Parameter(torch.tensor(_inv_softplus(eta_init)))
         self._sigma_f_raw = nn.Parameter(torch.tensor(_inv_softplus(sigma_f_init)))
@@ -312,6 +319,10 @@ class ContourSeed(nn.Module):
     @property
     def kappa(self) -> torch.Tensor:
         return Fn.softplus(self._kappa_raw).view(())
+
+    @property
+    def kappa_theta(self) -> torch.Tensor:
+        return Fn.softplus(self._kappa_theta_raw).view(())
 
     @property
     def lam(self) -> torch.Tensor:
@@ -347,7 +358,11 @@ class ContourSeed(nn.Module):
 
         if self.facil_mode == "collinear":
             F = collinear_facilitation(
-                Rb, theta, sigma_f=self.sigma_f, radius=self.facil_radius, eps=eps,
+                Rb, theta,
+                sigma_f=self.sigma_f,
+                kappa_theta=self.kappa_theta,
+                radius=self.facil_radius,
+                eps=eps,
             )
         else:
             F = cocircular_facilitation(
