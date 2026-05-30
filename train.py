@@ -139,7 +139,7 @@ def build_cells_flat_torch(cells: dict) -> dict:
         "S": int(cells["S"]),
         "P": int(cells["P"]),
         "theta": cells["theta"].reshape(N, 1),
-        "coherence_R": cells["coherence_R"].reshape(N),
+        "rho_peak": cells["rho_peak"].reshape(N),
         "rho_total": rho_t,
         "z0": rho_t,
         "cx_z2": cells["cx_z2"].reshape(N),
@@ -195,8 +195,8 @@ def build_cells_flat(cells: dict) -> dict:
         "S": int(cells["S"]),
         "P": int(cells["P"]),
         "theta": torch.from_numpy(cells["theta"].reshape(N, 1).astype(np.float32)),
-        "coherence_R": torch.from_numpy(
-            cells["coherence_R"].reshape(N).astype(np.float32)
+        "rho_peak": torch.from_numpy(
+            cells["rho_peak"].reshape(N).astype(np.float32)
         ),
         "rho_total": torch.from_numpy(rho_t.astype(np.float32)),
         "z0": torch.from_numpy(rho_t.astype(np.float32)),
@@ -723,7 +723,7 @@ def format_l0_param_lines(model: StriateE2E, *, indent: str = "  ") -> list[str]
 def format_l1_param_lines(model: StriateE2E, *, indent: str = "  ") -> list[str]:
     _ = model
     return [
-        f"{indent}z₂ moment pooling (R, ρ_total, θ) — no learned L1 params",
+        f"{indent}z₂ moment pooling (ρ_peak, ρ_total, θ) — no learned L1 params",
     ]
 
 
@@ -733,7 +733,7 @@ def format_seed_param_lines(seed, *, indent: str = "  ") -> list[str]:
         f"κ_θ={seed.kappa_theta.item():.4g}  λ={seed.lam.item():.4g}  "
         f"η={seed.eta.item():.4g}  σ_f={seed.sigma_f.item():.4g} "
         f"(learned)  [{seed.surround_mode} surround]",
-        f"{indent}e=R·(β+κ·F);  ρ=e²/(e²+η²+(λ·⟨e⟩_𝒩)²);  "
+        f"{indent}e=ρ_peak·(β+κ·F);  ρ=e²/(e²+η²+(λ·⟨e⟩_𝒩)²);  "
         f"F=von Mises collinear (a_κ=exp(κ_θ(cos Δ−1)))",
     ]
 
@@ -851,7 +851,7 @@ def main():
         f"  max_train={mt}"
     )
     print(
-        f"Seed: e=R·(β+κ·F);  ρ=e²/(e²+η²+(λ·⟨e⟩_𝒩)²)·ok;  "
+        f"Seed: e=ρ_peak·(β+κ·F);  ρ=e²/(e²+η²+(λ·⟨e⟩_𝒩)²)·ok;  "
         f"F=von Mises collinear (κ_θ window), broadside surround "
         f"(β,κ,κ_θ,λ,η,σ_f learned)"
     )

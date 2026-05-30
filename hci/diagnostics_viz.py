@@ -525,7 +525,6 @@ def viz_infer_l0_pinwheel(
 
 
 def viz_infer_l1_rho_masses(
-    coherence_R: np.ndarray,
     rho_total: np.ndarray,
     rho_peak: np.ndarray,
     is_border: np.ndarray,
@@ -534,13 +533,12 @@ def viz_infer_l1_rho_masses(
 
     viz_l1_rho_masses(
         [
-            (coherence_R, r"$R = |Z_2^{w}| / \sum h_{2m}|z_2|$"),
             (rho_total, r"$\rho_{\mathrm{total}} = \sum|z_2|$"),
             (rho_peak, r"$\rho_{\mathrm{peak}} = \max|z_2|$"),
         ],
         is_border,
         out_path,
-        suptitle=r"L1 z₂ moments ($R$, $\rho_{\mathrm{total}}$, $\rho_{\mathrm{peak}}$ per cell)",
+        suptitle=r"L1 z₂ moments ($\rho_{\mathrm{total}}$, $\rho_{\mathrm{peak}}$ per cell)",
     )
 
 

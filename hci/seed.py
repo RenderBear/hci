@@ -1,22 +1,18 @@
-r"""Cell-grid contour seed — association-field pooling of coherence.
+r"""Cell-grid contour seed — association-field pooling of ρ_peak drive.
 
-Coherence R is the base signal. Collinear support GATES it (rather than topping it
+Peak |z₂| per cell is the base signal. Collinear support GATES it (rather than topping it
 up), and an isotropic surround over the resulting drive normalises it DIVISIVELY —
 so suppression is relative to the local neighbourhood, never a flat DC offset.
 
-From L1 moments (R = |Z₂|/Σ|z₂|, θ = ½ arg Z₂, ρ_total):
+From L1 moments (ρ_peak = max|z₂|, θ = ½ arg Z₂ʷ, ρ_total):
 
-  double-angle field      q(c) = R(c) · e^{i 2θ(c)}            (u = R cos2θ, v = R sin2θ)
-
-  collinear facilitation  F(c) = relu( Σ_𝒩 w·R'·a_κ(θ'−θ) / Σ_𝒩 w )
+  collinear facilitation  F(c) = relu( Σ_𝒩 w·ρ_peak'·a_κ(θ'−θ) / Σ_𝒩 w )
                           a_κ(Δ) = exp(κ_θ·(cos Δ − 1)),  Δ wrapped to (−π/2,π/2]
                           w(δ) = G(|δ|) · pos(δ;θ_c),  pos = (δ·t̂_c)²/|δ|²
-                          (t̂_c = (cosθ, sinθ) tangent — renderer convention, so the
-                           facilitation axis coincides with the splat's σ∥ axis)
 
-  gated excitation        e(c) = R(c) · (β + κ·F(c))
-                          (β = coherence-alone floor; no collinear support ⇒ ~β·R,
-                           which removes the R≈⟨R⟩ noise pedestal at the source)
+  gated excitation        e(c) = ρ_peak(c) · (β + κ·F(c))
+                          (β = drive-alone floor; no collinear support ⇒ ~β·ρ_peak,
+                           which removes the ρ_peak≈⟨ρ_peak⟩ noise pedestal at the source)
 
   selective surround      S(c) = ⟨e⟩_𝒩   (center-excluded Gaussian over the drive;
                            spatially varying because e is structured)
@@ -276,7 +272,7 @@ def broadside_surround(
 class ContourSeed(nn.Module):
     """Divisive association-field gate.
 
-      e   = R · (β + κ·F)                     facilitation-GATED coherence (β = floor)
+      e   = ρ_peak · (β + κ·F)                  peak-|z₂| drive, facilitation-gated
       S   = ⟨e⟩_𝒩                             selective surround over structured drive
       ρ   = e² / (e² + η² + (λ·S)²) · ok      divisive normalisation (relative, not DC)
     """
@@ -348,13 +344,13 @@ class ContourSeed(nn.Module):
         N = nH * nW
         eps = self.eps
 
-        R = cells_flat["coherence_R"].to(device).reshape(nH, nW).float()
+        R = cells_flat["rho_peak"].to(device).reshape(nH, nW).float()
         theta = cells_flat["theta"].to(device).reshape(nH, nW).float()
         rho_t = cells_flat["rho_total"].to(device).reshape(nH, nW).float()
         is_border = cells_flat["is_border"].to(device).reshape(nH, nW).bool()
         ok = (~is_border).to(R.dtype)
 
-        Rb = R * ok  # don't let border coherence leak into the pooling
+        Rb = R * ok  # don't let border drive leak into the pooling
 
         if self.facil_mode == "collinear":
             F = collinear_facilitation(
@@ -369,9 +365,8 @@ class ContourSeed(nn.Module):
                 Rb, theta, sigma_f=self.sigma_f, radius=self.facil_radius, eps=eps,
             )
 
-        # Excitation: coherence GATED (not topped up) by collinear support.
-        # A high-R cell with no collinear neighbours (a noise fluctuation) yields
-        # only β·R, so the R≈⟨R⟩ noise pedestal is removed at the source.
+        # Excitation: ρ_peak GATED (not topped up) by collinear support.
+        # A high-ρ_peak cell with no collinear neighbours yields only β·ρ_peak.
         e = Rb * (self.beta + self.kappa * F)
 
         # Selective surround: pool the *structured* excitation, applied DIVISIVELY.
