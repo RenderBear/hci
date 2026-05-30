@@ -180,6 +180,54 @@ def collinear_facilitation(
     return torch.relu(fac_raw)
 
 
+def cocircular_facilitation(
+    R: torch.Tensor,
+    theta: torch.Tensor,
+    *,
+    sigma_f: torch.Tensor,
+    radius: int,
+    eps: float,
+) -> torch.Tensor:
+    """Co-circular (association-field) facilitation — a SELECTIVITY variant.
+
+      F(c) = relu( Σ_𝒩 w·R'·cos2(θ'+θ−2β_δ) / Σ_𝒩 w ),  w = G(|δ|)·cos²(β_δ−θ_c)
+
+    The agreement term cos2(θ'+θ−2β_δ) is the co-circular residual (θ'_pred = 2β_δ−θ_c):
+    it is +1 for a neighbour that smoothly continues an arc, ≈0 for random orientation,
+    and NEGATIVE for a co-oriented neighbour sitting off the tangent (a parallel
+    flanker). It therefore reduces to collinear cos2(θ'−θ_c) on a 1-px tangent neighbour
+    but refuses to bridge parallel lines or blob across a tight bend.
+
+    NOTE (measured): this does NOT brighten curves — it is *more* selective, so on a
+    tight 1-px curve a radius>1 window straddles the bend and the off-continuation ring
+    cells subtract, LOWERING on-curve facilitation vs ``collinear``. Use it when the
+    problem is parallel-line bridging / over-blobbing, not dim curves. To strengthen
+    curves, prefer ``collinear`` with a smaller ``facil_radius`` (1) and ``σ_f``≈0.7–0.9.
+    """
+    nH, nW = R.shape
+    dtype, dev = R.dtype, R.device
+    sig2 = (2.0 * sigma_f * sigma_f).clamp_min(eps)
+    pad = int(radius)
+
+    num = torch.zeros_like(R)
+    den = torch.zeros_like(R)
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            if dy == 0 and dx == 0:
+                continue
+            d2 = float(dy * dy + dx * dx)
+            G = torch.exp(torch.tensor(-d2, dtype=dtype, device=dev) / sig2)
+            beta = math.atan2(float(dx), float(dy))      # bearing, same frame as t̂
+            cos_bm = torch.cos(beta - theta)             # (nH, nW)
+            w = G * cos_bm * cos_bm                       # G·cos²(β_δ−θ_c) = G·pos
+            th_sh = _shift(theta, dy, dx, pad)
+            R_sh = _shift(R, dy, dx, pad)
+            agree = torch.cos(2.0 * (th_sh + theta - 2.0 * beta))  # co-circular residual
+            num = num + w * R_sh * agree
+            den = den + w
+    return torch.relu(num / (den + eps))
+
+
 def broadside_surround(
     e: torch.Tensor,
     theta: torch.Tensor,
@@ -237,6 +285,7 @@ class ContourSeed(nn.Module):
         eta_init: float = _ETA_INIT,
         sigma_f_init: float = _SIGMA_F_INIT,
         facil_radius: int = _FACIL_RADIUS,
+        facil_mode: str = str(getattr(SEED, "FACIL_MODE", "collinear")),
         surround_radius: int = SEED.SURROUND_RADIUS,
         surround_sigma: float = SEED.SURROUND_SIGMA,
         surround_mode: str = str(getattr(SEED, "SURROUND_MODE", "broadside")),
@@ -246,6 +295,7 @@ class ContourSeed(nn.Module):
         _ = kw
         self.eps = float(eps)
         self.facil_radius = int(facil_radius)
+        self.facil_mode = str(facil_mode)  # "cocircular" (curvature-tolerant) | "collinear"
         self.surround_radius = int(surround_radius)
         self.surround_sigma = float(surround_sigma)
         self.surround_mode = str(surround_mode)  # "broadside" (oriented) | "isotropic"
@@ -295,9 +345,14 @@ class ContourSeed(nn.Module):
 
         Rb = R * ok  # don't let border coherence leak into the pooling
 
-        F = collinear_facilitation(
-            Rb, theta, sigma_f=self.sigma_f, radius=self.facil_radius, eps=eps,
-        )
+        if self.facil_mode == "collinear":
+            F = collinear_facilitation(
+                Rb, theta, sigma_f=self.sigma_f, radius=self.facil_radius, eps=eps,
+            )
+        else:
+            F = cocircular_facilitation(
+                Rb, theta, sigma_f=self.sigma_f, radius=self.facil_radius, eps=eps,
+            )
 
         # Excitation: coherence GATED (not topped up) by collinear support.
         # A high-R cell with no collinear neighbours (a noise fluctuation) yields

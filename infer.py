@@ -46,7 +46,26 @@ from train import (
     format_renderer_param_lines,
     report_checkpoint_compatibility,
     upgrade_model_state_dict,
+    load_png_gt,
+    load_bsds_gt,
+    _find_gt_path_png,
 )
+
+
+def _load_infer_gt(gt_path: str, gt_format: str, H0: int, W0: int) -> np.ndarray:
+    if gt_format == "mat":
+        gt = load_bsds_gt(gt_path)
+    else:
+        gt = load_png_gt(gt_path)
+    return np.asarray(gt[:H0, :W0], dtype=np.float64)
+
+
+def _resolve_gt_path(gt_dir: str, stem: str, gt_format: str | None) -> tuple[str | None, str]:
+    if gt_format == "mat":
+        p = os.path.join(gt_dir, stem + ".mat")
+        return (p if os.path.isfile(p) else None), "mat"
+    p = _find_gt_path_png(gt_dir, stem)
+    return p, "png"
 
 
 def build_model(ckpt, device):
@@ -319,7 +338,18 @@ def main():
         "--diagnostics",
         action="store_true",
         help="Save additional diagnostics: base, l0_pinwheel, l1_moments, "
-        "cell_rho, cell_coherence, render_softmap, render_theta_bins, overlay.",
+        "cell_rho, cell_coherence, cell_joint, render_softmap, render_theta_bins, overlay.",
+    )
+    ap.add_argument(
+        "--gt_dir",
+        default=None,
+        help="Optional GT directory (same stem as --image) for cell_joint η± coloring.",
+    )
+    ap.add_argument(
+        "--gt_format",
+        default=None,
+        choices=("png", "mat"),
+        help="GT file format when --gt_dir is set (default: png, or .mat if present).",
     )
     ap.add_argument("--device", default=None)
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -395,6 +425,16 @@ def main():
             p_coh,
         )
         saved_files.append(p_coh)
+
+        gt_arr: np.ndarray | None = None
+        if args.gt_dir:
+            gt_fmt = args.gt_format
+            gt_path, fmt = _resolve_gt_path(args.gt_dir, stem, gt_fmt)
+            if gt_path is None:
+                print(f"  warning: no GT for stem '{stem}' under {args.gt_dir}")
+            else:
+                use_fmt = gt_fmt or fmt
+                gt_arr = _load_infer_gt(gt_path, use_fmt, prep["H0"], prep["W0"])
 
     threshold = float(args.threshold)
 
