@@ -545,7 +545,7 @@ def viz_infer_l1_rho_masses(
         is_border,
         out_path,
         suptitle=r"L1 z₂ moments (R and $\rho_{\mathrm{total}}$ per cell)",
-        label_a=r"$R = |Z_2| / \sum|z_2|$",
+        label_a=r"$R = |Z_2^{w}| / \sum h_{2m}|z_2|$",
         label_b=r"$\rho_{\mathrm{total}} = \sum|z_2|$",
     )
 
@@ -734,8 +734,8 @@ def viz_infer_cell_coherence(
 
     fig.suptitle(
         r"Patch orientation coherence "
-        r"$R = |Z_2| / (\sum_p |z_2(p)| + \varepsilon)$, "
-        r"$Z_2 = \sum_p z_2(p)$"
+        r"$R = |Z_2^{w}| / (\sum_p h_{2m}(p)|z_2(p)| + \varepsilon)$, "
+        r"$Z_2^{w} = \sum_p h_{2m}(p)\,z_2(p)$"
         + delta_note,
         fontsize=10,
         color=VIZ.FG,

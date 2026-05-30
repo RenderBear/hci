@@ -1,8 +1,9 @@
 r"""L1 — per-cell z₂ moments → cell grid (GPU-native).
 
 From L0 pixel field z₂ = s₂ + i s₃, sum-pool over P×P patches:
-  Z₂(c) = Σ z₂(p),  ρ_total(c) = Σ |z₂(p)|,
-  R(c) = |Z₂|/(ρ_total + ε),  θ(c) = ½ arg Z₂(c).
+  ρ_total(c) = Σ |z₂(p)|  (unweighted; seed presence / surround),
+  Z₂ʷ(c) = Σ h₂m(p) z₂(p),  ρ_totalʷ(c) = Σ h₂m(p) |z₂(p)|,
+  R(c) = |Z₂ʷ|/(ρ_totalʷ + ε),  θ(c) = ½ arg Z₂ʷ(c).
 Splat anchors: h₂m-weighted centroid within patch (cx_z2, cy_z2).
 """
 
@@ -104,15 +105,21 @@ def compute_cell_moments(
     is_border_flat = bm_patches.mean(dim=-1) > border_patch_max_frac
 
     z2_patches = _extract_patches_torch(z2, nH, nW, P, S)
-    Z2_sum = z2_patches.sum(dim=-1)
-    z2_abs_sum = z2_patches.abs().sum(dim=-1).to(torch.float32)
-    del z2_patches
+    h2m_patches = _extract_patches_torch(h2m, nH, nW, P, S)
 
+    # Unweighted presence energy — seed surround / E_rel (unchanged).
+    z2_abs_sum = z2_patches.abs().sum(dim=-1).to(torch.float32)
     rho_total_flat = z2_abs_sum.reshape(-1)
+
+    # h₂m-weighted orientation support — R and θ only.
+    Z2_w = (h2m_patches * z2_patches).sum(dim=-1)
+    rho_tot_w = (h2m_patches * z2_patches.abs()).sum(dim=-1).to(torch.float32)
+    del z2_patches, h2m_patches
+
     coherence_R_flat = (
-        Z2_sum.abs().to(torch.float32) / (z2_abs_sum + eps)
+        Z2_w.abs().to(torch.float32) / (rho_tot_w + eps)
     ).clamp(0.0, 1.0).reshape(-1)
-    theta_flat = (0.5 * torch.angle(Z2_sum)).to(torch.float32).reshape(-1)
+    theta_flat = (0.5 * torch.angle(Z2_w)).to(torch.float32).reshape(-1)
 
     theta_flat = torch.where(is_border_flat, torch.zeros_like(theta_flat), theta_flat)
     coherence_R_flat = torch.where(
@@ -146,7 +153,7 @@ def compute_cell_moments(
         n_border = int(is_border_flat.sum().item())
         print(f"  active={n - n_border}  border={n_border}")
         print(f"  rho_total: mean={rt.mean():.2f} max={rt.max():.2f}")
-        print(f"  R (|Z2|/sum|z2|): mean={float(coherence_R_flat.mean()):.3f}")
+        print(f"  R (h₂m-weighted |Z₂|/Σh₂m|z₂|): mean={float(coherence_R_flat.mean()):.3f}")
 
     if return_torch:
         return {
