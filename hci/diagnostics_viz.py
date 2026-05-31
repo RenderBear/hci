@@ -534,7 +534,7 @@ def viz_infer_l1_rho_masses(
     viz_l1_rho_masses(
         [
             (rho_total, r"$\rho_{\mathrm{total}} = \sum|z_2|$"),
-            (rho_peak, r"$\rho_{\mathrm{peak}} = \max|z_2|$"),
+            (rho_peak, r"$\rho_{\mathrm{peak}} = \left|\sum w\, z_2\right|$"),
         ],
         is_border,
         out_path,

@@ -13,8 +13,8 @@ L0 = SimpleNamespace(
         (1, -1), (1, 0), (1, 1),
     ],
     # Sole L0 sensitivity knobs: fixed scalars in this file only (never nn.Parameter / never trained).
-    ETA_LUM=0.05,
-    ETA_CHR=0.05,
+    ETA_LUM=0.01,
+    ETA_CHR=0.01,
     ETA0=0.05,  # legacy alias for scripts still printing “η₀”
     GAMMA=1.0,
     # ε inside chroma/harmonic norms — avoids ∂√0 = ∞ when backpropping through L0.
@@ -29,6 +29,7 @@ L1 = SimpleNamespace(
     PATCH_OVERLAP=3,
     BORDER_PATCH_MAX_FRAC=0.2,
     EPS=1e-15,
+    TOP_POWER=2.0,  # fixed q in top-emphasising soft mask on min-subtracted |z₂|
 )
 
 # ── Seed: NR peak + collinear readback + divisive readout ───────────────────

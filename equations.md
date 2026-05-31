@@ -81,9 +81,20 @@ Patch size $P$ (`L1.PATCH_SIZE`), stride $S = P - \texttt{patch\_overlap}$ (`L1.
 From the L0 pixel field $z_2(p) = s_2(p) + i\,s_3(p)$:
 
 $$
-\rho_{\mathrm{total}}(c) = \sum_{p \in \mathrm{patch}(c)} |z_2(p)|, \qquad
-\rho_{\mathrm{peak}}(c) = \max_{p \in \mathrm{patch}(c)} |z_2(p)|.
+\rho_{\mathrm{total}}(c) = \sum_{p \in \mathrm{patch}(c)} |z_2(p)|.
 $$
+
+**Coherent peak** (min-subtracted top-weighted complex pool on $z_2$; fixed $q = 2$):
+
+$$
+\tilde m(p) = \max\!\bigl(0,\;|z_2(p)| - \min_{q \in \mathrm{patch}} |z_2(q)|\bigr), \qquad
+w(p) = \frac{\tilde m(p)^q}{\sum_{r \in \mathrm{patch}} \tilde m(r)^q + \varepsilon},
+$$
+$$
+\rho_{\mathrm{peak}}(c) = \Bigl|\sum_{p \in \mathrm{patch}(c)} w(p)\, z_2(p)\Bigr|.
+$$
+
+With $u(p) = w(p)|z_2(p)|$, $U(c) = \sum_p u(p)$: $\rho_{\mathrm{peak}} = U \cdot R$ where $R(c) = \rho_{\mathrm{peak}}/U \in [0,1]$ is stored as **`rho_coherence`**.
 
 **Orientation** uses the $h_{2m}$-weighted complex moment:
 
@@ -103,7 +114,8 @@ $$
 
 | Key | Value |
 |-----|--------|
-| `rho_peak` | $\rho_{\mathrm{peak}}(c)$ — **seed drive** |
+| `rho_peak` | $\rho_{\mathrm{peak}}(c)$ — **seed drive** (coherent $|Z_2^w|$ on $z_2$) |
+| `rho_coherence` | $R(c) \in [0,1]$ — orientation agreement among top-$|z_2|$ pixels |
 | `rho_total`, `z0` | $\rho_{\mathrm{total}}(c)$ — surround / $E_{\mathrm{rel}}$ diagnostics |
 | `theta` | $\theta(c)$ |
 | `cx_z2`, `cy_z2` | $h_{2m}$-weighted splat anchors |

@@ -2,7 +2,7 @@ r"""L1 — per-cell z₂ moments → cell grid (GPU-native).
 
 From L0 pixel field z₂ = s₂ + i s₃, sum-pool over P×P patches:
   ρ_total(c) = Σ |z₂(p)|  (unweighted; seed surround / E_rel),
-  ρ_peak(c) = max_{p∈patch} |z₂(p)|  (seed drive),
+  ρ_peak(c) = |Σ w(p) z₂(p)|  (min-subtracted top-weighted coherent pool; q=2),
   Z₂ʷ(c) = Σ h₂m(p) z₂(p),  θ(c) = ½ arg Z₂ʷ(c).
 Splat anchors: h₂m-weighted centroid within patch (cx_z2, cy_z2).
 """
@@ -73,6 +73,27 @@ def _sum_pool2d(field: torch.Tensor, P: int, S: int) -> torch.Tensor:
     return F.avg_pool2d(x, kernel_size=P, stride=S).squeeze(0).squeeze(0) * (P * P)
 
 
+def _coherent_rho_peak(
+    z2_patches: torch.Tensor,
+    eps: float,
+    top_power: float = L1.TOP_POWER,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Min-subtracted top-weighted complex pool: |Σ w(p) z₂(p)| and coherence R."""
+    z2_abs = z2_patches.abs()
+    m_tilde = (z2_abs - z2_abs.min(dim=-1, keepdim=True).values).clamp_min(0.0)
+    m_pow = m_tilde.pow(top_power)
+    w = m_pow / (m_pow.sum(dim=-1, keepdim=True) + eps)
+    z2_peak = (w * z2_patches).sum(dim=-1)
+    rho_peak = z2_peak.abs().to(torch.float32)
+    u_mass = (w * z2_abs).sum(dim=-1).to(torch.float32)
+    rho_coherence = torch.where(
+        u_mass > eps,
+        (rho_peak / u_mass.clamp_min(eps)).clamp(0.0, 1.0),
+        torch.zeros_like(rho_peak),
+    )
+    return rho_peak, rho_coherence
+
+
 def compute_cell_moments(
     h2m: torch.Tensor,
     z2: torch.Tensor,
@@ -111,9 +132,13 @@ def compute_cell_moments(
     z2_abs_sum = z2_patches.abs().sum(dim=-1).to(torch.float32)
     rho_total_flat = z2_abs_sum.reshape(-1)
 
-    # h₂m-weighted moment for θ; ρ_peak and ρ_total from patch.
+    # h₂m-weighted moment for θ.
     Z2_w = (h2m_patches * z2_patches).sum(dim=-1)
-    rho_peak_flat = z2_patches.abs().max(dim=-1).values.to(torch.float32).reshape(-1)
+
+    # Coherent peak: |Σ w(p) z₂(p)| with q = L1.TOP_POWER (default 2).
+    rho_peak_cell, rho_coherence_cell = _coherent_rho_peak(z2_patches, eps)
+    rho_peak_flat = rho_peak_cell.reshape(-1)
+    rho_coherence_flat = rho_coherence_cell.reshape(-1)
     del z2_patches, h2m_patches
 
     theta_flat = (
@@ -126,6 +151,9 @@ def compute_cell_moments(
     )
     rho_peak_flat = torch.where(
         is_border_flat, torch.zeros_like(rho_peak_flat), rho_peak_flat,
+    )
+    rho_coherence_flat = torch.where(
+        is_border_flat, torch.zeros_like(rho_coherence_flat), rho_coherence_flat,
     )
     ib_grid = is_border_flat.reshape(nH, nW)
 
@@ -154,6 +182,8 @@ def compute_cell_moments(
         print(f"  rho_total: mean={rt.mean():.2f} max={rt.max():.2f}")
         rp = rho_peak_flat.detach().cpu().numpy()
         print(f"  rho_peak: mean={rp.mean():.2f} max={rp.max():.2f}")
+        rc = rho_coherence_flat.detach().cpu().numpy()
+        print(f"  rho_coherence R: mean={rc.mean():.3f} max={rc.max():.3f}")
 
     if return_torch:
         return {
@@ -164,6 +194,7 @@ def compute_cell_moments(
             "theta": theta_flat.reshape(nH, nW),
             "rho_total": rho_total_flat.reshape(nH, nW),
             "rho_peak": rho_peak_flat.reshape(nH, nW),
+            "rho_coherence": rho_coherence_flat.reshape(nH, nW),
             "z0": rho_total_flat.reshape(nH, nW),
             "cx": cx_grid,
             "cy": cy_grid,
@@ -184,6 +215,7 @@ def compute_cell_moments(
         "theta": _to_np(theta_flat.reshape(nH, nW)),
         "rho_total": _to_np(rho_hw),
         "rho_peak": _to_np(rho_peak_flat.reshape(nH, nW)),
+        "rho_coherence": _to_np(rho_coherence_flat.reshape(nH, nW)),
         "z0": _to_np(rho_hw),
         "cx": _to_np(cx_grid),
         "cy": _to_np(cy_grid),
