@@ -625,8 +625,9 @@ def viz_infer_cell_rho(
 
     fig.suptitle(
         r"Cell $\rho$ — map and interior distribution "
-        r"($\rho_{\mathrm{seed}}=\tilde\rho^2/(\tilde\rho^2+\eta_z^2)$; "
-        r"scalar $\rho=\max_k \rho_{\mathrm{seed}}^{(k)}$)",
+        r"($\rho_{\mathrm{seed}}=\rho_{\mathrm{peak}}^2/(\rho_{\mathrm{peak}}^2+\eta_{\mathrm{seed}}^2)$; "
+        r"$e=\beta_{\mathrm{seed}}\rho_{\mathrm{seed}}+\beta_{\mathrm{coll}}\rho_{\mathrm{coll}}$; "
+        r"$\rho=e^2/(e^2+\eta^2+\lambda S^2)$)",
         fontsize=10,
         color=VIZ.FG,
         fontfamily="monospace",

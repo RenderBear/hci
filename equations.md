@@ -8,7 +8,7 @@ This file records the **notation and equations implemented in this repository**:
 
 1. **L0** — RGB directional differences → per-direction min subtraction → independent Naka–Rushton per channel with **fixed** $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ (`L0.ETA_LUM`, `L0.ETA_CHR`) and gain $\gamma$ (`L0.GAMMA`). Produces harmonic stack $s$, magnitudes $h_{1m}, h_{2m}$, split $h_{2m}^{\mathrm{lum}}, h_{2m}^{\mathrm{chr}}$, and complex fields $z_1, z_2$ (`z_from_l0_harmonics`). With **`L0.LEARNED_METRIC`** (default), a **learned** $3\times3$ matrix $W$ (`L0LearnedMetric`) replaces the fixed lum/chr split for distance; L0 is recomputed **live each training step** from cached RGB. Without it, L0 uses the fixed orthonormal lum/chr split and may be precomputed into the disk cache.
 2. **L1** — From L0 pixel field $z_2$, pool over $P\times P$ patches → per-cell $\rho_{\mathrm{total}}$, $\rho_{\mathrm{peak}}$, orientation $\theta$, and $h_{2m}$-weighted splat anchors. **Runs live** each training step (`run_moments_cells_flat` in `prepare_batch`).
-3. **Seed** (`AndGateSeed` / `ContourSeed`) — association-field gate on $(\rho_{\mathrm{peak}}, \theta)$ with **learned** $\beta, \kappa, \kappa_\theta, \lambda, \eta, \sigma_f$. Scalar export $\rho(c)$ via divisive Naka–Rushton; $\theta(c)$ passes through from L1 unchanged.
+3. **Seed** (`AndGateSeed` / `ContourSeed`) — NR-normalise $\rho_{\mathrm{peak}}$ → $\rho_{\mathrm{seed}}$; collinear readback $\rho_{\mathrm{coll}}$; excitation $e = \beta_{\mathrm{seed}}\rho_{\mathrm{seed}} + \beta_{\mathrm{coll}}\rho_{\mathrm{coll}}$; divisive export $\rho = e^2/(e^2 + \eta^2 + \lambda S^2)$ with **learned** $\beta_{\mathrm{seed}}, \beta_{\mathrm{coll}}, \kappa_\theta, \eta_{\mathrm{seed}}, \eta, \lambda, \sigma_f$.
 4. **Renderer** (`ModulationRenderer`) — Cell-grid $\theta$ combing and $\rho$-gated anchor smoothing; **Gaussian-line splat** of $\rho$ to pixels; **splat-footprint coherence** map $\mathrm{coh}(p)$; tangential / normal **9-tap stencils on $\bar\rho$**; **20→12→1** thinning MLP gate:
    $$\hat B(p) = \bar\rho(p)\,\mathrm{gate}(p).$$
 
@@ -112,15 +112,21 @@ Border cells → $0$ on $\rho_{\mathrm{total}}, \rho_{\mathrm{peak}}, \theta$.
 
 ---
 
-## 4. Seed — association-field gate (`ContourSeed` / `AndGateSeed`)
+## 4. Seed — NR peak + collinear readback (`ContourSeed` / `AndGateSeed`)
 
-Let $d(c) = \rho_{\mathrm{peak}}(c)\,\mathrm{ok}(c)$ denote the masked drive (code uses local name `Rb`).
+Let $R(c) = \rho_{\mathrm{peak}}(c)\,\mathrm{ok}(c)$ denote the masked peak drive.
 
-**Collinear facilitation** (default `SEED.FACIL_MODE = "collinear"`):
+**NR-normalised seed field**:
 
 $$
-F(c) = \mathrm{relu}\!\left(
-\frac{\sum_{\delta \in \mathcal{N}} w_\delta(c)\, d(c+\delta)\, a_\kappa(\Delta\theta_\delta)}
+\rho_{\mathrm{seed}}(c) = \frac{R(c)^2}{R(c)^2 + \eta_{\mathrm{seed}}^2 + \varepsilon}\,\mathrm{ok}(c).
+$$
+
+**Collinear readback** on $\rho_{\mathrm{seed}}$ (default `SEED.FACIL_MODE = "collinear"`):
+
+$$
+\rho_{\mathrm{coll}}(c) = \mathrm{relu}\!\left(
+\frac{\sum_{\delta \in \mathcal{N}} w_\delta(c)\, \rho_{\mathrm{seed}}(c+\delta)\, a_\kappa(\Delta\theta_\delta)}
 {\sum_{\delta \in \mathcal{N}} w_\delta(c) + \varepsilon}
 \right),
 $$
@@ -130,27 +136,27 @@ a_\kappa(\Delta) = \exp\!\bigl(\kappa_\theta(\cos\Delta - 1)\bigr),
 $$
 with $\hat t_c = (\cos\theta_c, \sin\theta_c)$ and $\Delta\theta$ the wrapped double-angle difference.
 
-**Gated excitation**:
+**Excitation**:
 
 $$
-e(c) = d(c)\,\bigl(\beta + \kappa\, F(c)\bigr).
+e(c) = \beta_{\mathrm{seed}}\,\rho_{\mathrm{seed}}(c) + \beta_{\mathrm{coll}}\,\rho_{\mathrm{coll}}(c).
 $$
 
-**Selective surround** — center-excluded Gaussian over $e$ (`broadside` mode weights toward the normal of $\theta$ so contours do not self-suppress):
+**Surround** — center-excluded pool of $\rho_{\mathrm{seed}}$ (`broadside` mode weights toward the normal of $\theta$):
 
 $$
-S(c) = \langle e \rangle_{\mathcal{N}}(c).
+S(c) = \langle\rho_{\mathrm{seed}}\rangle_{\mathcal{N}}(c).
 $$
 
-**Divisive readout**:
+**Divisive cell export** ($\lambda$ is **not** squared):
 
 $$
-\rho(c) = \frac{e(c)^2}{e(c)^2 + \eta^2 + (\lambda S(c))^2 + \varepsilon}\,\mathrm{ok}(c).
+\rho(c) = \frac{e(c)^2}{e(c)^2 + \eta^2 + \lambda\, S(c)^2 + \varepsilon}\,\mathrm{ok}(c).
 $$
 
-**Learned** (softplus-positive): $\beta$ (floor), $\kappa$ (facilitation gain), $\kappa_\theta$ (orientation window in $F$), $\lambda$ (surround gain), $\eta$ (semi-saturation), $\sigma_f$ (facilitation length). Inits from `params.SEED`.
+**Learned** (softplus-positive): $\beta_{\mathrm{seed}}$, $\beta_{\mathrm{coll}}$, $\kappa_\theta$, $\eta_{\mathrm{seed}}$, $\eta$, $\lambda$, $\sigma_f$. Inits from `params.SEED`.
 
-**Surround energy** (diagnostic only, from $\rho_{\mathrm{total}}$):
+**Relative energy** (diagnostic only, from $\rho_{\mathrm{total}}$):
 
 $$
 E_{\mathrm{rel}}(c) = \frac{\rho_{\mathrm{total}}(c)}{\varepsilon + \langle\rho_{\mathrm{total}}\rangle_{\mathcal{N}}(c)}.
@@ -245,11 +251,11 @@ Checkpoints store `{"model_state": state_dict}` (`intermediate.pt`, `final.pt`).
 | Block | Count | Notes |
 |------:|------:|------|
 | $W$ (`L0LearnedMetric`) | 9 | $3\times3$ RGB metric; omitted with `--no-l0-metric` |
-| $\beta, \kappa, \kappa_\theta, \lambda, \eta, \sigma_f$ | 6 | Seed association-field scalars |
+| $\beta_{\mathrm{seed}}, \beta_{\mathrm{coll}}, \kappa_\theta, \eta_{\mathrm{seed}}, \eta, \lambda, \sigma_f$ | 7 | Seed NR peak + readback + divisive readout |
 | $\tilde\sigma_\perp, \tilde\sigma_\parallel, s_t, s_n$ | 4 | Splat widths + stencil spacings |
 | $\mathrm{MLP}_{\mathrm{thin}}$ (20→12→1) | 265 | $20\cdot 12 + 12 + 12 + 1$ |
 | **Renderer subtotal** | **269** | |
-| **Total (`StriateE2E`, default)** | **284** | 9 L0 + 6 seed + 269 renderer |
+| **Total (`StriateE2E`, default)** | **285** | 9 L0 + 7 seed + 269 renderer |
 
 L0 $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ are **fixed** (`params.L0`). Legacy checkpoints may contain dropped keys; `upgrade_model_state_dict` / `upgrade_renderer_state_dict` + `load_state_dict(..., strict=False)` handle migration.
 
@@ -261,7 +267,7 @@ L0 $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ are **fixed** (`params.L0`). Legac
 |-------|----------------|
 | $d_k$, NR, harmonics, $z_1, z_2$, learned $W$, interior mask | `hci/L0.py` |
 | z₂ moment pooling, $\rho_{\mathrm{peak}}$, $\rho_{\mathrm{total}}$, $\theta$, $h_{2m}$ anchors | `hci/L1.py` |
-| Association-field seed, $\rho_{\mathrm{peak}}$ drive, scalar $\rho$ export | `hci/seed.py` |
+| Association-field seed, $\rho_{\mathrm{seed}}$, $\rho_{\mathrm{coll}}$, cell $\rho$ export | `hci/seed.py` |
 | Splat, footprint $\mathrm{coh}$, stencils, thinning head, NMS | `hci/renderer.py` |
 | Cache, batching, loss, checkpoints | `train.py` |
 | Single-image pipeline, diagnostics | `infer.py`, `hci/diagnostics_viz.py` |

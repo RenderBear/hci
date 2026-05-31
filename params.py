@@ -31,17 +31,18 @@ L1 = SimpleNamespace(
     EPS=1e-15,
 )
 
-# ── Seed: association-field gate (β, κ, λ, η, σ_f, κ_θ learned) ───────────
+# ── Seed: NR peak + collinear readback + divisive readout ───────────────────
 SEED = SimpleNamespace(
     EPS=1e-9,
     R0_INIT=0.45,
     A_INIT=12.0,
     B_INIT=5.0,
-    BETA_INIT=0.30,
-    KAPPA_INIT=3.0,           # facilitation gain in e = R·(β + κ·F)
-    KAPPA_THETA_INIT=2.5,     # von Mises orientation width in collinear F
-    LAMBDA_INIT=1.5,
-    ETA_INIT=0.30,
+    BETA_SEED_INIT=0.5,       # weight on ρ_seed in excitation
+    BETA_COLL_INIT=0.5,       # weight on ρ_coll in excitation
+    KAPPA_THETA_INIT=2.5,     # von Mises orientation width in ρ_coll pool
+    ETA_SEED_INIT=0.30,       # semi-saturation in ρ_peak²/(ρ_peak²+η_seed²)
+    ETA_INIT=0.30,            # semi-saturation in final e²/(e²+η²+λ·S²) readout
+    LAMBDA_INIT=0.5,          # surround gain: λ·S² in denominator (λ not squared)
     SIGMA_F_INIT=1.3,
     FACIL_RADIUS=2,
     FACIL_MODE="collinear",

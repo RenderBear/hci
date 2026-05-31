@@ -1,7 +1,7 @@
 r"""train.py — STRIATE training: z₂ moments + association-field seed + harmonic render.
 
 Pipeline per image: L0 contrast/harmonics (cached) → live z₂ moment pooling each step
-→ association-field seed (R + κ·facilitation − λ·surround, NR readout)
+→ seed (ρ_seed NR + β_seed·ρ_seed + β_coll·ρ_coll excitation)
 → splat renderer ($\hat B = \bar\rho \cdot \mathrm{gate}$).
 Loss combines soft-Dice and per-pixel BCE on the same η± valid band
 (target≥η_pos or target<η_neg), weighted by ``--lam_dice`` and ``--lam_bce``
@@ -572,13 +572,7 @@ def bce_loss_with_ignore(
 
 
 def upgrade_model_state_dict(state_dict: dict) -> dict:
-    """Map legacy keys; drop dynamics / K-bin / η_z / von Mises / AND-gate scalars.
-
-    The association-field seed (κ, κ_θ, λ, η, σ_f) carries none of the old AND-gate
-    parameters, so legacy ``seed._R0`` / ``seed._a_raw`` / ``seed._b_raw`` (and the
-    earlier ``seed._eta_z_raw``) are dropped here and the new scalars initialise
-    fresh from ``params.SEED`` via ``load_state_dict(..., strict=False)``.
-    """
+    """Map legacy keys; drop dynamics / K-bin / η_z / von Mises / AND-gate scalars."""
     drop = {
         "seed._eta_z_raw",
         "_l1_von_mises_kappa_raw",
@@ -586,18 +580,22 @@ def upgrade_model_state_dict(state_dict: dict) -> dict:
         "seed._a_raw",
         "seed._b_raw",
     }
+    rename = {
+        "seed._beta_raw": "seed._beta_seed_raw",
+        "seed._kappa_raw": "seed._beta_coll_raw",
+    }
     out: dict = {}
     for k, v in state_dict.items():
         if k.startswith("dynamics."):
             continue
         if k in drop:
             continue
-        out[k] = v
+        out[rename.get(k, k)] = v
     return out
 
 
 def debug_seed_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
-    """One training batch: seed stats + ∂loss/∂(β, κ, κ_θ, λ, η, σ_f)."""
+    """One training batch: seed stats + ∂loss/∂(β_seed, β_coll, κ_θ, η_seed, η, λ, σ_f)."""
     model.train()
     meta = meta_list[0]
     cf = meta["cells_flat_dev"]
@@ -636,16 +634,18 @@ def debug_seed_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
                 print(f"  {key}: {st[key]}")
     seed = model.seed
     print(
-        f"\n  β={seed.beta.item():.4g}  κ={seed.kappa.item():.4g}  "
-        f"κ_θ={seed.kappa_theta.item():.4g}  λ={seed.lam.item():.4g}  "
-        f"η={seed.eta.item():.4g}  σ_f={seed.sigma_f.item():.4g} (learned)"
+        f"\n  β_seed={seed.beta_seed.item():.4g}  β_coll={seed.beta_coll.item():.4g}  "
+        f"κ_θ={seed.kappa_theta.item():.4g}  η_seed={seed.eta_seed.item():.4g}  "
+        f"η={seed.eta.item():.4g}  λ={seed.lam.item():.4g}  "
+        f"σ_f={seed.sigma_f.item():.4g} (learned)"
     )
     for name, t in (
-        ("β", seed._beta_raw),
-        ("κ", seed._kappa_raw),
+        ("β_seed", seed._beta_seed_raw),
+        ("β_coll", seed._beta_coll_raw),
         ("κ_θ", seed._kappa_theta_raw),
-        ("λ", seed._lambda_raw),
+        ("η_seed", seed._eta_seed_raw),
         ("η", seed._eta_raw),
+        ("λ", seed._lambda_raw),
         ("σ_f", seed._sigma_f_raw),
     ):
         if t.grad is None:
@@ -729,12 +729,12 @@ def format_l1_param_lines(model: StriateE2E, *, indent: str = "  ") -> list[str]
 
 def format_seed_param_lines(seed, *, indent: str = "  ") -> list[str]:
     return [
-        f"{indent}β={seed.beta.item():.4g}  κ={seed.kappa.item():.4g}  "
-        f"κ_θ={seed.kappa_theta.item():.4g}  λ={seed.lam.item():.4g}  "
-        f"η={seed.eta.item():.4g}  σ_f={seed.sigma_f.item():.4g} "
-        f"(learned)  [{seed.surround_mode} surround]",
-        f"{indent}e=ρ_peak·(β+κ·F);  ρ=e²/(e²+η²+(λ·⟨e⟩_𝒩)²);  "
-        f"F=von Mises collinear (a_κ=exp(κ_θ(cos Δ−1)))",
+        f"{indent}β_seed={seed.beta_seed.item():.4g}  β_coll={seed.beta_coll.item():.4g}  "
+        f"κ_θ={seed.kappa_theta.item():.4g}  η_seed={seed.eta_seed.item():.4g}  "
+        f"η={seed.eta.item():.4g}  λ={seed.lam.item():.4g}  "
+        f"σ_f={seed.sigma_f.item():.4g} (learned)  [{seed.surround_mode} surround]",
+        f"{indent}ρ_seed=ρ_peak²/(ρ_peak²+η_seed²);  e=β_seed·ρ_seed+β_coll·ρ_coll;  "
+        f"ρ=e²/(e²+η²+λ·S²);  S=⟨ρ_seed⟩_𝒩",
     ]
 
 
@@ -834,7 +834,7 @@ def main():
     ap.add_argument(
         "--debug-seed",
         action="store_true",
-        help="Run one batch, print seed stats and β/κ/κ_θ/λ/η/σ_f gradients, then exit",
+        help="Run one batch, print seed stats and β_seed/β_coll/κ_θ/η_seed/η/λ/σ_f gradients, then exit",
     )
     args = ap.parse_args()
 
@@ -851,9 +851,9 @@ def main():
         f"  max_train={mt}"
     )
     print(
-        f"Seed: e=ρ_peak·(β+κ·F);  ρ=e²/(e²+η²+(λ·⟨e⟩_𝒩)²)·ok;  "
-        f"F=von Mises collinear (κ_θ window), broadside surround "
-        f"(β,κ,κ_θ,λ,η,σ_f learned)"
+        f"Seed: ρ_seed=ρ_peak²/(ρ_peak²+η_seed²);  e=β_seed·ρ_seed+β_coll·ρ_coll;  "
+        f"ρ=e²/(e²+η²+λ·S²);  S=⟨ρ_seed⟩_𝒩 (broadside);  "
+        f"(β_seed,β_coll,κ_θ,η_seed,η,λ,σ_f learned)"
     )
     print(
         f"Render: Gaussian-line splat + stencil thinning MLP → "
