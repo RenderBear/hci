@@ -29,27 +29,15 @@ L1 = SimpleNamespace(
     PATCH_OVERLAP=3,
     BORDER_PATCH_MAX_FRAC=0.2,
     EPS=1e-15,
-    TOP_POWER=2.0,  # fixed q in top-emphasising soft mask on min-subtracted |z₂|
 )
 
-# ── Seed: NR peak + collinear readback + divisive readout ───────────────────
+# ── Seed: Naka–Rushton on |Z| only (ρ = |Z|²/(|Z|²+η_z²)) ─────────────────────
 SEED = SimpleNamespace(
     EPS=1e-9,
-    R0_INIT=0.45,
-    A_INIT=12.0,
-    B_INIT=5.0,
-    BETA_SEED_INIT=0.5,       # weight on ρ_seed in excitation
-    BETA_COLL_INIT=0.5,       # weight on ρ_coll in excitation
-    KAPPA_THETA_INIT=2.5,     # von Mises orientation width in ρ_coll pool
-    ETA_SEED_INIT=0.30,       # semi-saturation in ρ_peak²/(ρ_peak²+η_seed²)
-    ETA_INIT=0.30,            # semi-saturation in final e²/(e²+η²+λ·S²) readout
-    LAMBDA_INIT=0.5,          # surround gain: λ·S² in denominator (λ not squared)
-    SIGMA_F_INIT=1.3,
-    FACIL_RADIUS=2,
-    FACIL_MODE="collinear",
-    SURROUND_RADIUS=5,
-    SURROUND_SIGMA=2.0,
-    SURROUND_MODE="broadside",
+    ETA_Z_INIT=0.30,  # semi-saturation η_z (learned, softplus-positive)
+    # Defaults for ``relative_energy`` diagnostic in infer (Gaussian neighborhood of ρ_total)
+    SURROUND_RADIUS_DIAG=5,
+    SURROUND_SIGMA_DIAG=2.0,
 )
 
 # ── Render: §2.5 anisotropic splat + ρ̄ gate G + perp conv (see striate/renderer.py) ─

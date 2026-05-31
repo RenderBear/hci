@@ -7,8 +7,8 @@ This file records the **notation and equations implemented in this repository**:
 ## 1. End-to-end pipeline
 
 1. **L0** — RGB directional differences → per-direction min subtraction → independent Naka–Rushton per channel with **fixed** $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ (`L0.ETA_LUM`, `L0.ETA_CHR`) and gain $\gamma$ (`L0.GAMMA`). Produces harmonic stack $s$, magnitudes $h_{1m}, h_{2m}$, split $h_{2m}^{\mathrm{lum}}, h_{2m}^{\mathrm{chr}}$, and complex fields $z_1, z_2$ (`z_from_l0_harmonics`). With **`L0.LEARNED_METRIC`** (default), a **learned** $3\times3$ matrix $W$ (`L0LearnedMetric`) replaces the fixed lum/chr split for distance; L0 is recomputed **live each training step** from cached RGB. Without it, L0 uses the fixed orthonormal lum/chr split and may be precomputed into the disk cache.
-2. **L1** — From L0 pixel field $z_2$, pool over $P\times P$ patches → per-cell $\rho_{\mathrm{total}}$, $\rho_{\mathrm{peak}}$, orientation $\theta$, and $h_{2m}$-weighted splat anchors. **Runs live** each training step (`run_moments_cells_flat` in `prepare_batch`).
-3. **Seed** (`AndGateSeed` / `ContourSeed`) — NR-normalise $\rho_{\mathrm{peak}}$ → $\rho_{\mathrm{seed}}$; collinear readback $\rho_{\mathrm{coll}}$; excitation $e = \beta_{\mathrm{seed}}\rho_{\mathrm{seed}} + \beta_{\mathrm{coll}}\rho_{\mathrm{coll}}$; divisive export $\rho = e^2/(e^2 + \eta^2 + \lambda S^2)$ with **learned** $\beta_{\mathrm{seed}}, \beta_{\mathrm{coll}}, \kappa_\theta, \eta_{\mathrm{seed}}, \eta, \lambda, \sigma_f$.
+2. **L1** — From L0 pixel field $z_2$, pool over $P\times P$ patches → per-cell $\rho_{\mathrm{total}} = \sum|z_2|$, coherent magnitude $\rho_{\mathrm{peak}} = |\sum z_2|$, orientation $\theta$, and $h_{2m}$-weighted splat anchors. **Runs live** each training step (`run_moments_cells_flat` in `prepare_batch`).
+3. **Seed** (`AndGateSeed` / `ContourSeed`) — Naka–Rushton on coherent magnitude: with $R(c) = \rho_{\mathrm{peak}}(c)\,\mathrm{ok}(c)$, $\rho(c) = R^2/(R^2+\eta_z^2+\varepsilon)$. **Learned** $\eta_z > 0$ (softplus; init `SEED.ETA_Z_INIT`).
 4. **Renderer** (`ModulationRenderer`) — Cell-grid $\theta$ combing and $\rho$-gated anchor smoothing; **Gaussian-line splat** of $\rho$ to pixels; **splat-footprint coherence** map $\mathrm{coh}(p)$; tangential / normal **9-tap stencils on $\bar\rho$**; **20→12→1** thinning MLP gate:
    $$\hat B(p) = \bar\rho(p)\,\mathrm{gate}(p).$$
 
@@ -78,30 +78,21 @@ Split second-harmonic magnitudes $h_{2m}^{\mathrm{lum}}, h_{2m}^{\mathrm{chr}}$ 
 
 Patch size $P$ (`L1.PATCH_SIZE`), stride $S = P - \texttt{patch\_overlap}$ (`L1.PATCH_OVERLAP`) → cell grid $(n_H, n_W)$. A cell is **border** when the mean border mask over its patch exceeds `L1.BORDER_PATCH_MAX_FRAC`.
 
-From the L0 pixel field $z_2(p) = s_2(p) + i\,s_3(p)$:
+From the L0 pixel field $z_2(p) = s_2(p) + i\,s_3(p)$, **unweighted** patch sums:
 
 $$
+Z_2(c) = \sum_{p \in \mathrm{patch}(c)} z_2(p), \qquad
+\rho_{\mathrm{peak}}(c) = |Z_2(c)|, \qquad
 \rho_{\mathrm{total}}(c) = \sum_{p \in \mathrm{patch}(c)} |z_2(p)|.
 $$
 
-**Coherent peak** (min-subtracted top-weighted complex pool on $z_2$; fixed $q = 2$):
+**Orientation** (same moment as $|Z_2|$):
 
 $$
-\tilde m(p) = \max\!\bigl(0,\;|z_2(p)| - \min_{q \in \mathrm{patch}} |z_2(q)|\bigr), \qquad
-w(p) = \frac{\tilde m(p)^q}{\sum_{r \in \mathrm{patch}} \tilde m(r)^q + \varepsilon},
-$$
-$$
-\rho_{\mathrm{peak}}(c) = \Bigl|\sum_{p \in \mathrm{patch}(c)} w(p)\, z_2(p)\Bigr|.
+\theta(c) = \tfrac{1}{2}\operatorname{atan2}\!\bigl(\Im Z_2, \Re Z_2 + \varepsilon\bigr).
 $$
 
-With $u(p) = w(p)|z_2(p)|$, $U(c) = \sum_p u(p)$: $\rho_{\mathrm{peak}} = U \cdot R$ where $R(c) = \rho_{\mathrm{peak}}/U \in [0,1]$ is stored as **`rho_coherence`**.
-
-**Orientation** uses the $h_{2m}$-weighted complex moment:
-
-$$
-Z_2^{w}(c) = \sum_{p \in \mathrm{patch}(c)} h_{2m}(p)\, z_2(p), \qquad
-\theta(c) = \tfrac{1}{2}\operatorname{atan2}\!\bigl(\Im Z_2^{w}, \Re Z_2^{w} + \varepsilon\bigr).
-$$
+**Diagnostics:** `rho_coherence` stores $\rho_{\mathrm{peak}}/\max(\rho_{\mathrm{total}},\varepsilon)$ clamped to $[0,1]$ (coherent fraction of L¹ mass).
 
 **Splat anchors** ($h_{2m}$-weighted centroid within the patch; stored as `cx_z2`, `cy_z2`):
 
@@ -114,9 +105,9 @@ $$
 
 | Key | Value |
 |-----|--------|
-| `rho_peak` | $\rho_{\mathrm{peak}}(c)$ — **seed drive** (coherent $|Z_2^w|$ on $z_2$) |
-| `rho_coherence` | $R(c) \in [0,1]$ — orientation agreement among top-$|z_2|$ pixels |
-| `rho_total`, `z0` | $\rho_{\mathrm{total}}(c)$ — surround / $E_{\mathrm{rel}}$ diagnostics |
+| `rho_peak` | $|Z_2(c)|$ — coherent magnitude (seed input) |
+| `rho_coherence` | $\rho_{\mathrm{peak}}/\rho_{\mathrm{total}}$ (guarded, $\in[0,1]$) |
+| `rho_total`, `z0` | $\rho_{\mathrm{total}}(c)$ — $E_{\mathrm{rel}}$ diagnostics |
 | `theta` | $\theta(c)$ |
 | `cx_z2`, `cy_z2` | $h_{2m}$-weighted splat anchors |
 
@@ -124,57 +115,23 @@ Border cells → $0$ on $\rho_{\mathrm{total}}, \rho_{\mathrm{peak}}, \theta$.
 
 ---
 
-## 4. Seed — NR peak + collinear readback (`ContourSeed` / `AndGateSeed`)
+## 4. Seed — Naka–Rushton on $|Z|$ (`ContourSeed` / `AndGateSeed`)
 
-Let $R(c) = \rho_{\mathrm{peak}}(c)\,\mathrm{ok}(c)$ denote the masked peak drive.
-
-**NR-normalised seed field**:
+Let $R(c) = \rho_{\mathrm{peak}}(c)\,\mathrm{ok}(c) = |Z_2(c)|\,\mathrm{ok}(c)$. Learned $\eta_z > 0$ (softplus; init `SEED.ETA_Z_INIT`):
 
 $$
-\rho_{\mathrm{seed}}(c) = \frac{R(c)^2}{R(c)^2 + \eta_{\mathrm{seed}}^2 + \varepsilon}\,\mathrm{ok}(c).
+\rho(c) = \frac{R(c)^2}{R(c)^2 + \eta_z^2 + \varepsilon}\,\mathrm{ok}(c).
 $$
 
-**Collinear readback** on $\rho_{\mathrm{seed}}$ (default `SEED.FACIL_MODE = "collinear"`):
+The same $\rho$ is written to `cf_out["rho_seed"]` for diagnostics and passed to the renderer as the cell weight.
 
-$$
-\rho_{\mathrm{coll}}(c) = \mathrm{relu}\!\left(
-\frac{\sum_{\delta \in \mathcal{N}} w_\delta(c)\, \rho_{\mathrm{seed}}(c+\delta)\, a_\kappa(\Delta\theta_\delta)}
-{\sum_{\delta \in \mathcal{N}} w_\delta(c) + \varepsilon}
-\right),
-$$
-$$
-w_\delta = G(|\delta|)\,\mathrm{pos}(\delta; \hat t_c), \quad
-a_\kappa(\Delta) = \exp\!\bigl(\kappa_\theta(\cos\Delta - 1)\bigr),
-$$
-with $\hat t_c = (\cos\theta_c, \sin\theta_c)$ and $\Delta\theta$ the wrapped double-angle difference.
-
-**Excitation**:
-
-$$
-e(c) = \beta_{\mathrm{seed}}\,\rho_{\mathrm{seed}}(c) + \beta_{\mathrm{coll}}\,\rho_{\mathrm{coll}}(c).
-$$
-
-**Surround** — center-excluded pool of $\rho_{\mathrm{seed}}$ (`broadside` mode weights toward the normal of $\theta$):
-
-$$
-S(c) = \langle\rho_{\mathrm{seed}}\rangle_{\mathcal{N}}(c).
-$$
-
-**Divisive cell export** ($\lambda$ is **not** squared):
-
-$$
-\rho(c) = \frac{e(c)^2}{e(c)^2 + \eta^2 + \lambda\, S(c)^2 + \varepsilon}\,\mathrm{ok}(c).
-$$
-
-**Learned** (softplus-positive): $\beta_{\mathrm{seed}}$, $\beta_{\mathrm{coll}}$, $\kappa_\theta$, $\eta_{\mathrm{seed}}$, $\eta$, $\lambda$, $\sigma_f$. Inits from `params.SEED`.
-
-**Relative energy** (diagnostic only, from $\rho_{\mathrm{total}}$):
+**Relative energy** (diagnostic only, from $\rho_{\mathrm{total}}$; fixed Gaussian neighborhood in code, `SEED.SURROUND_RADIUS_DIAG` / `SEED.SURROUND_SIGMA_DIAG`):
 
 $$
 E_{\mathrm{rel}}(c) = \frac{\rho_{\mathrm{total}}(c)}{\varepsilon + \langle\rho_{\mathrm{total}}\rangle_{\mathcal{N}}(c)}.
 $$
 
-Border cells → $0$ on $\rho, \theta$. **Orientation** $\theta(c)$ is read from L1; seed does not refine $\theta$.
+Border cells → $0$ on $\rho$. **Orientation** $\theta(c)$ is read from L1; the seed does not refine $\theta$.
 
 ---
 
@@ -278,8 +235,8 @@ L0 $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ are **fixed** (`params.L0`). Legac
 | Stage | Primary code |
 |-------|----------------|
 | $d_k$, NR, harmonics, $z_1, z_2$, learned $W$, interior mask | `hci/L0.py` |
-| z₂ moment pooling, $\rho_{\mathrm{peak}}$, $\rho_{\mathrm{total}}$, $\theta$, $h_{2m}$ anchors | `hci/L1.py` |
-| Association-field seed, $\rho_{\mathrm{seed}}$, $\rho_{\mathrm{coll}}$, cell $\rho$ export | `hci/seed.py` |
+| z₂ moments $\rho_{\mathrm{total}}$, $\rho_{\mathrm{peak}}=|Z|$, $\theta$, $h_{2m}$ anchors | `hci/L1.py` |
+| Naka–Rushton $\rho = |Z|^2/(|Z|^2+\eta_z^2)$ | `hci/seed.py` |
 | Splat, footprint $\mathrm{coh}$, stencils, thinning head, NMS | `hci/renderer.py` |
 | Cache, batching, loss, checkpoints | `train.py` |
 | Single-image pipeline, diagnostics | `infer.py`, `hci/diagnostics_viz.py` |

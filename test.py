@@ -1,6 +1,6 @@
 r"""test.py — STRIATE test-set evaluation (ODS, OIS, AP).
 
-Per image: same L0 → moment pooling → association-field seed → render path as inference
+Per image: same L0 → |Z| / ρ_total / θ moments → NR seed → render path as inference
 (raw boundary map). Two prediction tracks: ``c_eval`` without ridge NMS; ``s_eval`` with ridge NMS
 along dominant theta. BSDS-style matching uses about 0.75% of the image
 diagonal.

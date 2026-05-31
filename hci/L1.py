@@ -1,10 +1,16 @@
 r"""L1 — per-cell z₂ moments → cell grid (GPU-native).
 
-From L0 pixel field z₂ = s₂ + i s₃, sum-pool over P×P patches:
-  ρ_total(c) = Σ |z₂(p)|  (unweighted; seed surround / E_rel),
-  ρ_peak(c) = |Σ w(p) z₂(p)|  (min-subtracted top-weighted coherent pool; q=2),
-  Z₂ʷ(c) = Σ h₂m(p) z₂(p),  θ(c) = ½ arg Z₂ʷ(c).
+From L0 pixel field z₂ = s₂ + i s₃, over each P×P patch (unweighted sums):
+
+  Z₂(c) = Σ_p z₂(p),   ρ_peak(c) = |Z₂(c)|,   θ(c) = ½ arg Z₂(c).
+
+  ρ_total(c) = Σ_p |z₂(p)|   (dilution-robust mass; diagnostics / E_rel).
+
+``rho_coherence`` = ρ_peak / max(ρ_total, ε) (capped at 1) — coherent fraction of L¹ mass.
+
 Splat anchors: h₂m-weighted centroid within patch (cx_z2, cy_z2).
+
+The seed applies Naka–Rushton on |Z|: ρ = |Z|²/(|Z|²+η_z²) (``hci/seed.py``).
 """
 
 from __future__ import annotations
@@ -73,27 +79,6 @@ def _sum_pool2d(field: torch.Tensor, P: int, S: int) -> torch.Tensor:
     return F.avg_pool2d(x, kernel_size=P, stride=S).squeeze(0).squeeze(0) * (P * P)
 
 
-def _coherent_rho_peak(
-    z2_patches: torch.Tensor,
-    eps: float,
-    top_power: float = L1.TOP_POWER,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Min-subtracted top-weighted complex pool: |Σ w(p) z₂(p)| and coherence R."""
-    z2_abs = z2_patches.abs()
-    m_tilde = (z2_abs - z2_abs.min(dim=-1, keepdim=True).values).clamp_min(0.0)
-    m_pow = m_tilde.pow(top_power)
-    w = m_pow / (m_pow.sum(dim=-1, keepdim=True) + eps)
-    z2_peak = (w * z2_patches).sum(dim=-1)
-    rho_peak = z2_peak.abs().to(torch.float32)
-    u_mass = (w * z2_abs).sum(dim=-1).to(torch.float32)
-    rho_coherence = torch.where(
-        u_mass > eps,
-        (rho_peak / u_mass.clamp_min(eps)).clamp(0.0, 1.0),
-        torch.zeros_like(rho_peak),
-    )
-    return rho_peak, rho_coherence
-
-
 def compute_cell_moments(
     h2m: torch.Tensor,
     z2: torch.Tensor,
@@ -126,23 +111,23 @@ def compute_cell_moments(
     is_border_flat = bm_patches.mean(dim=-1) > border_patch_max_frac
 
     z2_patches = _extract_patches_torch(z2, nH, nW, P, S)
-    h2m_patches = _extract_patches_torch(h2m, nH, nW, P, S)
 
-    # Unweighted presence energy — seed surround / E_rel (unchanged).
     z2_abs_sum = z2_patches.abs().sum(dim=-1).to(torch.float32)
     rho_total_flat = z2_abs_sum.reshape(-1)
 
-    # h₂m-weighted moment for θ.
-    Z2_w = (h2m_patches * z2_patches).sum(dim=-1)
-
-    # Coherent peak: |Σ w(p) z₂(p)| with q = L1.TOP_POWER (default 2).
-    rho_peak_cell, rho_coherence_cell = _coherent_rho_peak(z2_patches, eps)
+    Z2 = z2_patches.sum(dim=-1)
+    rho_peak_cell = Z2.abs().to(torch.float32)
+    rho_coherence_cell = torch.where(
+        z2_abs_sum > eps,
+        (rho_peak_cell / z2_abs_sum.clamp_min(eps)).clamp(0.0, 1.0),
+        torch.zeros_like(rho_peak_cell),
+    )
     rho_peak_flat = rho_peak_cell.reshape(-1)
     rho_coherence_flat = rho_coherence_cell.reshape(-1)
-    del z2_patches, h2m_patches
+    del z2_patches
 
     theta_flat = (
-        0.5 * torch.atan2(Z2_w.imag, Z2_w.real + eps)
+        0.5 * torch.atan2(Z2.imag, Z2.real + eps)
     ).to(torch.float32).reshape(-1)
 
     theta_flat = torch.where(is_border_flat, torch.zeros_like(theta_flat), theta_flat)
@@ -181,9 +166,9 @@ def compute_cell_moments(
         print(f"  active={n - n_border}  border={n_border}")
         print(f"  rho_total: mean={rt.mean():.2f} max={rt.max():.2f}")
         rp = rho_peak_flat.detach().cpu().numpy()
-        print(f"  rho_peak: mean={rp.mean():.2f} max={rp.max():.2f}")
+        print(f"  rho_peak |Z|: mean={rp.mean():.2f} max={rp.max():.2f}")
         rc = rho_coherence_flat.detach().cpu().numpy()
-        print(f"  rho_coherence R: mean={rc.mean():.3f} max={rc.max():.3f}")
+        print(f"  rho_coherence |Z|/ρ_total: mean={rc.mean():.3f} max={rc.max():.3f}")
 
     if return_torch:
         return {

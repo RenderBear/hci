@@ -534,11 +534,11 @@ def viz_infer_l1_rho_masses(
     viz_l1_rho_masses(
         [
             (rho_total, r"$\rho_{\mathrm{total}} = \sum|z_2|$"),
-            (rho_peak, r"$\rho_{\mathrm{peak}} = \left|\sum w\, z_2\right|$"),
+            (rho_peak, r"$|Z_2| = \left|\sum z_2\right|$"),
         ],
         is_border,
         out_path,
-        suptitle=r"L1 z₂ moments ($\rho_{\mathrm{total}}$, $\rho_{\mathrm{peak}}$ per cell)",
+        suptitle=r"L1 z₂ moments ($\rho_{\mathrm{total}}$, $|Z_2|$ per cell)",
     )
 
 
@@ -549,13 +549,19 @@ def viz_infer_cell_rho(
     *,
     n_bins: int = 50,
 ) -> None:
-    """Single row: cell ρ map, interior histogram, and empirical CDF."""
+    """Cell ρ after seed: Naka–Rushton ρ = |Z|²/(|Z|²+η_z²) ∈ [0,1] (interior map + hist + CDF)."""
     g = apply_border_zero(np.asarray(rho, dtype=np.float64), is_border)
     ib = np.asarray(is_border, dtype=bool)
     if ib.ndim == 1 and g.ndim == 2:
         ib = ib.reshape(g.shape)
     flat = g.ravel()[~ib.ravel()]
     n_cells = int(flat.size)
+    x_max = 1.0
+    suptitle = (
+        r"Cell $\rho = |Z|^2/(|Z|^2+\eta_z^2)$ — Naka–Rushton on coherent $|Z|$ from L1 "
+        r"(learned $\eta_z$; splat uses this $\rho$)"
+    )
+    map_title_key = r"\rho"
 
     fig = plt.figure(figsize=(14.0, 4.6), facecolor=VIZ.BG)
     gs = fig.add_gridspec(1, 3, width_ratios=[2.4, 1.0, 1.0], wspace=0.32)
@@ -567,14 +573,14 @@ def viz_infer_cell_rho(
     m = max(float(np.max(g)), VIZ.EPS)
     ax_m.set_facecolor(VIZ.PANEL_BG)
     ax_m.imshow(
-        g / m,
+        np.clip(g / m, 0.0, 1.0),
         cmap=cmap,
         vmin=0.0,
         vmax=1.0,
         interpolation="nearest",
     )
     ax_m.set_title(
-        rf"cell $\rho$ (max over K)  raw max={m:.4g}",
+        rf"cell ${map_title_key}$  raw max={m:.4g}",
         fontsize=9,
         color=VIZ.FG,
         fontfamily="monospace",
@@ -582,22 +588,23 @@ def viz_infer_cell_rho(
     ax_m.axis("off")
 
     ax_h.set_facecolor(VIZ.PANEL_BG)
-    ax_h.hist(
-        flat,
-        bins=n_bins,
-        range=(0.0, 1.0),
-        color=VIZ.ACCENT,
-        edgecolor=VIZ.PANEL_BG,
-        linewidth=0.3,
-    )
-    ax_h.set_xlim(0.0, 1.0)
+    if n_cells > 0:
+        ax_h.hist(
+            flat,
+            bins=n_bins,
+            range=(0.0, x_max),
+            color=VIZ.ACCENT,
+            edgecolor=VIZ.PANEL_BG,
+            linewidth=0.3,
+        )
+    ax_h.set_xlim(0.0, x_max)
     ax_h.set_title(
         rf"interior histogram  n={n_cells}",
         fontsize=9,
         color=VIZ.FG,
         fontfamily="monospace",
     )
-    ax_h.set_xlabel("ρ", fontsize=8, color=VIZ.FG)
+    ax_h.set_xlabel(r"$\rho$", fontsize=8, color=VIZ.FG)
     ax_h.set_ylabel("count", fontsize=8, color=VIZ.FG)
     ax_h.tick_params(colors=VIZ.FG, labelsize=7)
     for s in ax_h.spines.values():
@@ -608,7 +615,7 @@ def viz_infer_cell_rho(
         xs = np.sort(flat.astype(np.float64, copy=False))
         ys = np.arange(1, n_cells + 1, dtype=np.float64)
         ax_c.plot(xs, ys, color=VIZ.FG, linewidth=1.2)
-    ax_c.set_xlim(0.0, 1.0)
+    ax_c.set_xlim(0.0, x_max)
     ax_c.set_ylim(0.0, float(max(n_cells, 1)))
     ax_c.set_title(
         "empirical CDF",
@@ -616,22 +623,14 @@ def viz_infer_cell_rho(
         color=VIZ.FG,
         fontfamily="monospace",
     )
-    ax_c.set_xlabel("ρ", fontsize=8, color=VIZ.FG)
+    ax_c.set_xlabel(r"$\rho$", fontsize=8, color=VIZ.FG)
     ax_c.set_ylabel("cumulative count", fontsize=8, color=VIZ.FG)
     ax_c.grid(True, alpha=0.25, color=VIZ.ACCENT)
     ax_c.tick_params(colors=VIZ.FG, labelsize=7)
     for s in ax_c.spines.values():
         s.set_color(VIZ.ACCENT)
 
-    fig.suptitle(
-        r"Cell $\rho$ — map and interior distribution "
-        r"($\rho_{\mathrm{seed}}=\rho_{\mathrm{peak}}^2/(\rho_{\mathrm{peak}}^2+\eta_{\mathrm{seed}}^2)$; "
-        r"$e=\beta_{\mathrm{seed}}\rho_{\mathrm{seed}}+\beta_{\mathrm{coll}}\rho_{\mathrm{coll}}$; "
-        r"$\rho=e^2/(e^2+\eta^2+\lambda S^2)$)",
-        fontsize=10,
-        color=VIZ.FG,
-        fontfamily="monospace",
-    )
+    fig.suptitle(suptitle, fontsize=10, color=VIZ.FG, fontfamily="monospace")
     fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
     plt.close(fig)
 

@@ -1,7 +1,7 @@
 r"""train.py — STRIATE training: z₂ moments + association-field seed + harmonic render.
 
 Pipeline per image: L0 contrast/harmonics (cached) → live z₂ moment pooling each step
-→ seed (ρ_seed NR + β_seed·ρ_seed + β_coll·ρ_coll excitation)
+→ seed (ρ = |Z|²/(|Z|²+η_z²) with learned η_z)
 → splat renderer ($\hat B = \bar\rho \cdot \mathrm{gate}$).
 Loss combines soft-Dice and per-pixel BCE on the same η± valid band
 (target≥η_pos or target<η_neg), weighted by ``--lam_dice`` and ``--lam_bce``
@@ -37,7 +37,7 @@ from hci.L1 import (
     pad_for_patch_grid,
     compute_cell_moments,
 )
-from hci.seed import AndGateSeed, _inv_softplus
+from hci.seed import AndGateSeed
 from hci.renderer import (
     ModulationRenderer,
     render_boundary_map_torch,
@@ -572,9 +572,16 @@ def bce_loss_with_ignore(
 
 
 def upgrade_model_state_dict(state_dict: dict) -> dict:
-    """Map legacy keys; drop dynamics / K-bin / η_z / von Mises / AND-gate scalars."""
+    """Map legacy keys; drop removed seed/L1 parameters so checkpoints load with fresh inits."""
     drop = {
-        "seed._eta_z_raw",
+        "seed._eta_seed_raw",
+        "seed._sigma_l1_raw",
+        "seed._beta_seed_raw",
+        "seed._beta_coll_raw",
+        "seed._kappa_theta_raw",
+        "seed._eta_raw",
+        "seed._lambda_raw",
+        "seed._sigma_f_raw",
         "_l1_von_mises_kappa_raw",
         "seed._R0",
         "seed._a_raw",
@@ -595,7 +602,7 @@ def upgrade_model_state_dict(state_dict: dict) -> dict:
 
 
 def debug_seed_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
-    """One training batch: seed stats + ∂loss/∂(β_seed, β_coll, κ_θ, η_seed, η, λ, σ_f)."""
+    """One training batch: seed stats + ∂loss/∂η_z."""
     model.train()
     meta = meta_list[0]
     cf = meta["cells_flat_dev"]
@@ -628,26 +635,12 @@ def debug_seed_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
     print("\n--- seed debug ---")
     if diags and "iter_stats" in diags and diags["iter_stats"]:
         st = diags["iter_stats"][0]
-        for key in ("rho_mean", "rho_max", "mid_band_frac", "n_interior",
-                    "fac_mean", "sur_mean"):
+        for key in ("rho_mean", "rho_max", "mid_band_frac", "n_interior"):
             if key in st:
                 print(f"  {key}: {st[key]}")
     seed = model.seed
-    print(
-        f"\n  β_seed={seed.beta_seed.item():.4g}  β_coll={seed.beta_coll.item():.4g}  "
-        f"κ_θ={seed.kappa_theta.item():.4g}  η_seed={seed.eta_seed.item():.4g}  "
-        f"η={seed.eta.item():.4g}  λ={seed.lam.item():.4g}  "
-        f"σ_f={seed.sigma_f.item():.4g} (learned)"
-    )
-    for name, t in (
-        ("β_seed", seed._beta_seed_raw),
-        ("β_coll", seed._beta_coll_raw),
-        ("κ_θ", seed._kappa_theta_raw),
-        ("η_seed", seed._eta_seed_raw),
-        ("η", seed._eta_raw),
-        ("λ", seed._lambda_raw),
-        ("σ_f", seed._sigma_f_raw),
-    ):
+    print(f"\n  η_z={seed.eta_z.item():.4g} (learned NR semi-saturation on |Z|²)")
+    for name, t in (("η_z", seed._eta_z_raw),):
         if t.grad is None:
             print(f"  |grad| {name}: grad=None")
         else:
@@ -723,18 +716,14 @@ def format_l0_param_lines(model: StriateE2E, *, indent: str = "  ") -> list[str]
 def format_l1_param_lines(model: StriateE2E, *, indent: str = "  ") -> list[str]:
     _ = model
     return [
-        f"{indent}z₂ moment pooling (ρ_peak, ρ_total, θ) — no learned L1 params",
+        f"{indent}z₂ patch sum Z; ρ_peak=|Z|, ρ_total=Σ|z₂|, θ=½arg Z — no learned L1 params",
     ]
 
 
 def format_seed_param_lines(seed, *, indent: str = "  ") -> list[str]:
     return [
-        f"{indent}β_seed={seed.beta_seed.item():.4g}  β_coll={seed.beta_coll.item():.4g}  "
-        f"κ_θ={seed.kappa_theta.item():.4g}  η_seed={seed.eta_seed.item():.4g}  "
-        f"η={seed.eta.item():.4g}  λ={seed.lam.item():.4g}  "
-        f"σ_f={seed.sigma_f.item():.4g} (learned)  [{seed.surround_mode} surround]",
-        f"{indent}ρ_seed=ρ_peak²/(ρ_peak²+η_seed²);  e=β_seed·ρ_seed+β_coll·ρ_coll;  "
-        f"ρ=e²/(e²+η²+λ·S²);  S=⟨ρ_seed⟩_𝒩",
+        f"{indent}η_z={seed.eta_z.item():.4g} (learned)  "
+        f"ρ = |Z|²/(|Z|²+η_z²)  (Naka–Rushton on coherent magnitude from L1)",
     ]
 
 

@@ -12,8 +12,8 @@ STRIATE/
 ├── infer.py                 # single-image inference + diagnostics
 ├── hci/
 │   ├── L0.py                # pixel-level contrast
-│   ├── L1.py                # cell-level K-bin projection
-│   ├── seed.py              # NR seed (learned η_z) → scalar ρ
+│   ├── L1.py                # cell-level z₂ moments (E, C, θ)
+│   ├── seed.py              # |Z|²/(|Z|²+η_z²) → cell ρ for splat
 │   ├── renderer.py          # learned ridge projection
 │   └── diagnostics_viz.py   # visualisation utilities
 ├── data/                    # train, test, infer images (generic layout)
@@ -22,7 +22,7 @@ STRIATE/
     └── test/results.json
 ```
 
-**Equation and notation reference:** `equations.md` (code-aligned STRIATE pipeline: L0 → L1 K-bin → seed → splat renderer) and `docs/docs.html` (open in a browser).
+**Equation and notation reference:** `equations.md` (code-aligned STRIATE pipeline: L0 → L1 moments → seed → splat renderer) and `docs/docs.html` (open in a browser).
 
 ## Requirements
 

@@ -1,6 +1,6 @@
 r"""infer.py — STRIATE single-image inference.
 
-Pipeline: L0 → z₂ moment pooling → association-field seed → splat boundary map
+Pipeline: L0 → z₂ moments (|Z|, ρ_total, θ) → Naka–Rushton seed → splat boundary map
 ($\hat B = \bar\rho \cdot \mathrm{gate}$), optional ridge NMS along θ,
 then thresholded edge PNG (default τ = 0.5).
 """
@@ -200,7 +200,16 @@ def _infer_seed_and_render(
     collect_diags: bool = False,
     apply_ridge_nms: bool = True,
     timings: dict[str, float] | None = None,
-) -> tuple[np.ndarray, np.ndarray, torch.Tensor, torch.Tensor, np.ndarray, dict | None, np.ndarray]:
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    torch.Tensor,
+    torch.Tensor,
+    np.ndarray,
+    dict | None,
+    np.ndarray,
+    np.ndarray,
+]:
     H0, W0 = prep["H0"], prep["W0"]
     Hp, Wp = prep["Hp"], prep["Wp"]
     nH, nW = prep["nH"], prep["nW"]
@@ -248,9 +257,19 @@ def _infer_seed_and_render(
     if apply_ridge_nms:
         bmap = ridge_nms(bmap, theta=theta_map)
     rho_post_grid = rho_out.cpu().numpy().reshape(nH, nW)
+    rho_seed_grid = cf_out["rho_seed"].cpu().numpy().reshape(nH, nW)
     branch_grid = branch.cpu().numpy().reshape(nH, nW)
     supp_nb_np = supp_nb.cpu().numpy().reshape(nH, nW)
-    return bmap, theta_map, rho_out, branch_grid, rho_post_grid, surface_diags, supp_nb_np
+    return (
+        bmap,
+        theta_map,
+        rho_out,
+        branch_grid,
+        rho_post_grid,
+        surface_diags,
+        supp_nb_np,
+        rho_seed_grid,
+    )
 
 
 def forward_with_diagnostics(
@@ -270,6 +289,7 @@ def forward_with_diagnostics(
         rho_post_grid,
         surface_diags,
         supp_nb_np,
+        rho_seed_grid,
     ) = _infer_seed_and_render(
         model,
         prep,
@@ -287,6 +307,7 @@ def forward_with_diagnostics(
         prep["is_border_grid"],
         surface_diags,
         supp_nb_np,
+        rho_seed_grid,
         timings,
     )
 
@@ -343,7 +364,7 @@ def main():
         "--diagnostics",
         action="store_true",
         help="Save additional diagnostics: base, l0_pinwheel, l1_moments, "
-        "cell_rho, render_softmap, render_theta_bins, overlay.",
+        "cell_rho (ρ = |Z|²/(|Z|²+η_z²)), render_softmap, render_theta_bins, overlay.",
     )
     ap.add_argument(
         "--gt_dir",
@@ -378,14 +399,22 @@ def main():
     prep, prep_t = run_l0_l1(img_path, device, metric=model.l0_metric)
 
     collect_diags = args.verbose or args.diagnostics
-    (bmap, theta_map, rho_post, branch_grid, is_border, diags, _, fwd_t) = (
-        forward_with_diagnostics(
-            model,
-            prep,
-            device,
-            collect_diags=collect_diags,
-            apply_ridge_nms=args.ridge_nms,
-        )
+    (
+        bmap,
+        theta_map,
+        rho_post,
+        branch_grid,
+        is_border,
+        diags,
+        _,
+        rho_seed,
+        fwd_t,
+    ) = forward_with_diagnostics(
+        model,
+        prep,
+        device,
+        collect_diags=collect_diags,
+        apply_ridge_nms=args.ridge_nms,
     )
 
     if args.verbose and diags is not None and "iter_stats" in diags:
@@ -423,7 +452,7 @@ def main():
         saved_files.append(p_rho)
 
         p_cell = os.path.join(od, f"{stem}_cell_rho.png")
-        viz_infer_cell_rho(rho_post, is_border, p_cell)
+        viz_infer_cell_rho(rho_seed, is_border, p_cell)
         saved_files.append(p_cell)
 
         gt_arr: np.ndarray | None = None
