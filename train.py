@@ -1,7 +1,7 @@
 r"""train.py — STRIATE training: z₂ moments + association-field seed + harmonic render.
 
 Pipeline per image: L0 contrast/harmonics (cached) → live z₂ moment pooling each step
-→ seed (ρ = |Z|²/(|Z|²+η_z²) with learned η_z)
+→ seed (η_z NR on |Z|, then collinear + surround → cell ρ)
 → splat renderer ($\hat B = \bar\rho \cdot \mathrm{gate}$).
 Loss combines soft-Dice and per-pixel BCE on the same η± valid band
 (target≥η_pos or target<η_neg), weighted by ``--lam_dice`` and ``--lam_bce``
@@ -572,16 +572,10 @@ def bce_loss_with_ignore(
 
 
 def upgrade_model_state_dict(state_dict: dict) -> dict:
-    """Map legacy keys; drop removed seed/L1 parameters so checkpoints load with fresh inits."""
+    """Map legacy keys; drop obsolete tensors (σ_L1, old η_seed, etc.)."""
     drop = {
         "seed._eta_seed_raw",
         "seed._sigma_l1_raw",
-        "seed._beta_seed_raw",
-        "seed._beta_coll_raw",
-        "seed._kappa_theta_raw",
-        "seed._eta_raw",
-        "seed._lambda_raw",
-        "seed._sigma_f_raw",
         "_l1_von_mises_kappa_raw",
         "seed._R0",
         "seed._a_raw",
@@ -602,7 +596,7 @@ def upgrade_model_state_dict(state_dict: dict) -> dict:
 
 
 def debug_seed_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
-    """One training batch: seed stats + ∂loss/∂η_z."""
+    """One training batch: seed stats + ∂loss/∂(η_z, β_seed, β_coll, κ_θ, η, λ, σ_f)."""
     model.train()
     meta = meta_list[0]
     cf = meta["cells_flat_dev"]
@@ -635,12 +629,25 @@ def debug_seed_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
     print("\n--- seed debug ---")
     if diags and "iter_stats" in diags and diags["iter_stats"]:
         st = diags["iter_stats"][0]
-        for key in ("rho_mean", "rho_max", "mid_band_frac", "n_interior"):
+        for key in ("rho_mean", "rho_max", "mid_band_frac", "n_interior",
+                    "fac_mean", "sur_mean"):
             if key in st:
                 print(f"  {key}: {st[key]}")
     seed = model.seed
-    print(f"\n  η_z={seed.eta_z.item():.4g} (learned NR semi-saturation on |Z|²)")
-    for name, t in (("η_z", seed._eta_z_raw),):
+    print(
+        f"\n  η_z={seed.eta_z.item():.4g}  β_seed={seed.beta_seed.item():.4g}  "
+        f"β_coll={seed.beta_coll.item():.4g}  κ_θ={seed.kappa_theta.item():.4g}  "
+        f"η={seed.eta.item():.4g}  λ={seed.lam.item():.4g}  σ_f={seed.sigma_f.item():.4g}"
+    )
+    for name, t in (
+        ("η_z", seed._eta_z_raw),
+        ("β_seed", seed._beta_seed_raw),
+        ("β_coll", seed._beta_coll_raw),
+        ("κ_θ", seed._kappa_theta_raw),
+        ("η", seed._eta_raw),
+        ("λ", seed._lambda_raw),
+        ("σ_f", seed._sigma_f_raw),
+    ):
         if t.grad is None:
             print(f"  |grad| {name}: grad=None")
         else:
@@ -722,8 +729,12 @@ def format_l1_param_lines(model: StriateE2E, *, indent: str = "  ") -> list[str]
 
 def format_seed_param_lines(seed, *, indent: str = "  ") -> list[str]:
     return [
-        f"{indent}η_z={seed.eta_z.item():.4g} (learned)  "
-        f"ρ = |Z|²/(|Z|²+η_z²)  (Naka–Rushton on coherent magnitude from L1)",
+        f"{indent}η_z={seed.eta_z.item():.4g}  β_seed={seed.beta_seed.item():.4g}  "
+        f"β_coll={seed.beta_coll.item():.4g}  κ_θ={seed.kappa_theta.item():.4g}  "
+        f"η={seed.eta.item():.4g}  λ={seed.lam.item():.4g}  σ_f={seed.sigma_f.item():.4g}  "
+        f"[{seed.surround_mode} surround]",
+        f"{indent}ρ_nr=|Z|²/(|Z|²+η_z²);  e=β_seed·ρ_nr+β_coll·ρ_coll;  "
+        f"ρ=e²/(e²+η²+λ·S²);  S=⟨ρ_nr⟩_𝒩",
     ]
 
 

@@ -1,9 +1,13 @@
 r"""test.py — STRIATE test-set evaluation (ODS, OIS, AP).
 
-Per image: same L0 → |Z| / ρ_total / θ moments → NR seed → render path as inference
-(raw boundary map). Two prediction tracks: ``c_eval`` without ridge NMS; ``s_eval`` with ridge NMS
-along dominant theta. BSDS-style matching uses about 0.75% of the image
-diagonal.
+Per image: same L0 → |Z|, ρ_total, θ from L1 → seed (η_z NR on |Z|², then collinear
++ surround divisive readout) → splat render (raw boundary map). Two prediction tracks:
+``c_eval`` without ridge NMS; ``s_eval`` with ridge NMS along dominant θ. BSDS-style
+matching uses about 0.75% of the image diagonal.
+
+With ``--diagnostics``, also writes ``{output_dir}/diagnostics/{stem}_rho.png`` (two-row
+ρ map like ``infer.py``: post–η_z NR vs final cell ρ) and ``{stem}_geometry.png``
+(ρ_coll and surround S per cell).
 
 Writes predictions under ``output_dir/{c_eval,s_eval,b_eval}/preds/`` and
 aligned binary GT PNGs under ``output_dir/gt/`` (same stems), matching the
@@ -36,6 +40,7 @@ from hci.renderer import (
     ridge_nms,
     upgrade_renderer_state_dict,
 )
+from hci.diagnostics_viz import viz_infer_rho, viz_infer_geometry
 from train import (
     StriateE2E,
     build_cells_flat,
@@ -134,7 +139,14 @@ def _ap_from_pr(results):
     return float(((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1]).sum())
 
 
-def run_image_inference(model, img_path, device):
+def run_image_inference(
+    model,
+    img_path,
+    device,
+    *,
+    diagnostics_dir: str | None = None,
+    stem: str | None = None,
+):
 
     ir_np = np.array(Image.open(img_path).convert("RGB"), dtype=np.float32) / 255.0
     ir_p, H0, W0 = pad_for_patch_grid(ir_np, L1.PATCH_SIZE, L1.PATCH_OVERLAP)
@@ -217,9 +229,23 @@ def run_image_inference(model, img_path, device):
             return_dominant_theta=True,
         )
 
+        if diagnostics_dir is not None and stem is not None:
+            os.makedirs(diagnostics_dir, exist_ok=True)
+            nH = int(cf_dev["nH"])
+            nW = int(cf_dev["nW"])
+            rho_nr = cf_out["rho_nr"].detach().cpu().numpy().reshape(nH, nW)
+            rho_post = rho_out.detach().cpu().numpy().reshape(nH, nW)
+            is_b = cf_dev["is_border"].detach().cpu().numpy().reshape(nH, nW).astype(bool)
+            p_rho = os.path.join(diagnostics_dir, f"{stem}_rho.png")
+            viz_infer_rho(rho_nr, rho_post, is_b, p_rho)
+            rho_coll = cf_out["rho_coll"].detach().cpu().numpy().reshape(nH, nW)
+            sur = cf_out["sur"].detach().cpu().numpy().reshape(nH, nW)
+            p_geom = os.path.join(diagnostics_dir, f"{stem}_geometry.png")
+            viz_infer_geometry(rho_coll, sur, is_b, p_geom)
+
     bmap = bmap_t.cpu().numpy()[:H0, :W0]
     theta = theta_t.cpu().numpy()[:H0, :W0]
-    del cf_dev, proj_dev, rho_out, branch, bmap_t, theta_t
+    del cf_dev, proj_dev, rho_out, branch, bmap_t, theta_t, cf_out
     gc.collect()
     return bmap, theta, H0, W0
 
@@ -233,6 +259,11 @@ def main():
     ap.add_argument("--model", default="output/checkpoints/intermediate.pt")
     ap.add_argument("--output_dir", default="output/test")
     ap.add_argument("--device", default=None)
+    ap.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help="Save infer-style diagnostics under output_dir/diagnostics/ ({stem}_rho.png, {stem}_geometry.png).",
+    )
     ap.add_argument(
         "--tol",
         type=float,
@@ -299,6 +330,10 @@ def main():
     for d in list(pred_dirs.values()) + [gt_dir]:
         os.makedirs(d, exist_ok=True)
 
+    diag_dir = os.path.join(args.output_dir, "diagnostics") if args.diagnostics else None
+    if diag_dir:
+        print(f"diagnostics -> {diag_dir}  (<stem>_rho.png, <stem>_geometry.png per image)")
+
     state = {
         m: {
             "per_image": [],
@@ -326,7 +361,11 @@ def main():
     for idx, (stem, img_path, gt_path) in enumerate(pairs):
         t0 = time.perf_counter()
         bmap_c, theta, H0, W0 = run_image_inference(
-            model, img_path, device,
+            model,
+            img_path,
+            device,
+            diagnostics_dir=diag_dir,
+            stem=stem if diag_dir else None,
         )
         bmap_s = ridge_nms(bmap_c, theta=theta)
         gt = _load_gt(gt_path, gt_format)

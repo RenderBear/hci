@@ -31,11 +31,21 @@ L1 = SimpleNamespace(
     EPS=1e-15,
 )
 
-# ── Seed: Naka–Rushton on |Z| only (ρ = |Z|²/(|Z|²+η_z²)) ─────────────────────
+# ── Seed: η_z NR on |Z|, then collinear + surround + divisive readout ─────────
 SEED = SimpleNamespace(
     EPS=1e-9,
-    ETA_Z_INIT=0.30,  # semi-saturation η_z (learned, softplus-positive)
-    # Defaults for ``relative_energy`` diagnostic in infer (Gaussian neighborhood of ρ_total)
+    ETA_Z_INIT=0.30,
+    BETA_SEED_INIT=0.5,
+    BETA_COLL_INIT=0.5,
+    KAPPA_THETA_INIT=2.5,
+    ETA_INIT=0.30,
+    LAMBDA_INIT=0.5,
+    SIGMA_F_INIT=1.3,
+    FACIL_RADIUS=2,
+    FACIL_MODE="collinear",
+    SURROUND_RADIUS=5,
+    SURROUND_SIGMA=2.0,
+    SURROUND_MODE="broadside",
     SURROUND_RADIUS_DIAG=5,
     SURROUND_SIGMA_DIAG=2.0,
 )

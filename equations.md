@@ -8,7 +8,7 @@ This file records the **notation and equations implemented in this repository**:
 
 1. **L0** — RGB directional differences → per-direction min subtraction → independent Naka–Rushton per channel with **fixed** $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ (`L0.ETA_LUM`, `L0.ETA_CHR`) and gain $\gamma$ (`L0.GAMMA`). Produces harmonic stack $s$, magnitudes $h_{1m}, h_{2m}$, split $h_{2m}^{\mathrm{lum}}, h_{2m}^{\mathrm{chr}}$, and complex fields $z_1, z_2$ (`z_from_l0_harmonics`). With **`L0.LEARNED_METRIC`** (default), a **learned** $3\times3$ matrix $W$ (`L0LearnedMetric`) replaces the fixed lum/chr split for distance; L0 is recomputed **live each training step** from cached RGB. Without it, L0 uses the fixed orthonormal lum/chr split and may be precomputed into the disk cache.
 2. **L1** — From L0 pixel field $z_2$, pool over $P\times P$ patches → per-cell $\rho_{\mathrm{total}} = \sum|z_2|$, coherent magnitude $\rho_{\mathrm{peak}} = |\sum z_2|$, orientation $\theta$, and $h_{2m}$-weighted splat anchors. **Runs live** each training step (`run_moments_cells_flat` in `prepare_batch`).
-3. **Seed** (`AndGateSeed` / `ContourSeed`) — Naka–Rushton on coherent magnitude: with $R(c) = \rho_{\mathrm{peak}}(c)\,\mathrm{ok}(c)$, $\rho(c) = R^2/(R^2+\eta_z^2+\varepsilon)$. **Learned** $\eta_z > 0$ (softplus; init `SEED.ETA_Z_INIT`).
+3. **Seed** (`AndGateSeed` / `ContourSeed`) — **(i)** $\rho_{\mathrm{NR}} = R^2/(R^2+\eta_z^2)$ on $R = |Z|\,\mathrm{ok}$ with learned $\eta_z$; **(ii)** collinear readback $\rho_{\mathrm{coll}}$ on $\rho_{\mathrm{NR}}$; **(iii)** excitation $e = \beta_{\mathrm{seed}}\rho_{\mathrm{NR}} + \beta_{\mathrm{coll}}\rho_{\mathrm{coll}}$; surround $S$ of $\rho_{\mathrm{NR}}$; **(iv)** cell export $\rho = e^2/(e^2+\eta^2+\lambda S^2)$ to the renderer (**learned** $\beta_{\mathrm{seed}},\beta_{\mathrm{coll}},\kappa_\theta,\eta,\lambda,\sigma_f$). `cf_out["rho_nr"]` holds stage (i) for diagnostics.
 4. **Renderer** (`ModulationRenderer`) — Cell-grid $\theta$ combing and $\rho$-gated anchor smoothing; **Gaussian-line splat** of $\rho$ to pixels; **splat-footprint coherence** map $\mathrm{coh}(p)$; tangential / normal **9-tap stencils on $\bar\rho$**; **20→12→1** thinning MLP gate:
    $$\hat B(p) = \bar\rho(p)\,\mathrm{gate}(p).$$
 
@@ -115,15 +115,32 @@ Border cells → $0$ on $\rho_{\mathrm{total}}, \rho_{\mathrm{peak}}, \theta$.
 
 ---
 
-## 4. Seed — Naka–Rushton on $|Z|$ (`ContourSeed` / `AndGateSeed`)
+## 4. Seed — η_z NR then collinear + surround (`ContourSeed` / `AndGateSeed`)
 
 Let $R(c) = \rho_{\mathrm{peak}}(c)\,\mathrm{ok}(c) = |Z_2(c)|\,\mathrm{ok}(c)$. Learned $\eta_z > 0$ (softplus; init `SEED.ETA_Z_INIT`):
 
 $$
-\rho(c) = \frac{R(c)^2}{R(c)^2 + \eta_z^2 + \varepsilon}\,\mathrm{ok}(c).
+\rho_{\mathrm{NR}}(c) = \frac{R(c)^2}{R(c)^2 + \eta_z^2 + \varepsilon}\,\mathrm{ok}(c).
 $$
 
-The same $\rho$ is written to `cf_out["rho_seed"]` for diagnostics and passed to the renderer as the cell weight.
+**Collinear readback** on $\rho_{\mathrm{NR}}$ (default `SEED.FACIL_MODE = "collinear"`) yields $\rho_{\mathrm{coll}}$ as in the earlier full seed specification (same $w_\delta$, $a_\kappa$).
+
+**Excitation and surround:**
+
+$$
+e(c) = \beta_{\mathrm{seed}}\,\rho_{\mathrm{NR}}(c) + \beta_{\mathrm{coll}}\,\rho_{\mathrm{coll}}(c), \qquad
+S(c) = \langle\rho_{\mathrm{NR}}\rangle_{\mathcal{N}}(c).
+$$
+
+**Divisive cell export** ($\lambda$ is **not** squared):
+
+$$
+\rho(c) = \frac{e(c)^2}{e(c)^2 + \eta^2 + \lambda\, S(c)^2 + \varepsilon}\,\mathrm{ok}(c).
+$$
+
+The flat tensor returned by `ContourSeed.forward` is $\rho$ (splat input). `cf_out["rho_nr"]` stores $\rho_{\mathrm{NR}}$ for two-row infer diagnostics (`{stem}_rho.png`).
+
+**Learned** (softplus-positive): $\eta_z$, $\beta_{\mathrm{seed}}$, $\beta_{\mathrm{coll}}$, $\kappa_\theta$, $\eta$, $\lambda$, $\sigma_f$. Inits from `params.SEED`.
 
 **Relative energy** (diagnostic only, from $\rho_{\mathrm{total}}$; fixed Gaussian neighborhood in code, `SEED.SURROUND_RADIUS_DIAG` / `SEED.SURROUND_SIGMA_DIAG`):
 
@@ -131,7 +148,7 @@ $$
 E_{\mathrm{rel}}(c) = \frac{\rho_{\mathrm{total}}(c)}{\varepsilon + \langle\rho_{\mathrm{total}}\rangle_{\mathcal{N}}(c)}.
 $$
 
-Border cells → $0$ on $\rho$. **Orientation** $\theta(c)$ is read from L1; the seed does not refine $\theta$.
+Border cells → $0$ on $\rho_{\mathrm{NR}}, \rho$. **Orientation** $\theta(c)$ is read from L1; the seed does not refine $\theta$.
 
 ---
 
@@ -236,7 +253,7 @@ L0 $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ are **fixed** (`params.L0`). Legac
 |-------|----------------|
 | $d_k$, NR, harmonics, $z_1, z_2$, learned $W$, interior mask | `hci/L0.py` |
 | z₂ moments $\rho_{\mathrm{total}}$, $\rho_{\mathrm{peak}}=|Z|$, $\theta$, $h_{2m}$ anchors | `hci/L1.py` |
-| Naka–Rushton $\rho = |Z|^2/(|Z|^2+\eta_z^2)$ | `hci/seed.py` |
+| $\rho_{\mathrm{NR}}$, collinear + surround, cell $\rho$ export | `hci/seed.py` |
 | Splat, footprint $\mathrm{coh}$, stencils, thinning head, NMS | `hci/renderer.py` |
 | Cache, batching, loss, checkpoints | `train.py` |
 | Single-image pipeline, diagnostics | `infer.py`, `hci/diagnostics_viz.py` |

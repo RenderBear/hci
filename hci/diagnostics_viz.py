@@ -542,6 +542,112 @@ def viz_infer_l1_rho_masses(
     )
 
 
+def viz_infer_rho(
+    rho_after_nr: np.ndarray,
+    rho_after_suppress: np.ndarray,
+    is_border: np.ndarray,
+    out_path: str,
+    *,
+    n_bins: int = 50,
+) -> None:
+    """Two rows × (map, histogram, CDF): ρ after η_z NR, then ρ after collinear + surround."""
+    x_max = 1.0
+
+    def _prep(g: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
+        gg = apply_border_zero(np.asarray(g, dtype=np.float64), is_border)
+        ib_g = np.asarray(is_border, dtype=bool)
+        if ib_g.ndim == 1 and gg.ndim == 2:
+            ib_g = ib_g.reshape(gg.shape)
+        flat = gg.ravel()[~ib_g.ravel()]
+        return gg, flat, int(flat.size)
+
+    rows = [
+        (
+            rho_after_nr,
+            r"row 1 — $\rho_{\mathrm{NR}} = |Z|^2/(|Z|^2+\eta_z^2)$ (after $\eta_z$ NR)",
+        ),
+        (
+            rho_after_suppress,
+            r"row 2 — $\rho$ after collinear + surround ($e^2/(e^2+\eta^2+\lambda S^2)$; splat input)",
+        ),
+    ]
+
+    fig = plt.figure(figsize=(14.0, 9.2), facecolor=VIZ.BG)
+    gs = fig.add_gridspec(2, 3, height_ratios=[1.0, 1.0], width_ratios=[2.4, 1.0, 1.0], hspace=0.38, wspace=0.32)
+    cmap = rho_heatmap_cmap()
+
+    for ri, (rho_g, row_title) in enumerate(rows):
+        g, flat, n_cells = _prep(rho_g)
+        m = max(float(np.max(g)), VIZ.EPS)
+
+        ax_m = fig.add_subplot(gs[ri, 0])
+        ax_h = fig.add_subplot(gs[ri, 1])
+        ax_c = fig.add_subplot(gs[ri, 2])
+
+        ax_m.set_facecolor(VIZ.PANEL_BG)
+        ax_m.imshow(
+            np.clip(g / m, 0.0, 1.0),
+            cmap=cmap,
+            vmin=0.0,
+            vmax=1.0,
+            interpolation="nearest",
+        )
+        ax_m.set_title(
+            rf"{row_title} — map  raw max={m:.4g}",
+            fontsize=9,
+            color=VIZ.FG,
+            fontfamily="monospace",
+        )
+        ax_m.axis("off")
+
+        ax_h.set_facecolor(VIZ.PANEL_BG)
+        if n_cells > 0:
+            ax_h.hist(
+                flat,
+                bins=n_bins,
+                range=(0.0, x_max),
+                color=VIZ.ACCENT,
+                edgecolor=VIZ.PANEL_BG,
+                linewidth=0.3,
+            )
+        ax_h.set_xlim(0.0, x_max)
+        ax_h.set_title(
+            rf"interior histogram  n={n_cells}",
+            fontsize=9,
+            color=VIZ.FG,
+            fontfamily="monospace",
+        )
+        ax_h.set_xlabel(r"$\rho$", fontsize=8, color=VIZ.FG)
+        ax_h.set_ylabel("count", fontsize=8, color=VIZ.FG)
+        ax_h.tick_params(colors=VIZ.FG, labelsize=7)
+        for s in ax_h.spines.values():
+            s.set_color(VIZ.ACCENT)
+
+        ax_c.set_facecolor(VIZ.PANEL_BG)
+        if n_cells > 0:
+            xs = np.sort(flat.astype(np.float64, copy=False))
+            ys = np.arange(1, n_cells + 1, dtype=np.float64)
+            ax_c.plot(xs, ys, color=VIZ.FG, linewidth=1.2)
+        ax_c.set_xlim(0.0, x_max)
+        ax_c.set_ylim(0.0, float(max(n_cells, 1)))
+        ax_c.set_title("empirical CDF", fontsize=9, color=VIZ.FG, fontfamily="monospace")
+        ax_c.set_xlabel(r"$\rho$", fontsize=8, color=VIZ.FG)
+        ax_c.set_ylabel("cumulative count", fontsize=8, color=VIZ.FG)
+        ax_c.grid(True, alpha=0.25, color=VIZ.ACCENT)
+        ax_c.tick_params(colors=VIZ.FG, labelsize=7)
+        for s in ax_c.spines.values():
+            s.set_color(VIZ.ACCENT)
+
+    fig.suptitle(
+        r"Cell $\rho$ — NR on $|Z|$ then collinear + surround suppression",
+        fontsize=10,
+        color=VIZ.FG,
+        fontfamily="monospace",
+    )
+    fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
+    plt.close(fig)
+
+
 def viz_infer_cell_rho(
     rho: np.ndarray,
     is_border: np.ndarray,
@@ -549,88 +655,119 @@ def viz_infer_cell_rho(
     *,
     n_bins: int = 50,
 ) -> None:
-    """Cell ρ after seed: Naka–Rushton ρ = |Z|²/(|Z|²+η_z²) ∈ [0,1] (interior map + hist + CDF)."""
-    g = apply_border_zero(np.asarray(rho, dtype=np.float64), is_border)
-    ib = np.asarray(is_border, dtype=bool)
-    if ib.ndim == 1 and g.ndim == 2:
-        ib = ib.reshape(g.shape)
-    flat = g.ravel()[~ib.ravel()]
-    n_cells = int(flat.size)
-    x_max = 1.0
-    suptitle = (
-        r"Cell $\rho = |Z|^2/(|Z|^2+\eta_z^2)$ — Naka–Rushton on coherent $|Z|$ from L1 "
-        r"(learned $\eta_z$; splat uses this $\rho$)"
-    )
-    map_title_key = r"\rho"
+    """Deprecated: use ``viz_infer_rho(rho, rho, ...)`` for a single stage only."""
+    viz_infer_rho(rho, rho, is_border, out_path, n_bins=n_bins)
 
-    fig = plt.figure(figsize=(14.0, 4.6), facecolor=VIZ.BG)
-    gs = fig.add_gridspec(1, 3, width_ratios=[2.4, 1.0, 1.0], wspace=0.32)
-    ax_m = fig.add_subplot(gs[0, 0])
-    ax_h = fig.add_subplot(gs[0, 1])
-    ax_c = fig.add_subplot(gs[0, 2])
 
+def viz_infer_geometry(
+    rho_coll: np.ndarray,
+    surround: np.ndarray,
+    is_border: np.ndarray,
+    out_path: str,
+    *,
+    n_bins: int = 50,
+) -> None:
+    """Two rows × (map, histogram, CDF): collinear readback ρ_coll; surround pool S per cell."""
+    eps = float(VIZ.EPS)
+
+    def _prep(g: np.ndarray) -> tuple[np.ndarray, np.ndarray, int, float]:
+        gg = apply_border_zero(np.asarray(g, dtype=np.float64), is_border)
+        ib_g = np.asarray(is_border, dtype=bool)
+        if ib_g.ndim == 1 and gg.ndim == 2:
+            ib_g = ib_g.reshape(gg.shape)
+        flat = gg.ravel()[~ib_g.ravel()]
+        n_cells = int(flat.size)
+        if n_cells > 0:
+            x_max = max(float(np.max(flat)), eps)
+        else:
+            x_max = 1.0
+        return gg, flat, n_cells, x_max
+
+    rows = [
+        (
+            rho_coll,
+            r"row 1 — $\rho_{\mathrm{coll}}$ (collinear / cocircular facilitation)",
+            r"$\rho_{\mathrm{coll}}$",
+        ),
+        (
+            surround,
+            r"row 2 — $S$ (surround pool; divisive term)",
+            r"$S$",
+        ),
+    ]
+
+    fig = plt.figure(figsize=(14.0, 9.2), facecolor=VIZ.BG)
+    gs = fig.add_gridspec(2, 3, height_ratios=[1.0, 1.0], width_ratios=[2.4, 1.0, 1.0], hspace=0.38, wspace=0.32)
     cmap = rho_heatmap_cmap()
-    m = max(float(np.max(g)), VIZ.EPS)
-    ax_m.set_facecolor(VIZ.PANEL_BG)
-    ax_m.imshow(
-        np.clip(g / m, 0.0, 1.0),
-        cmap=cmap,
-        vmin=0.0,
-        vmax=1.0,
-        interpolation="nearest",
-    )
-    ax_m.set_title(
-        rf"cell ${map_title_key}$  raw max={m:.4g}",
-        fontsize=9,
-        color=VIZ.FG,
-        fontfamily="monospace",
-    )
-    ax_m.axis("off")
 
-    ax_h.set_facecolor(VIZ.PANEL_BG)
-    if n_cells > 0:
-        ax_h.hist(
-            flat,
-            bins=n_bins,
-            range=(0.0, x_max),
-            color=VIZ.ACCENT,
-            edgecolor=VIZ.PANEL_BG,
-            linewidth=0.3,
+    for ri, (rho_g, row_title, xlabel) in enumerate(rows):
+        g, flat, n_cells, x_max = _prep(rho_g)
+        m = max(float(np.max(g)), eps)
+
+        ax_m = fig.add_subplot(gs[ri, 0])
+        ax_h = fig.add_subplot(gs[ri, 1])
+        ax_c = fig.add_subplot(gs[ri, 2])
+
+        ax_m.set_facecolor(VIZ.PANEL_BG)
+        ax_m.imshow(
+            np.clip(g / m, 0.0, 1.0),
+            cmap=cmap,
+            vmin=0.0,
+            vmax=1.0,
+            interpolation="nearest",
         )
-    ax_h.set_xlim(0.0, x_max)
-    ax_h.set_title(
-        rf"interior histogram  n={n_cells}",
-        fontsize=9,
+        ax_m.set_title(
+            rf"{row_title} — map  raw max={m:.4g}",
+            fontsize=9,
+            color=VIZ.FG,
+            fontfamily="monospace",
+        )
+        ax_m.axis("off")
+
+        ax_h.set_facecolor(VIZ.PANEL_BG)
+        if n_cells > 0:
+            ax_h.hist(
+                flat,
+                bins=n_bins,
+                range=(0.0, x_max),
+                color=VIZ.ACCENT,
+                edgecolor=VIZ.PANEL_BG,
+                linewidth=0.3,
+            )
+        ax_h.set_xlim(0.0, x_max)
+        ax_h.set_title(
+            rf"interior histogram  n={n_cells}",
+            fontsize=9,
+            color=VIZ.FG,
+            fontfamily="monospace",
+        )
+        ax_h.set_xlabel(xlabel, fontsize=8, color=VIZ.FG)
+        ax_h.set_ylabel("count", fontsize=8, color=VIZ.FG)
+        ax_h.tick_params(colors=VIZ.FG, labelsize=7)
+        for s in ax_h.spines.values():
+            s.set_color(VIZ.ACCENT)
+
+        ax_c.set_facecolor(VIZ.PANEL_BG)
+        if n_cells > 0:
+            xs = np.sort(flat.astype(np.float64, copy=False))
+            ys = np.arange(1, n_cells + 1, dtype=np.float64)
+            ax_c.plot(xs, ys, color=VIZ.FG, linewidth=1.2)
+        ax_c.set_xlim(0.0, x_max)
+        ax_c.set_ylim(0.0, float(max(n_cells, 1)))
+        ax_c.set_title("empirical CDF", fontsize=9, color=VIZ.FG, fontfamily="monospace")
+        ax_c.set_xlabel(xlabel, fontsize=8, color=VIZ.FG)
+        ax_c.set_ylabel("cumulative count", fontsize=8, color=VIZ.FG)
+        ax_c.grid(True, alpha=0.25, color=VIZ.ACCENT)
+        ax_c.tick_params(colors=VIZ.FG, labelsize=7)
+        for s in ax_c.spines.values():
+            s.set_color(VIZ.ACCENT)
+
+    fig.suptitle(
+        r"Seed geometry — collinear readback $\rho_{\mathrm{coll}}$ and surround pool $S$",
+        fontsize=10,
         color=VIZ.FG,
         fontfamily="monospace",
     )
-    ax_h.set_xlabel(r"$\rho$", fontsize=8, color=VIZ.FG)
-    ax_h.set_ylabel("count", fontsize=8, color=VIZ.FG)
-    ax_h.tick_params(colors=VIZ.FG, labelsize=7)
-    for s in ax_h.spines.values():
-        s.set_color(VIZ.ACCENT)
-
-    ax_c.set_facecolor(VIZ.PANEL_BG)
-    if n_cells > 0:
-        xs = np.sort(flat.astype(np.float64, copy=False))
-        ys = np.arange(1, n_cells + 1, dtype=np.float64)
-        ax_c.plot(xs, ys, color=VIZ.FG, linewidth=1.2)
-    ax_c.set_xlim(0.0, x_max)
-    ax_c.set_ylim(0.0, float(max(n_cells, 1)))
-    ax_c.set_title(
-        "empirical CDF",
-        fontsize=9,
-        color=VIZ.FG,
-        fontfamily="monospace",
-    )
-    ax_c.set_xlabel(r"$\rho$", fontsize=8, color=VIZ.FG)
-    ax_c.set_ylabel("cumulative count", fontsize=8, color=VIZ.FG)
-    ax_c.grid(True, alpha=0.25, color=VIZ.ACCENT)
-    ax_c.tick_params(colors=VIZ.FG, labelsize=7)
-    for s in ax_c.spines.values():
-        s.set_color(VIZ.ACCENT)
-
-    fig.suptitle(suptitle, fontsize=10, color=VIZ.FG, fontfamily="monospace")
     fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
     plt.close(fig)
 

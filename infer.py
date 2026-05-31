@@ -1,6 +1,6 @@
 r"""infer.py — STRIATE single-image inference.
 
-Pipeline: L0 → z₂ moments (|Z|, ρ_total, θ) → Naka–Rushton seed → splat boundary map
+Pipeline: L0 → |Z|, ρ_total, θ → seed (η_z NR, then collinear + surround) → splat boundary map
 ($\hat B = \bar\rho \cdot \mathrm{gate}$), optional ridge NMS along θ,
 then thresholded edge PNG (default τ = 0.5).
 """
@@ -30,7 +30,8 @@ from hci.renderer import (
 from hci.diagnostics_viz import (
     viz_infer_l0_pinwheel,
     viz_infer_l1_rho_masses,
-    viz_infer_cell_rho,
+    viz_infer_rho,
+    viz_infer_geometry,
     save_rho_png,
     viz_infer_shape_readout,
     viz_infer_base_edges_overlay,
@@ -209,6 +210,8 @@ def _infer_seed_and_render(
     dict | None,
     np.ndarray,
     np.ndarray,
+    np.ndarray,
+    np.ndarray,
 ]:
     H0, W0 = prep["H0"], prep["W0"]
     Hp, Wp = prep["Hp"], prep["Wp"]
@@ -257,7 +260,9 @@ def _infer_seed_and_render(
     if apply_ridge_nms:
         bmap = ridge_nms(bmap, theta=theta_map)
     rho_post_grid = rho_out.cpu().numpy().reshape(nH, nW)
-    rho_seed_grid = cf_out["rho_seed"].cpu().numpy().reshape(nH, nW)
+    rho_nr_grid = cf_out["rho_nr"].cpu().numpy().reshape(nH, nW)
+    rho_coll_grid = cf_out["rho_coll"].cpu().numpy().reshape(nH, nW)
+    sur_grid = cf_out["sur"].cpu().numpy().reshape(nH, nW)
     branch_grid = branch.cpu().numpy().reshape(nH, nW)
     supp_nb_np = supp_nb.cpu().numpy().reshape(nH, nW)
     return (
@@ -268,7 +273,9 @@ def _infer_seed_and_render(
         rho_post_grid,
         surface_diags,
         supp_nb_np,
-        rho_seed_grid,
+        rho_nr_grid,
+        rho_coll_grid,
+        sur_grid,
     )
 
 
@@ -289,7 +296,9 @@ def forward_with_diagnostics(
         rho_post_grid,
         surface_diags,
         supp_nb_np,
-        rho_seed_grid,
+        rho_nr_grid,
+        rho_coll_grid,
+        sur_grid,
     ) = _infer_seed_and_render(
         model,
         prep,
@@ -307,7 +316,9 @@ def forward_with_diagnostics(
         prep["is_border_grid"],
         surface_diags,
         supp_nb_np,
-        rho_seed_grid,
+        rho_nr_grid,
+        rho_coll_grid,
+        sur_grid,
         timings,
     )
 
@@ -364,7 +375,8 @@ def main():
         "--diagnostics",
         action="store_true",
         help="Save additional diagnostics: base, l0_pinwheel, l1_moments, "
-        "cell_rho (ρ = |Z|²/(|Z|²+η_z²)), render_softmap, render_theta_bins, overlay.",
+        "rho (row1: η_z NR, row2: after collinear+surround), geometry (ρ_coll, S), "
+        "render_softmap, render_theta_bins, overlay.",
     )
     ap.add_argument(
         "--gt_dir",
@@ -407,7 +419,9 @@ def main():
         is_border,
         diags,
         _,
-        rho_seed,
+        rho_nr,
+        rho_coll,
+        sur,
         fwd_t,
     ) = forward_with_diagnostics(
         model,
@@ -451,9 +465,13 @@ def main():
         )
         saved_files.append(p_rho)
 
-        p_cell = os.path.join(od, f"{stem}_cell_rho.png")
-        viz_infer_cell_rho(rho_seed, is_border, p_cell)
-        saved_files.append(p_cell)
+        p_rho = os.path.join(od, f"{stem}_rho.png")
+        viz_infer_rho(rho_nr, rho_post, is_border, p_rho)
+        saved_files.append(p_rho)
+
+        p_geom = os.path.join(od, f"{stem}_geometry.png")
+        viz_infer_geometry(rho_coll, sur, is_border, p_geom)
+        saved_files.append(p_geom)
 
         gt_arr: np.ndarray | None = None
         if args.gt_dir:
