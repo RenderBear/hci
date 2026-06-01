@@ -3,8 +3,8 @@ r"""train.py — STRIATE training: z₂ moments + association-field seed + harmo
 Pipeline per image: L0 contrast/harmonics (cached) → live z₂ moment pooling each step
 → seed (η_z NR on |Z|, then collinear + surround → cell ρ)
 → splat renderer ($\hat B = \bar\rho \cdot \mathrm{gate}$).
-Loss combines soft-Dice and per-pixel BCE on the same η± valid band
-(target≥η_pos or target<η_neg), weighted by ``--lam_dice`` and ``--lam_bce``
+Loss combines soft-Dice (η± edge band) and HED-style class-balanced BCE
+(soft BSDS targets, all pixels), weighted by ``--lam_dice`` and ``--lam_bce``
 (each can be 0).
 
 Trains on the full train split (no held-out val). Saves `intermediate.pt`
@@ -548,27 +548,30 @@ def soft_dice_loss_with_ignore(
     return 1.0 - dice
 
 
-def bce_loss_with_ignore(
+def bce_loss_balanced(
     pred: torch.Tensor,
     target: torch.Tensor,
-    eta_pos: float = 0.5,
-    eta_neg: float = 0.5,
+    *,
+    pos_threshold: float = 0.5,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Mean BCE on non-ignored pixels (same η± edge band as soft Dice).
+    """HED-style class-balanced BCE on all pixels with soft BSDS targets.
 
-    Valid = (target≥η_pos) ∨ (target<η_neg); label y = 1 on positives, 0 on negatives.
+    Per pixel j (y_j = GT in [0, 1], p_j = prediction):
+      L_j = −[β·y_j·log(p_j) + (1−β)·(1−y_j)·log(1−p_j)]
+    with β = n_neg / n, n_pos = |{j : y_j ≥ pos_threshold}|, n_neg = n − n_pos.
     """
     pred = pred.nan_to_num(0.0).clamp(eps, 1.0 - eps)
-    pos_mask = target >= eta_pos
-    neg_mask = target < eta_neg
-    valid = pos_mask | neg_mask
-    if not valid.any():
-        return pred.sum() * 0.0
-    y = pos_mask.float()
-    v = valid.float()
-    bce = F.binary_cross_entropy(pred, y, reduction="none")
-    return (bce * v).sum() / v.sum().clamp_min(eps)
+    y = target.clamp(0.0, 1.0)
+    n = y.numel()
+    n_pos = (y >= pos_threshold).sum().to(y.dtype)
+    n_neg = n - n_pos
+    if n_pos <= 0 or n_neg <= 0:
+        return F.binary_cross_entropy(pred, y, reduction="mean")
+    beta = n_neg / n
+    one_m_beta = n_pos / n
+    loss = -(beta * y * pred.log() + one_m_beta * (1.0 - y) * (1.0 - pred).log())
+    return loss.mean()
 
 
 def upgrade_model_state_dict(state_dict: dict) -> dict:
@@ -621,7 +624,7 @@ def debug_seed_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
         bmap[:Hg, :Wg], meta["gt"][:Hg, :Wg],
     )
     if lam_bce:
-        loss = loss + lam_bce * bce_loss_with_ignore(
+        loss = loss + lam_bce * bce_loss_balanced(
             bmap[:Hg, :Wg], meta["gt"][:Hg, :Wg],
         )
     loss.backward()
@@ -860,7 +863,7 @@ def main():
         f"$\\hat B = \\bar\\rho \\cdot \\mathrm{{gate}}$"
     )
     print(
-        f"Loss: λ_dice·soft-Dice + λ_bce·BCE (η± edge band)  "
+        f"Loss: λ_dice·soft-Dice (η± band) + λ_bce·balanced BCE (soft GT)  "
         f"λ_dice={args.lam_dice:g}  λ_bce={args.lam_bce:g}"
     )
     if args.lam_dice == 0.0 and args.lam_bce == 0.0:
@@ -962,7 +965,7 @@ def main():
                 bc = bmap[:Hg, :Wg]
                 gc_ = m["gt"][:Hg, :Wg]
                 loss_dice = soft_dice_loss_with_ignore(bc, gc_)
-                loss_bce = bce_loss_with_ignore(bc, gc_)
+                loss_bce = bce_loss_balanced(bc, gc_)
                 dice_sum = loss_dice if dice_sum is None else dice_sum + loss_dice
                 bce_sum = loss_bce if bce_sum is None else bce_sum + loss_bce
             n_bm = len(bmaps)

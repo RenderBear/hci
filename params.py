@@ -81,8 +81,8 @@ TRAIN = SimpleNamespace(
     BATCH_SIZE=4,
     GRAD_CLIP=1.0,
     NUM_WORKERS=2,
-    LAM_DICE=1.0,
-    LAM_BCE=0.0,
+    LAM_DICE=0.0,
+    LAM_BCE=1.0,
     # Bump when L0 / pad / ``l0_pix`` / GT schema changes — not L1 binning or seed.
     L0_CACHE_VERSION=2,
     # Legacy full-cache tag (pre-rho split); kept so old ``.pt`` files are rejected cleanly.
