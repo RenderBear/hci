@@ -44,7 +44,7 @@ from hci.renderer import (
     proj_to_device,
     upgrade_renderer_state_dict,
 )
-from params import L0, L1, SEED, RENDER, TRAIN, VIZ
+from params import L0, L1, SEED, TRAIN, VIZ
 
 
 def build_l0_pix(
@@ -210,17 +210,14 @@ class StriateE2E(nn.Module):
     def __init__(
         self,
         eps: float = SEED.EPS,
-        render_cell_hidden: int = RENDER.CELL_HIDDEN,
-        render_pixel_hidden: int = RENDER.PIXEL_HIDDEN,
         use_l0_metric: bool = L0.LEARNED_METRIC,
         **kw,
     ):
         super().__init__()
-        _ = kw  # absorbs legacy R0_init / a_init / b_init if a caller still passes them
+        _ = kw  # absorbs legacy StriateE2E kwargs if a caller still passes them
         self.l0_metric = L0LearnedMetric() if use_l0_metric else None
         self.seed = AndGateSeed(eps=eps)  # alias → ContourSeed; init from params.SEED
-        _ = render_cell_hidden
-        self.renderer = ModulationRenderer(hidden=render_pixel_hidden)
+        self.renderer = ModulationRenderer()
         self.eps = eps
         self.render_eps = max(float(eps), 1e-6)
 
@@ -897,8 +894,6 @@ def main():
 
     model = StriateE2E(
         eps=SEED.EPS,
-        render_cell_hidden=RENDER.CELL_HIDDEN,
-        render_pixel_hidden=RENDER.PIXEL_HIDDEN,
         use_l0_metric=use_l0_metric,
     ).to(device)
 

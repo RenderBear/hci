@@ -7,8 +7,7 @@ L1 supplies ``rho_peak`` = |Σ z₂| and θ = ½ arg(Σ z₂). With R = |Z|·ok:
   ρ_coll, e, S, then  ρ(c) = e² / (e² + η² + λ·S² + ε) · ok   (learned β, κ_θ, η, λ, σ_f)
 
 ``cf_out`` exposes ``rho_nr`` (row‑1 diagnostics) and the returned flat ``ρ`` is the
-final map for the renderer. ``relative_energy`` uses a fixed diagnostic neighborhood
-of ρ_total (``SURROUND_*_DIAG``).
+final map for the renderer. ``relative_energy`` reuses the same surround neighborhood as the seed readout.
 """
 
 from __future__ import annotations
@@ -25,8 +24,8 @@ except Exception:  # pragma: no cover
     class SEED:  # type: ignore
         EPS = 1e-6
         ETA_Z_INIT = 0.30
-        SURROUND_RADIUS_DIAG = 5
-        SURROUND_SIGMA_DIAG = 2.0
+        SURROUND_RADIUS = 5
+        SURROUND_SIGMA = 2.0
 
 
 _ETA_Z_INIT = float(getattr(SEED, "ETA_Z_INIT", 0.30))
@@ -37,8 +36,8 @@ _ETA_INIT = float(getattr(SEED, "ETA_INIT", 0.30))
 _LAMBDA_INIT = float(getattr(SEED, "LAMBDA_INIT", 0.5))
 _SIGMA_F_INIT = float(getattr(SEED, "SIGMA_F_INIT", 1.3))
 _FACIL_RADIUS = int(getattr(SEED, "FACIL_RADIUS", 2))
-_SURROUND_RADIUS_DIAG = int(getattr(SEED, "SURROUND_RADIUS_DIAG", 5))
-_SURROUND_SIGMA_DIAG = float(getattr(SEED, "SURROUND_SIGMA_DIAG", 2.0))
+_SURROUND_RADIUS = int(getattr(SEED, "SURROUND_RADIUS", 5))
+_SURROUND_SIGMA = float(getattr(SEED, "SURROUND_SIGMA", 2.0))
 
 
 def _inv_softplus(x: float) -> float:
@@ -87,8 +86,8 @@ def relative_energy(
     nW: int,
     eps: float,
     *,
-    radius: int = _SURROUND_RADIUS_DIAG,
-    sigma: float = _SURROUND_SIGMA_DIAG,
+    radius: int = _SURROUND_RADIUS,
+    sigma: float = _SURROUND_SIGMA,
 ) -> torch.Tensor:
     """E_rel(c) = ρ_total / (ε + ⟨ρ_total⟩_𝒩). Diagnostic only (infer prep)."""
     nb = surround_mean(rho_total, nH, nW, radius=radius, sigma=sigma)
@@ -349,8 +348,8 @@ class ContourSeed(nn.Module):
         cf_out["drive"] = Rb
         cf_out["E_rel"] = relative_energy(
             rho_t, nH, nW, eps,
-            radius=_SURROUND_RADIUS_DIAG,
-            sigma=_SURROUND_SIGMA_DIAG,
+            radius=self.surround_radius,
+            sigma=self.surround_sigma,
         )
         cf_out["g_R"] = ((self.beta_seed * rho_nr + self.beta_coll * rho_coll) * ok).reshape(nH, nW)
         cf_out["g_E"] = (S * ok).reshape(nH, nW)

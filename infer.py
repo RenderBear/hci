@@ -16,7 +16,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from params import L0, L1, SEED, RENDER, INFER
+from params import L0, L1, SEED, EVAL, INFER
 from hci.L0 import compute_l0_rgb, compute_interior
 from hci.L1 import z_from_l0_harmonics, pad_for_patch_grid, compute_cell_moments
 from hci.seed import relative_energy
@@ -70,11 +70,7 @@ def _resolve_gt_path(gt_dir: str, stem: str, gt_format: str | None) -> tuple[str
 
 
 def build_model(ckpt, device):
-    m = StriateE2E(
-        eps=SEED.EPS,
-        render_cell_hidden=RENDER.CELL_HIDDEN,
-        render_pixel_hidden=RENDER.PIXEL_HIDDEN,
-    )
+    m = StriateE2E(eps=SEED.EPS)
     sd = upgrade_model_state_dict(ckpt["model_state"])
     sd = upgrade_renderer_state_dict(sd, prefix="renderer.")
     incompatible = m.load_state_dict(sd, strict=False)
@@ -356,10 +352,10 @@ def main():
         "-t",
         "--threshold",
         type=float,
-        default=INFER.DEFAULT_THRESHOLD,
+        default=EVAL.DEFAULT_THRESHOLD,
         help=(
             "Edge threshold on the soft map in [0, 1] "
-            f"(default {INFER.DEFAULT_THRESHOLD})."
+            f"(default {EVAL.DEFAULT_THRESHOLD})."
         ),
     )
     ap.add_argument(

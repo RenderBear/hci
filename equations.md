@@ -142,7 +142,7 @@ The flat tensor returned by `ContourSeed.forward` is $\rho$ (splat input). `cf_o
 
 **Learned** (softplus-positive): $\eta_z$, $\beta_{\mathrm{seed}}$, $\beta_{\mathrm{coll}}$, $\kappa_\theta$, $\eta$, $\lambda$, $\sigma_f$. Inits from `params.SEED`.
 
-**Relative energy** (diagnostic only, from $\rho_{\mathrm{total}}$; fixed Gaussian neighborhood in code, `SEED.SURROUND_RADIUS_DIAG` / `SEED.SURROUND_SIGMA_DIAG`):
+**Relative energy** (diagnostic only, from $\rho_{\mathrm{total}}$; uses `SEED.SURROUND_RADIUS` / `SEED.SURROUND_SIGMA`):
 
 $$
 E_{\mathrm{rel}}(c) = \frac{\rho_{\mathrm{total}}(c)}{\varepsilon + \langle\rho_{\mathrm{total}}\rangle_{\mathcal{N}}(c)}.

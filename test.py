@@ -30,7 +30,7 @@ import torch
 from PIL import Image
 from scipy.ndimage import binary_dilation
 
-from params import L0, L1, SEED, RENDER, TEST
+from params import L0, L1, SEED, EVAL
 from hci.L0 import compute_l0_rgb, compute_interior
 from hci.L1 import z_from_l0_harmonics, pad_for_patch_grid, compute_cell_moments
 from hci.renderer import (
@@ -49,15 +49,11 @@ from train import (
     upgrade_model_state_dict,
 )
 
-EVAL_THRESHOLDS = np.linspace(0.01, 0.99, TEST.THRESHOLD_COUNT)
+EVAL_THRESHOLDS = np.linspace(0.01, 0.99, EVAL.THRESHOLD_COUNT)
 
 
 def build_model(ckpt, device):
-    m = StriateE2E(
-        eps=SEED.EPS,
-        render_cell_hidden=RENDER.CELL_HIDDEN,
-        render_pixel_hidden=RENDER.PIXEL_HIDDEN,
-    )
+    m = StriateE2E(eps=SEED.EPS)
     sd = upgrade_model_state_dict(ckpt["model_state"])
     sd = upgrade_renderer_state_dict(sd, prefix="renderer.")
     incompatible = m.load_state_dict(sd, strict=False)
@@ -67,7 +63,7 @@ def build_model(ckpt, device):
 
 def precision_max_dist(H, W, tol=None):
 
-    d = (0.0075 if tol is None else float(tol)) * float(np.hypot(H, W))
+    d = (EVAL.MAX_DIST_FRAC if tol is None else float(tol)) * float(np.hypot(H, W))
     return max(1, int(round(d)))
 
 
@@ -373,7 +369,7 @@ def main():
         H = min(bmap_c.shape[0], gt.shape[0])
         W = min(bmap_c.shape[1], gt.shape[1])
         bmaps = {"c_eval": bmap_c[:H, :W], "s_eval": bmap_s[:H, :W]}
-        bmap_b = (bmap_s[:H, :W] >= TEST.BISTABLE_THRESHOLD).astype(np.float32)
+        bmap_b = (bmap_s[:H, :W] >= EVAL.DEFAULT_THRESHOLD).astype(np.float32)
         bmaps["b_eval"] = bmap_b
         gt = gt[:H, :W]
 
@@ -432,7 +428,7 @@ def main():
 
         # b_eval: single fixed threshold, no sweep
         b_results = _eval_at_thresholds(
-            bmaps["b_eval"], gt, [TEST.BISTABLE_THRESHOLD], eval_max_dist,
+            bmaps["b_eval"], gt, [EVAL.DEFAULT_THRESHOLD], eval_max_dist,
         )[0]
         b_st = state["b_eval"]
         b_st["agg_tp_p"] += b_results["tp_p"]
@@ -543,7 +539,7 @@ def main():
 
     b_summary = {
         "mode": "b_eval",
-        "threshold": TEST.BISTABLE_THRESHOLD,
+        "threshold": EVAL.DEFAULT_THRESHOLD,
         "F1": b_f1,
         "P": b_prec,
         "R": b_rec,
@@ -562,7 +558,7 @@ def main():
     with open(b_out_path, "w") as f:
         json.dump(b_summary, f, indent=2)
 
-    print(f"[B_EVAL (bistable, t={TEST.BISTABLE_THRESHOLD})]")
+    print(f"[B_EVAL (bistable, t={EVAL.DEFAULT_THRESHOLD})]")
     print(f"  F1={b_f1:.4f}  P={b_prec:.4f}  R={b_rec:.4f}  (fixed threshold, no tuning)")
     print(f"  F1_macro={b_f1_macro:.4f}")
     print(f"  preds -> {pred_dirs['b_eval']}")

@@ -397,9 +397,9 @@ class ModulationRenderer(nn.Module):
     Total: 269 parameters.
     """
 
-    def __init__(self, hidden: int | None = None, **kwargs):
+    def __init__(self, **kwargs):
         super().__init__()
-        _ = (hidden, kwargs)
+        _ = kwargs
         self._sigma_perp_raw = nn.Parameter(
             torch.tensor(_inv_softplus(_SIGMA_PERP_INIT), dtype=torch.float32)
         )
