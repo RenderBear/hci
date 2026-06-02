@@ -1,19 +1,39 @@
-r"""Renderer — anisotropic Gaussian splat + MLP thinning head (paper §2.5).
+r"""Renderer — soft-indicator deposit + noisy-OR aggregation (no suppression).
 
 Pipeline:
   1. Cell grid: ρ-weighted θ combing → ρ-gated anchor smoothing.
-  2. 2D anisotropic Gaussian splat of ρ at z₂ anchors → ρ̄(p) = Σ_c ρ_c φ_c(p).
-  3. Per-pixel feature vector F_p = [ρ̄, coh, tang9, norm9] ∈ R²⁰.
-  4. Thinning head: B̂(p) = ρ̄(p) · σ(W₂ ReLU(W₁ F_p + b₁) + b₂).
-  NMS at inference thins to single-pixel width.
+  2. Per-cell features (6 scalars/cell): own ρ, neighborhood ρ, collinearity,
+     curvature/disagreement, tangent-ρ asymmetry, normal-ρ asymmetry.
+  3. MLP (6 → 16 → 7) emits basis weights w_k per cell.
+  4. Each active cell produces a soft-indicator m_c(p) over a (2H+1)² patch:
+        m_c(p) = exp(Σ_k w_k b_k(s,n) − max_p ...)  ∈ [0, 1],   max_p m_c = 1.
+     (s, n) is the patch pixel in cell-tangent frame (half-width units).
+  5. Per-cell claim c_c(p) = ρ_c · m_c(p) ∈ [0, 1].
+  6. Output via noisy-OR of independent claims:
+        B̂(p) = 1 − ∏_c (1 − c_c(p)).
+     The renderer applies no suppression; precision lives at the seed.
 
-Learned: σ⊥, σ∥ (splat widths), s_t and s_n (stencil spacings),
-         MLP 20→12→1 (265 params).  Total: 269 scalars.
+Why soft-indicator not sum-normalized:
+    Sum-normalize (Σ_p m_c = 1) is exactly conservative but spreads ρ_c=1 over
+    the cell's full footprint → per-pixel values fall to ~1/|footprint| ≈ 0.01,
+    below any NMS threshold.  Soft-indicator + noisy-OR makes ρ_c=1 mean "edge
+    passes through my claimed pixel at confidence 1" and combines overlapping
+    claims probabilistically.  Renderer remains a pure depositor.
+
+Gestalt basis b_0..b_6 in cell-local coords (s = tangent, n = normal):
+  b_0 = 0                         # uniform claim (flat after max-normalize)
+  b_1 = -n²                        # line along edge
+  b_2 = -s²                        # dot localized in tangent
+  b_3 = -(s² + n²)                # round blob
+  b_4 = s                          # forward bias (MLP can output ±)
+  b_5 = -(n - κ₀ s²)²              # curve A
+  b_6 = -(n + κ₀ s²)²              # curve B
 """
 
 from __future__ import annotations
 
 import math
+from typing import Optional
 
 import numpy as np
 from scipy import ndimage
@@ -28,11 +48,28 @@ from params import RENDER
 # Defaults
 # ═══════════════════════════════════════════════════════════════
 
-_SIGMA_PERP_INIT = getattr(RENDER, "SIGMA_PERP_INIT", 1.5)
-_SIGMA_PERP_MAX = getattr(RENDER, "SIGMA_PERP_MAX", 8.0)
-_SIGMA_PAR_INIT = getattr(RENDER, "SIGMA_PAR_INIT", 2.0)
-_SIGMA_PAR_MAX = getattr(RENDER, "SIGMA_PAR_MAX", 32.0)
-_SPLAT_RADIUS_SIGMAS = getattr(RENDER, "SPLAT_RADIUS_SIGMAS", 3.0)
+# Deposit footprint: half-width in pixels = ceil(DEPOSIT_HALF_WIDTH_STRIDES * S)
+_DEPOSIT_HALF_WIDTH_STRIDES = float(getattr(RENDER, "DEPOSIT_HALF_WIDTH_STRIDES", 2.0))
+_DEPOSIT_HALF_WIDTH_MIN = int(getattr(RENDER, "DEPOSIT_HALF_WIDTH_MIN", 4))
+_DEPOSIT_HALF_WIDTH_MAX = int(getattr(RENDER, "DEPOSIT_HALF_WIDTH_MAX", 24))
+
+_FEATURE_DIM = 6
+_BASIS_DIM = 7
+_HIDDEN_DIM = int(getattr(RENDER, "DEPOSIT_HIDDEN", 16))
+
+# Curvature shape parameter for curve basis (in normalized cell-frame coords)
+_BASIS_KAPPA = float(getattr(RENDER, "BASIS_KAPPA", 0.5))
+
+# Init priors for basis MLP output bias (favor "line" deposit at t=0)
+_BASIS_INIT_BIAS = {
+    0: 0.0,   # uniform
+    1: 5.0,   # line  ← dominant at init
+    2: 0.0,   # dot
+    3: 0.0,   # blob
+    4: 0.0,   # forward bias
+    5: 0.0,   # curve A
+    6: 0.0,   # curve B
+}
 
 
 def _inv_softplus(x: float) -> float:
@@ -40,7 +77,7 @@ def _inv_softplus(x: float) -> float:
 
 
 # ═══════════════════════════════════════════════════════════════
-# Cell-grid smoothing
+# Cell-grid smoothing (unchanged from prior renderer)
 # ═══════════════════════════════════════════════════════════════
 
 def _smooth_theta_rho_double_angle(
@@ -54,7 +91,7 @@ def _smooth_theta_rho_double_angle(
     th, rh, ib = theta, rho, is_border
     pad = lambda t: F.pad(t[None, None], (1, 1, 1, 1)).squeeze(0).squeeze(0)
     for _ in range(int(n_passes)):
-        th_p, rh_p = pad(th), pad(rh)
+        rh_p = pad(rh)
         u_p = pad(rh * torch.cos(2.0 * th))
         v_p = pad(rh * torch.sin(2.0 * th))
         su = torch.zeros_like(th)
@@ -102,288 +139,279 @@ def _smooth_anchors_rho_gated(
 
 
 # ═══════════════════════════════════════════════════════════════
-# Anisotropic 2D Gaussian splat (vectorized scatter_add)
+# Per-cell features for the deposit MLP
 # ═══════════════════════════════════════════════════════════════
 
-def _aniso_kernel_phi(
-    ox: torch.Tensor,
-    oy: torch.Tensor,
-    cos_a: torch.Tensor,
-    sin_a: torch.Tensor,
-    sig_perp: torch.Tensor,
-    sig_par: torch.Tensor,
-    eps: float,
+def _per_cell_features(
+    rho_g: torch.Tensor,        # (nH, nW)
+    theta_g: torch.Tensor,      # (nH, nW)  smoothed
+    ib_g: torch.Tensor,         # (nH, nW)  bool
+    eps: float = 1e-6,
 ) -> torch.Tensor:
-    """φ = exp(−d⊥²/2σ⊥² − d∥²/2σ∥²) with offsets (ox, oy) from anchor to pixel."""
-    d_perp = ox.unsqueeze(0) * cos_a.unsqueeze(1) - oy.unsqueeze(0) * sin_a.unsqueeze(1)
-    d_par = ox.unsqueeze(0) * sin_a.unsqueeze(1) + oy.unsqueeze(0) * cos_a.unsqueeze(1)
-    return torch.exp(
-        -d_perp * d_perp / (2.0 * sig_perp * sig_perp + eps)
-        - d_par * d_par / (2.0 * sig_par * sig_par + eps)
-    )
+    """6 scalar features per cell, computed via 3×3 neighborhood operations.
+
+      f0: ρ_c
+      f1: <ρ>_N                                  (3×3 neighborhood mean, excl. self)
+      f2: <ρ cos(2(θ_nbr - θ_c))>_N / <ρ>_N      collinearity (+1 = aligned)
+      f3: |<ρ sin(2(θ_nbr - θ_c))>_N| / <ρ>_N    disagreement magnitude
+      f4: <ρ (Δ·t̂_c)>_N / <ρ>_N                  tangent asymmetry of ρ
+      f5: <ρ (Δ·n̂_c)>_N / <ρ>_N                  normal asymmetry of ρ
+    """
+    nH, nW = rho_g.shape
+
+    cos_t = torch.cos(theta_g)
+    sin_t = torch.sin(theta_g)
+    # Tangent t̂ = (cos θ, sin θ); normal n̂ = (-sin θ, cos θ)  in (x, y) = (col, row).
+
+    cos2 = torch.cos(2.0 * theta_g)
+    sin2 = torch.sin(2.0 * theta_g)
+
+    def _pad0(t: torch.Tensor) -> torch.Tensor:
+        return F.pad(t[None, None], (1, 1, 1, 1), value=0.0).squeeze(0).squeeze(0)
+
+    rho_p  = _pad0(rho_g)
+    rcos_p = _pad0(rho_g * cos2)
+    rsin_p = _pad0(rho_g * sin2)
+
+    sum_rho   = torch.zeros_like(rho_g)
+    sum_rcos  = torch.zeros_like(rho_g)
+    sum_rsin  = torch.zeros_like(rho_g)
+    sum_rho_t = torch.zeros_like(rho_g)
+    sum_rho_n = torch.zeros_like(rho_g)
+
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dy == 0 and dx == 0:
+                continue
+            sl = (slice(1 + dy, 1 + dy + nH), slice(1 + dx, 1 + dx + nW))
+            rn = rho_p[sl]
+            sum_rho  += rn
+            sum_rcos += rcos_p[sl]
+            sum_rsin += rsin_p[sl]
+            # Neighbor offset direction in (x, y) = (col, row): (dx, dy).
+            proj_t =  float(dx) * cos_t + float(dy) * sin_t
+            proj_n = -float(dx) * sin_t + float(dy) * cos_t
+            sum_rho_t += rn * proj_t
+            sum_rho_n += rn * proj_n
+
+    # Soft floor so empty-neighborhood cells produce 0-valued (not 1e6-scale)
+    # features. With sum_rho ∈ [0, ~1] typically, soft=5e-2 caps inv_w at 20 and
+    # smoothly suppresses ratios when fewer than ~0.05 worth of neighbor ρ is
+    # present. Critical for forward numerical stability of the MLP / softmax.
+    soft = 5e-2
+    inv_w = 1.0 / (sum_rho + soft)
+
+    # Rotate neighborhood phasor by -2θ_c:
+    #   Σ ρ cos(2(θ_n - θ_c)) = sum_rcos · cos2_c + sum_rsin · sin2_c
+    #   Σ ρ sin(2(θ_n - θ_c)) = sum_rsin · cos2_c - sum_rcos · sin2_c
+    coh_num  = sum_rcos * cos2 + sum_rsin * sin2
+    anti_num = sum_rsin * cos2 - sum_rcos * sin2
+
+    mean_rho = sum_rho * (1.0 / 8.0)
+    coh    = coh_num  * inv_w
+    anti   = torch.abs(anti_num) * inv_w
+    asym_t = sum_rho_t * inv_w
+    asym_n = sum_rho_n * inv_w
+
+    use = (~ib_g).to(dtype=rho_g.dtype)
+    mean_rho = mean_rho * use
+    coh      = coh      * use
+    anti     = anti     * use
+    asym_t   = asym_t   * use
+    asym_n   = asym_n   * use
+
+    feats = torch.stack([rho_g, mean_rho, coh, anti, asym_t, asym_n], dim=-1)
+    return feats.reshape(-1, _FEATURE_DIM)
 
 
-def _splat_footprint_radius(sig_perp: torch.Tensor, sig_par: torch.Tensor, S: int) -> int:
-    sp = float(sig_perp.detach().clamp(min=0.3, max=_SIGMA_PERP_MAX))
-    sa = float(sig_par.detach().clamp(min=0.3, max=_SIGMA_PAR_MAX))
-    r = max(
-        int(math.ceil(_SPLAT_RADIUS_SIGMAS * sp)),
-        int(math.ceil(_SPLAT_RADIUS_SIGMAS * sa)),
-        int(math.ceil(_SPLAT_RADIUS_SIGMAS * S)),
-        1,
-    )
-    return r
+# ═══════════════════════════════════════════════════════════════
+# Conservative deposit
+# ═══════════════════════════════════════════════════════════════
+
+def _deposit_half_width(S: int) -> int:
+    h = int(math.ceil(_DEPOSIT_HALF_WIDTH_STRIDES * max(S, 1)))
+    return max(_DEPOSIT_HALF_WIDTH_MIN, min(_DEPOSIT_HALF_WIDTH_MAX, h))
 
 
-def _anisotropic_gaussian_splat(
-    values: torch.Tensor,
-    cx: torch.Tensor, cy: torch.Tensor,
-    theta: torch.Tensor, is_border: torch.Tensor,
-    sigma_perp: torch.Tensor,
-    sigma_par: torch.Tensor,
-    H: int, W: int, S: int,
-    radius_sigmas: float = _SPLAT_RADIUS_SIGMAS,
+def _compute_basis(s: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
+    """Evaluate 7 basis functions at patch pixels.
+
+    s, n: (A, P) cell-frame coordinates, normalized to half-width units
+          (so |s|, |n| ≲ 1 within the deposit window).
+    Returns: (A, P, 7).
+    """
+    s2 = s * s
+    n2 = n * n
+    kappa = _BASIS_KAPPA
+
+    b0 = torch.zeros_like(s)                    # uniform
+    b1 = -n2                                     # line along tangent
+    b2 = -s2                                     # dot in tangent direction
+    b3 = -(s2 + n2)                              # round blob
+    b4 = s                                       # forward bias
+    b5 = -(n - kappa * s2).pow(2)                # curve A
+    b6 = -(n + kappa * s2).pow(2)                # curve B
+    return torch.stack([b0, b1, b2, b3, b4, b5, b6], dim=-1)
+
+
+def _conservative_deposit(
+    rho_active: torch.Tensor,      # (A,)  ρ_c for active cells (grad-bearing from seed)
+    cx_active: torch.Tensor,       # (A,)  anchor x (detached)
+    cy_active: torch.Tensor,       # (A,)  anchor y (detached)
+    theta_active: torch.Tensor,    # (A,)  tangent angle (detached)
+    basis_w: torch.Tensor,         # (A, 7) basis weights from MLP
+    H: int, W: int, half_w: int,
     eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Deposit ρ̄ = Σ_c ρ_c φ_c; θ★ = scatter-max argmax ρ_c φ_c.
+    """Per-cell soft-indicator deposit + noisy-OR aggregation.
 
-    φ_c is a finite 2D anisotropic Gaussian centered at anchor (c_x, c_y).
+    Per cell c, the patch-pixel mass is normalized to **peak at 1**, not to **sum to 1**:
+
+        m_c(p) = exp(ℓ_c(p) − max_p ℓ_c(p))  ∈ [0, 1],   max_p m_c(p) = 1.
+
+    The cell's per-pixel **claim** is c_c(p) = ρ_c · m_c(p) ∈ [0, 1].  Pixel-wise
+    aggregation is **noisy-OR** over independent claims:
+
+        B̂(p) = 1 − ∏_c (1 − c_c(p))   =   1 − exp(Σ_c log(1 − c_c(p))).
+
+    Why this and not the sum/softmax (Σ_p m_c = 1) form:
+      The sum-normalized form spreads ρ_c=1 over the cell's footprint, so per-pixel
+      values fall to ~1/|footprint| ≈ 0.01 — below any NMS threshold.  Soft-indicator
+      + noisy-OR makes ρ_c=1 mean "edge passes through my claimed pixel at confidence 1"
+      and combines overlapping claims probabilistically (two cells at ρ=0.5 → 0.75; two
+      collinear cells at ρ=1 → 1).  The renderer still applies no suppression —
+      precision still comes from upstream (the seed); the renderer only places mass.
+
+    Returns:
+        bmap: (H, W) ∈ [0, 1]   — pixel-wise noisy-OR of all cell claims.
+        theta_star: (H, W)       — tangent angle of the dominant claimant per pixel
+                                  (used for inference-time NMS).
     """
-    _ = radius_sigmas
-    device, dtype = values.device, values.dtype
-    sig_perp = sigma_perp.to(dtype=dtype, device=device).clamp(
-        min=0.3, max=_SIGMA_PERP_MAX,
-    )
-    sig_par = sigma_par.to(dtype=dtype, device=device).clamp(
-        min=0.3, max=_SIGMA_PAR_MAX,
-    )
-    foot_r = _splat_footprint_radius(sig_perp, sig_par, S)
-    cut_perp = _SPLAT_RADIUS_SIGMAS * sig_perp
-    cut_par = _SPLAT_RADIUS_SIGMAS * sig_par
+    A = rho_active.shape[0]
+    device, dtype = rho_active.device, rho_active.dtype
+    n_pix = H * W
 
-    active = (~is_border) & (values.abs() > eps)
-    active_idx = active.nonzero(as_tuple=True)[0]
-    A = active_idx.shape[0]
     if A == 0:
         z = torch.zeros(H, W, device=device, dtype=dtype)
         return z, z
 
-    val_a = values[active_idx]
-    cx_a, cy_a = cx[active_idx], cy[active_idx]
-    cos_a = torch.cos(theta[active_idx])
-    sin_a = torch.sin(theta[active_idx])
-    th_a = theta[active_idx]
-
-    offsets = torch.arange(-foot_r, foot_r + 1, device=device, dtype=dtype)
-    oy, ox = torch.meshgrid(offsets, offsets, indexing="ij")
-    oy, ox = oy.reshape(-1), ox.reshape(-1)
+    # Patch offsets (oy, ox) in pixel units; flatten to (P,).
+    offsets = torch.arange(-half_w, half_w + 1, device=device, dtype=dtype)
+    oy_g, ox_g = torch.meshgrid(offsets, offsets, indexing="ij")
+    oy = oy_g.reshape(-1)
+    ox = ox_g.reshape(-1)
     P = oy.shape[0]
-    n_pix = H * W
 
-    sum_rho_phi = torch.zeros(n_pix, device=device, dtype=dtype)
-    max_rho_phi = torch.full((n_pix,), -1.0, device=device, dtype=dtype)
+    inv_hw = 1.0 / float(max(half_w, 1))
+
+    # Process in batches to bound peak memory.
+    max_batch = max(1, 4_000_000 // P)
+
+    # Noisy-OR accumulator: Σ_c log(1 − claim_c(p)).  Starts at 0 → bmap(p)=0.
+    log_neg_acc = torch.zeros(n_pix, device=device, dtype=dtype)
+
+    # Track max-claim per pixel for θ★ (used for ridge NMS at inference).
+    max_claim = torch.full((n_pix,), -1.0, device=device, dtype=torch.float32)
     theta_star = torch.zeros(n_pix, device=device, dtype=dtype)
 
-    max_batch = max(1, 4_000_000 // P)
+    # Clamp ρ to [0, 1−ε_clip] for log-stability of log1p(−claim).
+    # The seed's divisive readout ρ = e²/(e²+η²+λS²+ε) is already in [0, 1] but a
+    # rare cell can come in slightly above due to numerical noise.
+    _CLIP = 1.0 - 1e-5
+    rho_clamped = rho_active.clamp(min=0.0, max=_CLIP)
+
     for b0 in range(0, A, max_batch):
         b1 = min(b0 + max_batch, A)
-        py_b = cy_a[b0:b1].unsqueeze(1) + oy.unsqueeze(0)
-        px_b = cx_a[b0:b1].unsqueeze(1) + ox.unsqueeze(0)
-        d_perp = ox.unsqueeze(0) * cos_a[b0:b1].unsqueeze(1) - oy.unsqueeze(0) * sin_a[b0:b1].unsqueeze(1)
-        d_par = ox.unsqueeze(0) * sin_a[b0:b1].unsqueeze(1) + oy.unsqueeze(0) * cos_a[b0:b1].unsqueeze(1)
-        in_bounds = (
-            (py_b >= 0) & (py_b < H) & (px_b >= 0) & (px_b < W)
-            & (d_perp.abs() <= cut_perp) & (d_par.abs() <= cut_par)
-        )
-        phi = _aniso_kernel_phi(
-            ox, oy, cos_a[b0:b1], sin_a[b0:b1], sig_perp, sig_par, eps,
-        ) * in_bounds.to(dtype=dtype)
-        flat_idx = (py_b.long() * W + px_b.long()).clamp(0, n_pix - 1)
+        bs = b1 - b0
 
-        rho_phi = val_a[b0:b1].unsqueeze(1) * phi
-        sum_rho_phi.scatter_add_(0, flat_idx.reshape(-1), rho_phi.reshape(-1))
+        # Cell-frame coordinates of each patch pixel, normalized to [-1, 1]²
+        cos_a = torch.cos(theta_active[b0:b1]).unsqueeze(1)   # (bs, 1)
+        sin_a = torch.sin(theta_active[b0:b1]).unsqueeze(1)
+        s_loc = (ox.unsqueeze(0) * cos_a + oy.unsqueeze(0) * sin_a) * inv_hw   # (bs, P)
+        n_loc = (-ox.unsqueeze(0) * sin_a + oy.unsqueeze(0) * cos_a) * inv_hw
 
-        th_expand = th_a[b0:b1].unsqueeze(1).expand_as(rho_phi)
-        rp_flat = rho_phi.reshape(-1)
-        th_flat = th_expand.reshape(-1)
-        fi_flat = flat_idx.reshape(-1)
-        update = rp_flat > max_rho_phi[fi_flat]
-        update_idx = fi_flat[update]
-        if update_idx.numel() > 0:
-            max_rho_phi[update_idx] = rp_flat[update]
-            theta_star[update_idx] = th_flat[update]
+        basis = _compute_basis(s_loc, n_loc)                  # (bs, P, 7)
+        logits = (basis * basis_w[b0:b1].unsqueeze(1)).sum(dim=-1)   # (bs, P)
 
-    return sum_rho_phi.reshape(H, W), theta_star.reshape(H, W)
+        # Pixel coordinates and bounds mask.
+        py = cy_active[b0:b1].unsqueeze(1) + oy.unsqueeze(0)   # (bs, P)
+        px = cx_active[b0:b1].unsqueeze(1) + ox.unsqueeze(0)
+        in_bounds = (py >= 0) & (py < H) & (px >= 0) & (px < W)
 
+        # Soft-max-normalize: mass peaks at 1 (not Σ = 1).
+        # Mask OOB to −∞ so they don't influence the max or contribute to the deposit.
+        logits = torch.where(in_bounds, logits, torch.full_like(logits, -1e9))
+        logits_max = logits.max(dim=1, keepdim=True).values
+        mass = torch.exp(logits - logits_max) * in_bounds.to(dtype=dtype)   # (bs, P), in [0, 1]
 
-# ═══════════════════════════════════════════════════════════════
-# Bilinear sampling for stencil taps
-# ═══════════════════════════════════════════════════════════════
+        # Per-cell claim, clipped strictly below 1 for log1p stability.
+        claim = (rho_clamped[b0:b1].unsqueeze(1) * mass).clamp(min=0.0, max=_CLIP)
 
-def _bilinear_sample_2d(
-    field: torch.Tensor, row: torch.Tensor, col: torch.Tensor,
-) -> torch.Tensor:
-    H, W = field.shape
-    r = row.reshape(1, 1, -1, 1)
-    c = col.reshape(1, 1, -1, 1)
-    gx = 2.0 * c / max(W - 1, 1) - 1.0
-    gy = 2.0 * r / max(H - 1, 1) - 1.0
-    grid = torch.cat([gx, gy], dim=-1)
-    out = F.grid_sample(field.reshape(1, 1, H, W), grid,
-                        mode="bilinear", padding_mode="border", align_corners=True)
-    return out.reshape(row.shape)
+        # log(1 − claim) ∈ (−∞, 0]; OOB pixels have claim=0 → log_neg=0 (additive identity).
+        log_neg = torch.log1p(-claim)
 
+        flat_idx = (py.long().clamp(0, H - 1) * W + px.long().clamp(0, W - 1))
+        flat_idx_v = flat_idx.reshape(-1)
+        log_neg_v = log_neg.reshape(-1)
 
-def _sample_stencil_9(
-    field: torch.Tensor,
-    theta: torch.Tensor,
-    spacing: torch.Tensor,
-    direction: str,
-    eps: float = 1e-6,
-) -> torch.Tensor:
-    """9-tap stencil along tangent or normal (j ∈ {-4,…,4}). Returns (H, W, 9)."""
-    _ = eps
-    H, W = field.shape
-    device, dtype = field.device, field.dtype
-    rows = torch.arange(H, device=device, dtype=dtype).unsqueeze(1).expand(H, W)
-    cols = torch.arange(W, device=device, dtype=dtype).unsqueeze(0).expand(H, W)
-    sp = spacing.to(dtype=dtype, device=device)
-    if direction == "tangent":
-        dr, dc = torch.cos(theta), torch.sin(theta)
-    else:  # normal
-        dr, dc = -torch.sin(theta), torch.cos(theta)
-    taps = []
-    for k in range(-4, 5):
-        r_off = rows + k * sp * dr
-        c_off = cols + k * sp * dc
-        taps.append(_bilinear_sample_2d(field, r_off, c_off))
-    return torch.stack(taps, dim=-1)
+        log_neg_acc.scatter_add_(0, flat_idx_v, log_neg_v)
+
+        # Track dominant cell per pixel by max claim (for θ★).  Race conditions within
+        # a batch may lose ties, but the dominant cell at most pixels wins by a margin.
+        claim_max_v = claim.detach().to(torch.float32).reshape(-1)
+        cur = max_claim[flat_idx_v]
+        upd = claim_max_v > cur
+        if upd.any():
+            upd_idx = flat_idx_v[upd]
+            max_claim[upd_idx] = claim_max_v[upd]
+            th_expand = theta_active[b0:b1].unsqueeze(1).expand(bs, P).reshape(-1)
+            theta_star[upd_idx] = th_expand[upd].to(dtype=dtype)
+
+    # Noisy-OR readout: B̂(p) = 1 − exp(Σ_c log(1−claim)) = −expm1(accumulator).
+    bmap = -torch.expm1(log_neg_acc)   # in [0, 1]
+    return bmap.reshape(H, W), theta_star.reshape(H, W)
 
 
 # ═══════════════════════════════════════════════════════════════
-# Coherence diagnostic
+# Basis MLP
 # ═══════════════════════════════════════════════════════════════
 
-def _compute_coherence(
-    rho_bar: torch.Tensor,
-    theta_star: torch.Tensor,
-    values: torch.Tensor,
-    cx: torch.Tensor, cy: torch.Tensor,
-    theta: torch.Tensor, is_border: torch.Tensor,
-    sigma_perp: torch.Tensor,
-    sigma_par: torch.Tensor,
-    H: int, W: int, S: int,
-    eps: float = 1e-6,
-) -> torch.Tensor:
-    """coh(p) = Σ_c ρ_c φ_c cos²(θ_c − θ★) / (Σ_c ρ_c φ_c + ε)."""
-    _ = rho_bar
-    device, dtype = values.device, values.dtype
-    sig_perp = sigma_perp.to(dtype=dtype, device=device).clamp(
-        min=0.3, max=_SIGMA_PERP_MAX,
-    )
-    sig_par = sigma_par.to(dtype=dtype, device=device).clamp(
-        min=0.3, max=_SIGMA_PAR_MAX,
-    )
-    foot_r = _splat_footprint_radius(sig_perp, sig_par, S)
-    cut_perp = _SPLAT_RADIUS_SIGMAS * sig_perp
-    cut_par = _SPLAT_RADIUS_SIGMAS * sig_par
+class DepositMLP(nn.Module):
+    """6 → 16 → 7 MLP producing basis weights per cell.
 
-    active = (~is_border) & (values.abs() > eps)
-    active_idx = active.nonzero(as_tuple=True)[0]
-    A = active_idx.shape[0]
-    if A == 0:
-        return torch.zeros(H, W, device=device, dtype=dtype)
-
-    val_a = values[active_idx]
-    cx_a, cy_a = cx[active_idx], cy[active_idx]
-    cos_a = torch.cos(theta[active_idx])
-    sin_a = torch.sin(theta[active_idx])
-    th_a = theta[active_idx]
-
-    offsets = torch.arange(-foot_r, foot_r + 1, device=device, dtype=dtype)
-    oy, ox = torch.meshgrid(offsets, offsets, indexing="ij")
-    oy, ox = oy.reshape(-1), ox.reshape(-1)
-    P = oy.shape[0]
-    n_pix = H * W
-
-    sum_rho_cos2 = torch.zeros(n_pix, device=device, dtype=dtype)
-    sum_rho = torch.zeros(n_pix, device=device, dtype=dtype)
-
-    max_batch = max(1, 4_000_000 // P)
-    for b0 in range(0, A, max_batch):
-        b1 = min(b0 + max_batch, A)
-        py_b = cy_a[b0:b1].unsqueeze(1) + oy.unsqueeze(0)
-        px_b = cx_a[b0:b1].unsqueeze(1) + ox.unsqueeze(0)
-        d_perp = ox.unsqueeze(0) * cos_a[b0:b1].unsqueeze(1) - oy.unsqueeze(0) * sin_a[b0:b1].unsqueeze(1)
-        d_par = ox.unsqueeze(0) * sin_a[b0:b1].unsqueeze(1) + oy.unsqueeze(0) * cos_a[b0:b1].unsqueeze(1)
-        in_bounds = (
-            (py_b >= 0) & (py_b < H) & (px_b >= 0) & (px_b < W)
-            & (d_perp.abs() <= cut_perp) & (d_par.abs() <= cut_par)
-        )
-        phi = _aniso_kernel_phi(
-            ox, oy, cos_a[b0:b1], sin_a[b0:b1], sig_perp, sig_par, eps,
-        ) * in_bounds.to(dtype=dtype)
-        flat_idx = (py_b.long() * W + px_b.long()).clamp(0, n_pix - 1)
-
-        th_star_at_pix = theta_star.reshape(-1)[flat_idx]
-        cos2_diff = torch.cos(th_a[b0:b1].unsqueeze(1) - th_star_at_pix).pow(2)
-
-        rho_phi = val_a[b0:b1].unsqueeze(1) * phi
-        sum_rho_cos2.scatter_add_(0, flat_idx.reshape(-1), (rho_phi * cos2_diff).reshape(-1))
-        sum_rho.scatter_add_(0, flat_idx.reshape(-1), rho_phi.reshape(-1))
-
-    return (sum_rho_cos2 / (sum_rho + eps)).reshape(H, W)
-
-
-# Feature layout: [ρ̄, coh, tang_{-4}…tang_4, norm_{-4}…norm_4] ∈ R^20
-_FEAT_DIM = int(getattr(RENDER, "THINNING_IN", 20))
-_TANG_SLICE = slice(2, 11)
-_NORM_SLICE = slice(11, 20)
-_THIN_HIDDEN = int(getattr(RENDER, "THINNING_HIDDEN", 12))
-
-
-# ═══════════════════════════════════════════════════════════════
-# Thinning head (20 → 12 → 1 MLP)
-# ═══════════════════════════════════════════════════════════════
-
-class ThinningHead(nn.Module):
-    """20→12→1 MLP: σ(W₂ ReLU(W₁ F + b₁) + b₂).
-
-    F = [ρ̄, coh, tang9(9), norm9(9)] ∈ R²⁰.
-    Initialised with structural priors per spec.
+    Init: fc1 small-Gaussian, fc2.weight zero, fc2.bias set so basis-1 ("line")
+    dominates at t = 0 → renderer starts as a Gaussian-line-shaped deposit.
     """
 
     def __init__(
         self,
-        in_dim: int = _FEAT_DIM,
-        hidden_dim: int = _THIN_HIDDEN,
+        in_dim: int = _FEATURE_DIM,
+        hidden_dim: int = _HIDDEN_DIM,
+        out_dim: int = _BASIS_DIM,
     ):
         super().__init__()
         self.fc1 = nn.Linear(in_dim, hidden_dim, bias=True)
-        self.fc2 = nn.Linear(hidden_dim, 1, bias=True)
+        self.fc2 = nn.Linear(hidden_dim, out_dim, bias=True)
         self._init_priors()
 
     def _init_priors(self) -> None:
+        # fc1: standard ReLU init (Kaiming) so the hidden layer activates from t = 0.
+        # fc2: SMALL Gaussian (not zero) so features influence the output immediately
+        #      — bias still dominates (line prior), but fc1.weight receives gradient
+        #      from the first backward pass instead of being dead until fc2.weight
+        #      itself starts moving.
         with torch.no_grad():
-            self.fc1.weight.zero_()
+            nn.init.kaiming_uniform_(self.fc1.weight, a=math.sqrt(5))
             self.fc1.bias.zero_()
-            self.fc2.weight.zero_()
-
-            # Unit 0: Mexican-hat on norm9 (non-max suppression)
-            mex_hat = torch.full((9,), -0.25)
-            mex_hat[4] = 1.0
-            self.fc1.weight[0, _NORM_SLICE] = mex_hat
-
-            # Unit 1: flat 1/9 on tang9 (along-contour smooth)
-            self.fc1.weight[1, _TANG_SLICE] = 1.0 / 9.0
-
-            # W₂ = 0, b₂ = 2 → gate ≈ σ(2) ≈ 0.88 at init (near-identity)
-            self.fc2.bias.fill_(2.0)
+            nn.init.normal_(self.fc2.weight, std=0.01)
+            for k, b in _BASIS_INIT_BIAS.items():
+                if 0 <= k < self.fc2.bias.numel():
+                    self.fc2.bias[k] = float(b)
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
-        """features: (N, 20). Returns: (N,) gate in (0, 1)."""
+        """features: (N, 6). Returns: (N, 7) basis weights (unbounded)."""
         h = F.relu(self.fc1(features))
-        return torch.sigmoid(self.fc2(h).squeeze(-1))
+        return self.fc2(h)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -391,69 +419,100 @@ class ThinningHead(nn.Module):
 # ═══════════════════════════════════════════════════════════════
 
 class ModulationRenderer(nn.Module):
-    """Anisotropic Gaussian splat + thinning head (paper §2.5).
+    """Soft-indicator deposit + noisy-OR renderer.
 
-    Learned: σ⊥ (1), σ∥ (1), s_t (1), s_n (1), ThinningHead 20→12→1 (265).
-    Total: 269 parameters.
+    Learned: DepositMLP 6→16→7 (231 params).  Total: 231.
+
+    Aggregation:
+        Per cell c, soft-indicator m_c(p) ∈ [0, 1] with max_p m_c(p) = 1.
+        Per-cell claim c_c(p) = ρ_c · m_c(p).
+        Output B̂(p) = 1 − ∏_c (1 − c_c(p))   ∈ [0, 1].
+
+        The renderer never suppresses or amplifies — the seed is the only
+        amplitude decision-maker.  The renderer chooses *where* each cell
+        places its claim within its footprint and combines overlapping
+        claims as independent evidence.
+
+    Note: this is NOT mass-conservative (Σ_p B̂ ≠ Σ_c ρ_c in general).  An
+    earlier version was conservative via per-cell softmax (Σ_p m_c = 1),
+    but that diluted ρ_c=1 over the footprint into per-pixel values too
+    small to survive NMS thresholding.  Soft-indicator + noisy-OR keeps
+    the "renderer-only-places-mass" principle while letting ρ_c=1 produce
+    pixel values near 1.
     """
 
     def __init__(self, **kwargs):
         super().__init__()
-        _ = kwargs
-        self._sigma_perp_raw = nn.Parameter(
-            torch.tensor(_inv_softplus(_SIGMA_PERP_INIT), dtype=torch.float32)
-        )
-        self._sigma_par_raw = nn.Parameter(
-            torch.tensor(_inv_softplus(_SIGMA_PAR_INIT), dtype=torch.float32)
-        )
-        self.s_t = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
-        self.s_n = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
-        self.thinning = ThinningHead()
+        _ = kwargs  # tolerate legacy kwargs
+        self.deposit = DepositMLP()
 
+    # ── Legacy compat properties / methods (no effect on output) ─────────
     @property
     def sigma_perp(self) -> torch.Tensor:
-        return F.softplus(self._sigma_perp_raw)
+        return torch.zeros((), dtype=torch.float32)
 
     @property
     def sigma_par(self) -> torch.Tensor:
-        return F.softplus(self._sigma_par_raw)
+        return torch.zeros((), dtype=torch.float32)
 
-    # Legacy compat
     @property
     def sigma_pre(self) -> torch.Tensor:
         return torch.zeros((), dtype=torch.float32)
+
     @property
     def smooth_sigma(self) -> torch.Tensor:
         return torch.zeros((), dtype=torch.float32)
+
     @property
     def eta_h(self) -> torch.Tensor:
         return torch.zeros((), dtype=torch.float32)
+
+    @property
+    def s_t(self) -> torch.Tensor:
+        return torch.zeros((), dtype=torch.float32)
+
+    @property
+    def s_n(self) -> torch.Tensor:
+        return torch.zeros((), dtype=torch.float32)
+
     def pixel_map(self, profile: torch.Tensor) -> torch.Tensor:
         return torch.ones(profile.shape[0], device=profile.device, dtype=profile.dtype)
 
 
 def upgrade_renderer_state_dict(state_dict: dict, prefix: str = "") -> dict:
-    remove = {
+    """Strip legacy renderer keys before load_state_dict(strict=False)."""
+    legacy_keys = {
         f"{prefix}_sigma_pre_raw",
+        f"{prefix}_sigma_perp_raw",
+        f"{prefix}_sigma_par_raw",
         f"{prefix}_eta_h_raw",
         f"{prefix}_smooth_sigma_raw",
+        f"{prefix}s_t",
+        f"{prefix}s_n",
         f"{prefix}perp_conv.conv.weight",
         f"{prefix}perp_conv.conv.bias",
         f"{prefix}perp_conv.fc.weight",
         f"{prefix}perp_conv.fc.bias",
+        # legacy thinning head — fully removed in this renderer
+        f"{prefix}thinning.fc1.weight",
+        f"{prefix}thinning.fc1.bias",
+        f"{prefix}thinning.fc2.weight",
+        f"{prefix}thinning.fc2.bias",
     }
-    out = {k: v for k, v in state_dict.items() if k not in remove}
-    par_key = f"{prefix}_sigma_par_raw"
-    if par_key not in out:
-        out[par_key] = torch.tensor(
-            _inv_softplus(_SIGMA_PAR_INIT), dtype=torch.float32,
-        )
-    return out
+    return {k: v for k, v in state_dict.items() if k not in legacy_keys}
 
 
 # ═══════════════════════════════════════════════════════════════
-# Proj / feature helpers
+# Proj helpers
 # ═══════════════════════════════════════════════════════════════
+
+def proj_to_device(proj: dict, device: torch.device) -> dict:
+    return {
+        "H": proj["H"], "W": proj["W"],
+        "n_cells": proj["n_cells"],
+        "nH": proj["nH"], "nW": proj["nW"],
+    }
+
 
 def compute_render_features(
     z2_image: np.ndarray, img: np.ndarray,
@@ -464,11 +523,6 @@ def compute_render_features(
     H, W = z2_image.shape
     nH, nW = cells["nH"], cells["nW"]
     return {"H": H, "W": W, "n_cells": nH * nW, "nH": nH, "nW": nW}
-
-
-def proj_to_device(proj: dict, device: torch.device) -> dict:
-    return {"H": proj["H"], "W": proj["W"], "n_cells": proj["n_cells"],
-            "nH": proj["nH"], "nW": proj["nW"]}
 
 
 def _theta_on_branch(theta, branch_pick, n_cells, device):
@@ -491,15 +545,15 @@ def render_boundary_map_torch(
     renderer: ModulationRenderer,
     cells_flat: dict,
     Hp: int, Wp: int,
-    l0_pix: dict[str, torch.Tensor] | None = None,
+    l0_pix: Optional[dict[str, torch.Tensor]] = None,
     eps: float = 1e-6,
     training: bool = False,
-    branch_pick: torch.Tensor | None = None,
-    content_h: int | None = None,
-    content_w: int | None = None,
+    branch_pick: Optional[torch.Tensor] = None,
+    content_h: Optional[int] = None,
+    content_w: Optional[int] = None,
     return_dominant_theta: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-
+    """Soft-indicator deposit + noisy-OR: B̂(p) = 1 − ∏_c (1 − ρ_c · m_c(p))."""
     _ = (training, l0_pix)
     H, W = proj_dev["H"], proj_dev["W"]
     device, dtype = rho_cell.device, rho_cell.dtype
@@ -513,13 +567,14 @@ def render_boundary_map_torch(
     theta_c = _theta_on_branch(theta_all, branch_pick, n_cells, device)
     S = int(cells_flat.get("S", max(1, W // max(nW, 1))))
 
-    # ── Step 1: Cell-grid operations ──────────────────────────
+    # ── Step 1: Cell-grid θ smoothing ─────────────────────────
     rho_grid = rho_cell.reshape(nH, nW).to(dtype=dtype)
     ib_grid = cells_flat["is_border"].to(device=device).reshape(nH, nW).bool()
     theta_c = _smooth_theta_rho_double_angle(
         theta_c.reshape(nH, nW), rho_grid, ib_grid, eps=eps,
     ).reshape(-1)
 
+    # ── Step 2: ρ-gated anchor smoothing ──────────────────────
     cx = cells_flat["cx_z2"].to(device=device, dtype=dtype)
     cy = cells_flat["cy_z2"].to(device=device, dtype=dtype)
     rho_flat = rho_cell.reshape(-1).to(dtype=dtype)
@@ -530,50 +585,49 @@ def render_boundary_map_torch(
     )
 
     active = (rho_flat > 0) & (~is_border)
-    if not active.any().item():
+    if not bool(active.any().item()):
         z = (rho_cell.sum() * 0.0).to(dtype=dtype, device=device)
-        out = z.expand(H, W)[:Hp, :Wp]
+        out = z.expand(H, W)[:Hp, :Wp].contiguous()
         if return_dominant_theta:
             return out, torch.zeros_like(out)
         return out
 
-    # Detach anchors and θ: no coordinate gradients back to seed
+    # Detach anchors and θ before deposit: no coordinate gradients into seed.
     cx_det, cy_det = _cx.detach(), _cy.detach()
     theta_det = theta_c.detach()
-    rho_splat = torch.where(is_border, torch.zeros_like(rho_flat), rho_flat)
+    rho_safe = torch.where(is_border, torch.zeros_like(rho_flat), rho_flat)
 
-    # ── Step 2: Anisotropic Gaussian splat → ρ̄(p), θ★(p) ─────
-    rho_bar, theta_star = _anisotropic_gaussian_splat(
-        rho_splat, cx_det, cy_det, theta_det, is_border,
-        sigma_perp=renderer.sigma_perp,
-        sigma_par=renderer.sigma_par,
-        H=H, W=W, S=S, eps=eps,
+    # ── Step 3: Per-cell features (cell grid, all cells) ──────
+    # Features are pure descriptors — they decide deposit *shape*, not amplitude.
+    # Detach both ρ and θ so gradient cannot loop back to L0/seed via the feature
+    # path; the MLP weights still receive gradient (their gradient depends on the
+    # *values* of features, not on features being part of the autograd graph).
+    # Without this, normalization terms like 1/(sum_rho + eps) on empty-
+    # neighborhood cells inflate Jacobians by ~1e6 and produce non-finite grads
+    # in l0_metric.W and the seed's NR / β parameters.
+    feats_all = _per_cell_features(
+        rho_safe.reshape(nH, nW).detach(),
+        theta_c.reshape(nH, nW).detach(),
+        ib_grid,
+        eps=eps,
+    )  # (N, 6)
+
+    # ── Step 4: MLP → basis weights for active cells ──────────
+    active_idx = active.nonzero(as_tuple=True)[0]
+    basis_w_active = renderer.deposit(feats_all[active_idx])  # (A, 7)
+
+    # ── Step 5: Conservative deposit ──────────────────────────
+    half_w = _deposit_half_width(S)
+    bmap, theta_star = _conservative_deposit(
+        rho_active=rho_safe[active_idx],
+        cx_active=cx_det[active_idx],
+        cy_active=cy_det[active_idx],
+        theta_active=theta_det[active_idx],
+        basis_w=basis_w_active,
+        H=H, W=W, half_w=half_w, eps=eps,
     )
 
-    # ── Step 3: Coherence ─────────────────────────────────────
-    coh = _compute_coherence(
-        rho_bar, theta_star,
-        rho_splat, cx_det, cy_det, theta_det, is_border,
-        renderer.sigma_perp, renderer.sigma_par, H, W, S, eps=eps,
-    )
-
-    # ── Step 4: Feature vector F_p ────────────────────────────
-    tang9 = _sample_stencil_9(rho_bar, theta_star, renderer.s_t, "tangent", eps)
-    norm9 = _sample_stencil_9(rho_bar, theta_star, renderer.s_n, "normal", eps)
-    # F_p = [ρ̄, coh, tang9(9), norm9(9)] ∈ R²⁰
-    features = torch.cat([
-        rho_bar.unsqueeze(-1),
-        coh.unsqueeze(-1),
-        tang9,
-        norm9,
-    ], dim=-1)  # (H, W, 20)
-
-    # ── Step 5: Thinning head → B̂(p) = ρ̄(p) · gate(p) ──────
-    feat_flat = features.reshape(H * W, _FEAT_DIM)
-    gate = renderer.thinning(feat_flat).reshape(H, W)
-    bmap = rho_bar * gate
-
-    # ── Crop ──────────────────────────────────────────────────
+    # ── Crop to content region ────────────────────────────────
     ch = Hp if content_h is None else content_h
     cw = Wp if content_w is None else content_w
     ch, cw = min(ch, H), min(cw, W)
@@ -591,17 +645,17 @@ def render_boundary_map_torch(
 
 
 # ═══════════════════════════════════════════════════════════════
-# NumPy wrapper
+# NumPy wrapper (unchanged interface)
 # ═══════════════════════════════════════════════════════════════
 
 def render_boundary_map(
     rho_cell: np.ndarray, proj: dict,
     renderer: ModulationRenderer, cells_flat: dict,
-    l0_pix: dict[str, np.ndarray] | None = None,
+    l0_pix: Optional[dict[str, np.ndarray]] = None,
     device: torch.device = torch.device("cpu"),
     eps: float = 1e-6,
-    branch_pick: np.ndarray | None = None,
-    content_h: int | None = None, content_w: int | None = None,
+    branch_pick: Optional[np.ndarray] = None,
+    content_h: Optional[int] = None, content_w: Optional[int] = None,
 ) -> np.ndarray:
     proj_dev = proj_to_device(proj, device)
     rho_t = torch.from_numpy(np.asarray(rho_cell, dtype=np.float32)).to(device)
@@ -620,26 +674,33 @@ def render_boundary_map(
 
 
 # ═══════════════════════════════════════════════════════════════
-# NMS
+# NMS (unchanged)
 # ═══════════════════════════════════════════════════════════════
 
 def _nms_unit_normal_from_theta(theta, eps=1e-8):
+    _ = eps
     t = np.asarray(theta, dtype=np.float64)
     return np.cos(t).astype(np.float32), (-np.sin(t)).astype(np.float32)
+
 
 def _nms_unit_normal_from_gradient(mag, eps=1e-8):
     m = np.asarray(mag, dtype=np.float64)
     gx, gy = ndimage.sobel(m, axis=1), ndimage.sobel(m, axis=0)
-    norm = np.sqrt(gx*gx + gy*gy) + eps
-    return (gx/norm).astype(np.float32), (gy/norm).astype(np.float32)
+    norm = np.sqrt(gx * gx + gy * gy) + eps
+    return (gx / norm).astype(np.float32), (gy / norm).astype(np.float32)
+
 
 def _nms_bilinear_sample(mag, row_off, col_off):
     coords = np.stack([row_off.astype(np.float64), col_off.astype(np.float64)])
-    return ndimage.map_coordinates(mag.astype(np.float64), coords, order=1, mode="nearest").astype(np.float32)
+    return ndimage.map_coordinates(
+        mag.astype(np.float64), coords, order=1, mode="nearest"
+    ).astype(np.float32)
+
 
 def ridge_nms(mag, *, theta=None, grad_norm_floor=1e-7):
     m = np.asarray(mag, dtype=np.float32)
-    if m.ndim != 2: raise ValueError(f"ridge_nms expects 2D, got {m.shape}")
+    if m.ndim != 2:
+        raise ValueError(f"ridge_nms expects 2D, got {m.shape}")
     H, W = m.shape
     yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
     m_work = m.copy()
@@ -647,17 +708,22 @@ def ridge_nms(mag, *, theta=None, grad_norm_floor=1e-7):
         nx, ny = _nms_unit_normal_from_theta(np.asarray(theta, dtype=np.float32))
         weak = np.zeros((H, W), dtype=bool)
     else:
-        gx, gy = ndimage.sobel(m_work.astype(np.float64), axis=1), ndimage.sobel(m_work.astype(np.float64), axis=0)
-        gnorm = np.sqrt(gx*gx + gy*gy).astype(np.float32)
+        gx = ndimage.sobel(m_work.astype(np.float64), axis=1)
+        gy = ndimage.sobel(m_work.astype(np.float64), axis=0)
+        gnorm = np.sqrt(gx * gx + gy * gy).astype(np.float32)
         nx, ny = _nms_unit_normal_from_gradient(m_work)
         weak = gnorm < grad_norm_floor
-    ahead = _nms_bilinear_sample(m_work, yy+ny, xx+nx)
-    behind = _nms_bilinear_sample(m_work, yy-ny, xx-nx)
+    ahead = _nms_bilinear_sample(m_work, yy + ny, xx + nx)
+    behind = _nms_bilinear_sample(m_work, yy - ny, xx - nx)
     keep = ((m_work >= ahead) & (m_work >= behind)) | weak
     return np.where(keep, m_work, 0.0).astype(np.float32)
 
+
 def ridge_nms_binary(mag, threshold, *, theta=None, grad_norm_floor=1e-7):
-    return (ridge_nms(mag, theta=theta, grad_norm_floor=grad_norm_floor) >= threshold).astype(np.uint8) * 255
+    return (
+        ridge_nms(mag, theta=theta, grad_norm_floor=grad_norm_floor) >= threshold
+    ).astype(np.uint8) * 255
+
 
 def cell_rho_to_2branch(rho_cell, branch):
     out = np.zeros((*rho_cell.shape, 2), dtype=rho_cell.dtype)
@@ -665,6 +731,8 @@ def cell_rho_to_2branch(rho_cell, branch):
     out[ii, jj, branch.astype(np.int64)] = rho_cell
     return out
 
+
+# Legacy aliases
 HarmonicThinRenderer = ModulationRenderer
 StampRenderer = ModulationRenderer
 AnisoDiffusionRenderer = ModulationRenderer
