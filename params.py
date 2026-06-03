@@ -32,7 +32,7 @@ L1 = SimpleNamespace(
 # ── Seed: η_z NR on |Z|, then collinear + surround + divisive readout (η_readout) ─
 SEED = SimpleNamespace(
     EPS=1e-9,
-    ETA_Z_INIT=5.0,
+    ETA_Z_INIT=10.0,
     BETA_SEED_INIT=0.5,
     BETA_COLL_INIT=0.5,
     KAPPA_THETA_INIT=2.5,
