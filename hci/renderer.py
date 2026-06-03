@@ -4,7 +4,7 @@ Pipeline:
   1. Cell grid: ρ-weighted θ combing → ρ-gated anchor smoothing.
   2. Per-cell features (6 scalars/cell): own ρ, neighborhood ρ, collinearity,
      curvature/disagreement, tangent-ρ asymmetry, normal-ρ asymmetry.
-  3. MLP (6 → 16 → 7) emits basis weights w_k per cell.
+  3. MLP (6 → 16 → 8) emits basis weights w_k per cell.
   4. Each active cell produces a soft-indicator m_c(p) over a (2H+1)² patch:
         m_c(p) = exp(Σ_k w_k b_k(s,n) − max_p ...)  ∈ [0, 1],   max_p m_c = 1.
      (s, n) is the patch pixel in cell-tangent frame (half-width units).
@@ -20,14 +20,24 @@ Why soft-indicator not sum-normalized:
     passes through my claimed pixel at confidence 1" and combines overlapping
     claims probabilistically.  Renderer remains a pure depositor.
 
-Gestalt basis b_0..b_6 in cell-local coords (s = tangent, n = normal):
-  b_0 = 0                         # uniform claim (flat after max-normalize)
-  b_1 = -n²                        # line along edge
-  b_2 = -s²                        # dot localized in tangent
-  b_3 = -(s² + n²)                # round blob
-  b_4 = s                          # forward bias (MLP can output ±)
-  b_5 = -(n - κ₀ s²)²              # curve A
-  b_6 = -(n + κ₀ s²)²              # curve B
+Gestalt basis b_0..b_7 in cell-local coords (s = tangent, n = normal):
+  b_0 = 0                              # uniform claim (flat after max-normalize)
+  b_1 = -n²                             # line along edge
+  b_2 = -s²                             # dot localized in tangent
+  b_3 = -(s² + n²)                     # round blob
+  b_4 = s                               # forward bias (MLP can output ±)
+  b_5 = -(n - κ₀ s²)²                   # curve A
+  b_6 = -(n + κ₀ s²)²                   # curve B
+  b_7 = -((s, n) - L·v̂_c)²             # extremal deposit (self-gating)
+
+The b_7 basis enables a cell to place its deposit *offset* from the anchor along
+a per-cell extension vector v̂_c, derived from the cell's tangent / normal ρ
+asymmetry features.  This addresses the "spike tip" failure mode: a spike-body
+cell sees high own-ρ and high tangent-asymmetry (ρ trails off ahead along the
+tangent) — b_7 lets the deposit shift forward toward the spike tip rather than
+sit at the magnitude centroid behind the tip.  When asymmetry is small (a clean
+line cell), |v̂_c| → 0 and b_7 collapses to b_3 (round blob), so the basis is
+inactive on non-extremal cells.
 """
 
 from __future__ import annotations
@@ -54,11 +64,16 @@ _DEPOSIT_HALF_WIDTH_MIN = int(getattr(RENDER, "DEPOSIT_HALF_WIDTH_MIN", 4))
 _DEPOSIT_HALF_WIDTH_MAX = int(getattr(RENDER, "DEPOSIT_HALF_WIDTH_MAX", 24))
 
 _FEATURE_DIM = 6
-_BASIS_DIM = 7
+_BASIS_DIM = 8
 _HIDDEN_DIM = int(getattr(RENDER, "DEPOSIT_HIDDEN", 16))
 
 # Curvature shape parameter for curve basis (in normalized cell-frame coords)
 _BASIS_KAPPA = float(getattr(RENDER, "BASIS_KAPPA", 0.5))
+
+# Reference offset length for the extremal basis b_7 (in half-width units).
+# b_7 places its peak at (L * v̂_s, L * v̂_n) — at half a footprint by default.
+# Tunable via RENDER.EXTENSION_REF; range (0, 1].
+_EXTENSION_REF = float(getattr(RENDER, "EXTENSION_REF", 0.5))
 
 # Init priors for basis MLP output bias (favor "line" deposit at t=0)
 _BASIS_INIT_BIAS = {
@@ -69,6 +84,7 @@ _BASIS_INIT_BIAS = {
     4: 0.0,   # forward bias
     5: 0.0,   # curve A
     6: 0.0,   # curve B
+    7: 0.0,   # extremal — inactive at init, opens when MLP learns to use it
 }
 
 
@@ -233,12 +249,23 @@ def _deposit_half_width(S: int) -> int:
     return max(_DEPOSIT_HALF_WIDTH_MIN, min(_DEPOSIT_HALF_WIDTH_MAX, h))
 
 
-def _compute_basis(s: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
-    """Evaluate 7 basis functions at patch pixels.
+def _compute_basis(
+    s: torch.Tensor,
+    n: torch.Tensor,
+    ext_s: torch.Tensor,
+    ext_n: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate 8 basis functions at patch pixels.
 
     s, n: (A, P) cell-frame coordinates, normalized to half-width units
           (so |s|, |n| ≲ 1 within the deposit window).
-    Returns: (A, P, 7).
+    ext_s, ext_n: (A,) per-cell extension components in the tangent frame,
+                  in half-width units, clamped to [-EXTENSION_REF, +EXTENSION_REF].
+                  When |ext| → 0 the cell wants no displacement (b_7 collapses to
+                  a centered blob); larger |ext| pushes the deposit toward the
+                  spike-tip end of the cell's footprint.
+
+    Returns: (A, P, 8).
     """
     s2 = s * s
     n2 = n * n
@@ -247,11 +274,18 @@ def _compute_basis(s: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
     b0 = torch.zeros_like(s)                    # uniform
     b1 = -n2                                     # line along tangent
     b2 = -s2                                     # dot in tangent direction
-    b3 = -(s2 + n2)                              # round blob
+    b3 = -(s2 + n2)                              # round blob (centered)
     b4 = s                                       # forward bias
     b5 = -(n - kappa * s2).pow(2)                # curve A
     b6 = -(n + kappa * s2).pow(2)                # curve B
-    return torch.stack([b0, b1, b2, b3, b4, b5, b6], dim=-1)
+    # b_7: extremal — round Gaussian peaked at (ext_s, ext_n).  Self-gating: when
+    # |ext| ≈ 0 this is b_3 and adds nothing new (the MLP can already produce a
+    # centered blob); when |ext| > 0 it places mass *offset* from the anchor by
+    # an amount derived from the cell's own ρ-asymmetry features.
+    ds = s - ext_s.unsqueeze(1)
+    dn = n - ext_n.unsqueeze(1)
+    b7 = -(ds * ds + dn * dn)
+    return torch.stack([b0, b1, b2, b3, b4, b5, b6, b7], dim=-1)
 
 
 def _conservative_deposit(
@@ -259,7 +293,9 @@ def _conservative_deposit(
     cx_active: torch.Tensor,       # (A,)  anchor x (detached)
     cy_active: torch.Tensor,       # (A,)  anchor y (detached)
     theta_active: torch.Tensor,    # (A,)  tangent angle (detached)
-    basis_w: torch.Tensor,         # (A, 7) basis weights from MLP
+    basis_w: torch.Tensor,         # (A, 8) basis weights from MLP
+    ext_s: torch.Tensor,           # (A,) tangent-frame extension, in half-width units
+    ext_n: torch.Tensor,           # (A,) normal-frame extension, in half-width units
     H: int, W: int, half_w: int,
     eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -330,7 +366,10 @@ def _conservative_deposit(
         s_loc = (ox.unsqueeze(0) * cos_a + oy.unsqueeze(0) * sin_a) * inv_hw   # (bs, P)
         n_loc = (-ox.unsqueeze(0) * sin_a + oy.unsqueeze(0) * cos_a) * inv_hw
 
-        basis = _compute_basis(s_loc, n_loc)                  # (bs, P, 7)
+        basis = _compute_basis(
+            s_loc, n_loc,
+            ext_s[b0:b1], ext_n[b0:b1],
+        )                                                       # (bs, P, 8)
         logits = (basis * basis_w[b0:b1].unsqueeze(1)).sum(dim=-1)   # (bs, P)
 
         # Pixel coordinates and bounds mask.
@@ -379,8 +418,10 @@ def _conservative_deposit(
 class DepositMLP(nn.Module):
     """6 → 16 → 7 MLP producing basis weights per cell.
 
-    Init: fc1 small-Gaussian, fc2.weight zero, fc2.bias set so basis-1 ("line")
-    dominates at t = 0 → renderer starts as a Gaussian-line-shaped deposit.
+    Init: fc1 small-Gaussian, fc2.weight small-Gaussian (~0.01 std), fc2.bias set
+    so basis-1 ("line") dominates at t = 0 → renderer starts as a Gaussian-line-
+    shaped deposit.  Basis-7 (extremal) has bias 0 — inactive at init, activates
+    when the MLP learns to use it.
     """
 
     def __init__(
@@ -409,7 +450,7 @@ class DepositMLP(nn.Module):
                     self.fc2.bias[k] = float(b)
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
-        """features: (N, 6). Returns: (N, 7) basis weights (unbounded)."""
+        """features: (N, 6). Returns: (N, 8) basis weights (unbounded)."""
         h = F.relu(self.fc1(features))
         return self.fc2(h)
 
@@ -445,6 +486,16 @@ class ModulationRenderer(nn.Module):
         super().__init__()
         _ = kwargs  # tolerate legacy kwargs
         self.deposit = DepositMLP()
+        # Learnable scale mapping ρ-asymmetry features (in cell-grid units) to
+        # the extension vector (in half-width units).  softplus so it stays > 0;
+        # init at ~1.0 so initial extension magnitudes match the natural feature
+        # scale.  When the system finds extension unhelpful it can shrink this
+        # toward 0, collapsing b_7 back to a centered blob.
+        self._ext_scale_raw = nn.Parameter(torch.tensor(_inv_softplus(1.0)))
+
+    @property
+    def ext_scale(self) -> torch.Tensor:
+        return F.softplus(self._ext_scale_raw).view(())
 
     # ── Legacy compat properties / methods (no effect on output) ─────────
     @property
@@ -614,7 +665,20 @@ def render_boundary_map_torch(
 
     # ── Step 4: MLP → basis weights for active cells ──────────
     active_idx = active.nonzero(as_tuple=True)[0]
-    basis_w_active = renderer.deposit(feats_all[active_idx])  # (A, 7)
+    basis_w_active = renderer.deposit(feats_all[active_idx])  # (A, 8)
+
+    # ── Step 4b: Extension vector (ext_s, ext_n) per active cell ─────────
+    # Derived from the tangent / normal ρ-asymmetry features (cols 4, 5 of F_c),
+    # mapped to half-width units via a learned scale (renderer.ext_scale, ≥ 0)
+    # and clamped to ±EXTENSION_REF.  Conceptually: when ρ trails off ahead of the
+    # cell along the tangent (positive asym_t = neighbors-have-more-ρ in +t̂),
+    # the cell is *behind* the perceptual feature — the extension points in −t̂
+    # (toward the magnitude-centroid side), so we negate.
+    asym_t = feats_all[active_idx, 4]
+    asym_n = feats_all[active_idx, 5]
+    ext_scale = renderer.ext_scale  # softplus, learnable scalar; init ≈ 1.0
+    ext_s = (-asym_t * ext_scale).clamp(min=-_EXTENSION_REF, max=_EXTENSION_REF)
+    ext_n = (-asym_n * ext_scale).clamp(min=-_EXTENSION_REF, max=_EXTENSION_REF)
 
     # ── Step 5: Conservative deposit ──────────────────────────
     half_w = _deposit_half_width(S)
@@ -624,6 +688,8 @@ def render_boundary_map_torch(
         cy_active=cy_det[active_idx],
         theta_active=theta_det[active_idx],
         basis_w=basis_w_active,
+        ext_s=ext_s,
+        ext_n=ext_n,
         H=H, W=W, half_w=half_w, eps=eps,
     )
 
