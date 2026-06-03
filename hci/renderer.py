@@ -305,8 +305,9 @@ def _conservative_deposit(
 
         m_c(p) = exp(ℓ_c(p) − max_p ℓ_c(p))  ∈ [0, 1],   max_p m_c(p) = 1.
 
-    The cell's per-pixel **claim** is c_c(p) = ρ_c · m_c(p) ∈ [0, 1].  Pixel-wise
-    aggregation is **noisy-OR** over independent claims:
+    The cell's per-pixel **claim** is c_c(p) = ρ_c · m_c(p) ∈ [0, 1].  Each claim is
+    scattered to the four nearest pixels via bilinear weights of the sub-pixel anchor
+    (integer base + fractional part).  Pixel-wise aggregation is **noisy-OR**:
 
         B̂(p) = 1 − ∏_c (1 − c_c(p))   =   1 − exp(Σ_c log(1 − c_c(p))).
 
@@ -356,15 +357,30 @@ def _conservative_deposit(
     _CLIP = 1.0 - 1e-5
     rho_clamped = rho_active.clamp(min=0.0, max=_CLIP)
 
+    # Sub-pixel anchor: integer base + fractional bilinear weights.
+    ax_int = torch.floor(cx_active).long()
+    ay_int = torch.floor(cy_active).long()
+    ax_frac = cx_active - ax_int.to(dtype=dtype)
+    ay_frac = cy_active - ay_int.to(dtype=dtype)
+
     for b0 in range(0, A, max_batch):
         b1 = min(b0 + max_batch, A)
         bs = b1 - b0
 
-        # Cell-frame coordinates of each patch pixel, normalized to [-1, 1]²
+        ax_f = ax_frac[b0:b1].unsqueeze(1)   # (bs, 1)
+        ay_f = ay_frac[b0:b1].unsqueeze(1)
+        w_NN = (1.0 - ax_f) * (1.0 - ay_f)
+        w_NE = ax_f * (1.0 - ay_f)
+        w_SW = (1.0 - ax_f) * ay_f
+        w_SE = ax_f * ay_f
+
+        # Cell-frame coords relative to sub-pixel anchor (not integer base).
         cos_a = torch.cos(theta_active[b0:b1]).unsqueeze(1)   # (bs, 1)
         sin_a = torch.sin(theta_active[b0:b1]).unsqueeze(1)
-        s_loc = (ox.unsqueeze(0) * cos_a + oy.unsqueeze(0) * sin_a) * inv_hw   # (bs, P)
-        n_loc = (-ox.unsqueeze(0) * sin_a + oy.unsqueeze(0) * cos_a) * inv_hw
+        ox_eff = ox.unsqueeze(0) - ax_f
+        oy_eff = oy.unsqueeze(0) - ay_f
+        s_loc = (ox_eff * cos_a + oy_eff * sin_a) * inv_hw   # (bs, P)
+        n_loc = (-ox_eff * sin_a + oy_eff * cos_a) * inv_hw
 
         basis = _compute_basis(
             s_loc, n_loc,
@@ -372,39 +388,67 @@ def _conservative_deposit(
         )                                                       # (bs, P, 8)
         logits = (basis * basis_w[b0:b1].unsqueeze(1)).sum(dim=-1)   # (bs, P)
 
-        # Pixel coordinates and bounds mask.
-        py = cy_active[b0:b1].unsqueeze(1) + oy.unsqueeze(0)   # (bs, P)
-        px = cx_active[b0:b1].unsqueeze(1) + ox.unsqueeze(0)
-        in_bounds = (py >= 0) & (py < H) & (px >= 0) & (px < W)
+        # Bilinear scatter targets from integer anchor base + patch offsets.
+        ax_b = ax_int[b0:b1].unsqueeze(1)
+        ay_b = ay_int[b0:b1].unsqueeze(1)
+        px_NN = ax_b + ox.unsqueeze(0)
+        py_NN = ay_b + oy.unsqueeze(0)
+        px_NE = px_NN + 1
+        py_NE = py_NN
+        px_SW = px_NN
+        py_SW = py_NN + 1
+        px_SE = px_NN + 1
+        py_SE = py_NN + 1
+
+        in_bounds_NN = (py_NN >= 0) & (py_NN < H) & (px_NN >= 0) & (px_NN < W)
+        in_bounds_NE = (py_NE >= 0) & (py_NE < H) & (px_NE >= 0) & (px_NE < W)
+        in_bounds_SW = (py_SW >= 0) & (py_SW < H) & (px_SW >= 0) & (px_SW < W)
+        in_bounds_SE = (py_SE >= 0) & (py_SE < H) & (px_SE >= 0) & (px_SE < W)
+        in_bounds_any = in_bounds_NN | in_bounds_NE | in_bounds_SW | in_bounds_SE
 
         # Soft-max-normalize: mass peaks at 1 (not Σ = 1).
         # Mask OOB to −∞ so they don't influence the max or contribute to the deposit.
-        logits = torch.where(in_bounds, logits, torch.full_like(logits, -1e9))
+        logits = torch.where(in_bounds_any, logits, torch.full_like(logits, -1e9))
         logits_max = logits.max(dim=1, keepdim=True).values
-        mass = torch.exp(logits - logits_max) * in_bounds.to(dtype=dtype)   # (bs, P), in [0, 1]
+        mass = torch.exp(logits - logits_max) * in_bounds_any.to(dtype=dtype)
 
         # Per-cell claim, clipped strictly below 1 for log1p stability.
         claim = (rho_clamped[b0:b1].unsqueeze(1) * mass).clamp(min=0.0, max=_CLIP)
 
-        # log(1 − claim) ∈ (−∞, 0]; OOB pixels have claim=0 → log_neg=0 (additive identity).
-        log_neg = torch.log1p(-claim)
+        claim_NN = (claim * w_NN * in_bounds_NN.to(dtype=dtype)).clamp(min=0.0, max=_CLIP)
+        claim_NE = (claim * w_NE * in_bounds_NE.to(dtype=dtype)).clamp(min=0.0, max=_CLIP)
+        claim_SW = (claim * w_SW * in_bounds_SW.to(dtype=dtype)).clamp(min=0.0, max=_CLIP)
+        claim_SE = (claim * w_SE * in_bounds_SE.to(dtype=dtype)).clamp(min=0.0, max=_CLIP)
 
-        flat_idx = (py.long().clamp(0, H - 1) * W + px.long().clamp(0, W - 1))
-        flat_idx_v = flat_idx.reshape(-1)
-        log_neg_v = log_neg.reshape(-1)
+        log_neg_NN = torch.log1p(-claim_NN)
+        log_neg_NE = torch.log1p(-claim_NE)
+        log_neg_SW = torch.log1p(-claim_SW)
+        log_neg_SE = torch.log1p(-claim_SE)
 
-        log_neg_acc.scatter_add_(0, flat_idx_v, log_neg_v)
+        flat_idx_NN = (py_NN.long().clamp(0, H - 1) * W + px_NN.long().clamp(0, W - 1))
+        flat_idx_NE = (py_NE.long().clamp(0, H - 1) * W + px_NE.long().clamp(0, W - 1))
+        flat_idx_SW = (py_SW.long().clamp(0, H - 1) * W + px_SW.long().clamp(0, W - 1))
+        flat_idx_SE = (py_SE.long().clamp(0, H - 1) * W + px_SE.long().clamp(0, W - 1))
 
-        # Track dominant cell per pixel by max claim (for θ★).  Race conditions within
-        # a batch may lose ties, but the dominant cell at most pixels wins by a margin.
-        claim_max_v = claim.detach().to(torch.float32).reshape(-1)
-        cur = max_claim[flat_idx_v]
-        upd = claim_max_v > cur
-        if upd.any():
-            upd_idx = flat_idx_v[upd]
-            max_claim[upd_idx] = claim_max_v[upd]
-            th_expand = theta_active[b0:b1].unsqueeze(1).expand(bs, P).reshape(-1)
-            theta_star[upd_idx] = th_expand[upd].to(dtype=dtype)
+        log_neg_acc.scatter_add_(0, flat_idx_NN.reshape(-1), log_neg_NN.reshape(-1))
+        log_neg_acc.scatter_add_(0, flat_idx_NE.reshape(-1), log_neg_NE.reshape(-1))
+        log_neg_acc.scatter_add_(0, flat_idx_SW.reshape(-1), log_neg_SW.reshape(-1))
+        log_neg_acc.scatter_add_(0, flat_idx_SE.reshape(-1), log_neg_SE.reshape(-1))
+
+        # Track dominant cell per pixel by max bilinear-fraction claim (for θ★).
+        th_expand = theta_active[b0:b1].unsqueeze(1).expand(bs, P).reshape(-1)
+        for flat_idx_v, claim_t in (
+            (flat_idx_NN.reshape(-1), claim_NN.detach().to(torch.float32).reshape(-1)),
+            (flat_idx_NE.reshape(-1), claim_NE.detach().to(torch.float32).reshape(-1)),
+            (flat_idx_SW.reshape(-1), claim_SW.detach().to(torch.float32).reshape(-1)),
+            (flat_idx_SE.reshape(-1), claim_SE.detach().to(torch.float32).reshape(-1)),
+        ):
+            cur = max_claim[flat_idx_v]
+            upd = claim_t > cur
+            if upd.any():
+                upd_idx = flat_idx_v[upd]
+                max_claim[upd_idx] = claim_t[upd]
+                theta_star[upd_idx] = th_expand[upd].to(dtype=dtype)
 
     # Noisy-OR readout: B̂(p) = 1 − exp(Σ_c log(1−claim)) = −expm1(accumulator).
     bmap = -torch.expm1(log_neg_acc)   # in [0, 1]
