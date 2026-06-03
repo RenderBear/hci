@@ -29,14 +29,14 @@ L1 = SimpleNamespace(
     EPS=1e-15,
 )
 
-# ── Seed: η_z NR on |Z|, then collinear + surround + divisive readout ─────────
+# ── Seed: η_z NR on |Z|, then collinear + surround + divisive readout (η_readout) ─
 SEED = SimpleNamespace(
     EPS=1e-9,
-    ETA_Z_INIT=0.30,
+    ETA_Z_INIT=5.0,
     BETA_SEED_INIT=0.5,
     BETA_COLL_INIT=0.5,
     KAPPA_THETA_INIT=2.5,
-    ETA_INIT=0.30,
+    ETA_READOUT_INIT=0.30,
     LAMBDA_INIT=0.5,
     SIGMA_F_INIT=1.3,
     FACIL_RADIUS=2,

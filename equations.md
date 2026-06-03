@@ -8,7 +8,7 @@ This file records the **notation and equations implemented in this repository**:
 
 1. **L0** — RGB directional differences → per-direction min subtraction → independent Naka–Rushton per channel with **fixed** $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ (`L0.ETA_LUM`, `L0.ETA_CHR`) and gain $\gamma$ (`L0.GAMMA`). Produces harmonic stack $s$, magnitudes $h_{1m}, h_{2m}$, split $h_{2m}^{\mathrm{lum}}, h_{2m}^{\mathrm{chr}}$, and complex fields $z_1, z_2$ (`z_from_l0_harmonics`). With **`L0.LEARNED_METRIC`** (default), a **learned** $3\times3$ matrix $W$ (`L0LearnedMetric`) replaces the fixed lum/chr split for distance; L0 is recomputed **live each training step** from cached RGB. Without it, L0 uses the fixed orthonormal lum/chr split and may be precomputed into the disk cache.
 2. **L1** — From L0 pixel field $z_2$, pool over $P\times P$ patches → per-cell $\rho_{\mathrm{total}} = \sum|z_2|$, coherent magnitude $\rho_{\mathrm{peak}} = |\sum z_2|$, orientation $\theta$, and $h_{2m}$-weighted splat anchors. **Runs live** each training step (`run_moments_cells_flat` in `prepare_batch`).
-3. **Seed** (`AndGateSeed` / `ContourSeed`) — **(i)** $\rho_{\mathrm{NR}} = R^2/(R^2+\eta_z^2)$ on $R = |Z|\,\mathrm{ok}$ with learned $\eta_z$; **(ii)** collinear readback $\rho_{\mathrm{coll}}$ on $\rho_{\mathrm{NR}}$; **(iii)** excitation $e = \beta_{\mathrm{seed}}\rho_{\mathrm{NR}} + \beta_{\mathrm{coll}}\rho_{\mathrm{coll}}$; surround $S$ of $\rho_{\mathrm{NR}}$; **(iv)** cell export $\rho = e^2/(e^2+\eta^2+\lambda S^2)$ to the renderer (**learned** $\beta_{\mathrm{seed}},\beta_{\mathrm{coll}},\kappa_\theta,\eta,\lambda,\sigma_f$). `cf_out["rho_nr"]` holds stage (i) for diagnostics.
+3. **Seed** (`AndGateSeed` / `ContourSeed`) — **(i)** $\rho_{\mathrm{NR}} = R^2/(R^2+\eta_z^2)$ on $R = |Z|\,\mathrm{ok}$ with learned $\eta_z$; **(ii)** collinear readback $\rho_{\mathrm{coll}}$ on $\rho_{\mathrm{NR}}$; **(iii)** excitation $e = \beta_{\mathrm{seed}}\rho_{\mathrm{NR}} + \beta_{\mathrm{coll}}\rho_{\mathrm{coll}}$; surround $S$ of $\rho_{\mathrm{NR}}$; **(iv)** cell export $\rho = e^2/(e^2+\eta_{\mathrm{readout}}^2+\lambda S^2)$ to the renderer (**learned** $\beta_{\mathrm{seed}},\beta_{\mathrm{coll}},\kappa_\theta,\eta_{\mathrm{readout}},\lambda,\sigma_f$). `cf_out["rho_nr"]` holds stage (i) for diagnostics.
 4. **Renderer** (`ModulationRenderer`) — Cell-grid $\theta$ combing and $\rho$-gated anchor smoothing; **Gaussian-line splat** of $\rho$ to pixels; **splat-footprint coherence** map $\mathrm{coh}(p)$; tangential / normal **9-tap stencils on $\bar\rho$**; **20→12→1** thinning MLP gate:
    $$\hat B(p) = \bar\rho(p)\,\mathrm{gate}(p).$$
 
@@ -135,12 +135,12 @@ $$
 **Divisive cell export** ($\lambda$ is **not** squared):
 
 $$
-\rho(c) = \frac{e(c)^2}{e(c)^2 + \eta^2 + \lambda\, S(c)^2 + \varepsilon}\,\mathrm{ok}(c).
+\rho(c) = \frac{e(c)^2}{e(c)^2 + \eta_{\mathrm{readout}}^2 + \lambda\, S(c)^2 + \varepsilon}\,\mathrm{ok}(c).
 $$
 
 The flat tensor returned by `ContourSeed.forward` is $\rho$ (splat input). `cf_out["rho_nr"]` stores $\rho_{\mathrm{NR}}$ for two-row infer diagnostics (`{stem}_rho.png`).
 
-**Learned** (softplus-positive): $\eta_z$, $\beta_{\mathrm{seed}}$, $\beta_{\mathrm{coll}}$, $\kappa_\theta$, $\eta$, $\lambda$, $\sigma_f$. Inits from `params.SEED`.
+**Learned** (softplus-positive): $\eta_z$, $\beta_{\mathrm{seed}}$, $\beta_{\mathrm{coll}}$, $\kappa_\theta$, $\eta_{\mathrm{readout}}$, $\lambda$, $\sigma_f$. Inits from `params.SEED` (`ETA_Z_INIT`, `ETA_READOUT_INIT`, …).
 
 **Relative energy** (diagnostic only, from $\rho_{\mathrm{total}}$; uses `SEED.SURROUND_RADIUS` / `SEED.SURROUND_SIGMA`):
 
@@ -237,7 +237,7 @@ Checkpoints store `{"model_state": state_dict}` (`intermediate.pt`, `final.pt`).
 | Block | Count | Notes |
 |------:|------:|------|
 | $W$ (`L0LearnedMetric`) | 9 | $3\times3$ RGB metric; omitted with `--no-l0-metric` |
-| $\beta_{\mathrm{seed}}, \beta_{\mathrm{coll}}, \kappa_\theta, \eta_{\mathrm{seed}}, \eta, \lambda, \sigma_f$ | 7 | Seed NR peak + readback + divisive readout |
+| $\beta_{\mathrm{seed}}, \beta_{\mathrm{coll}}, \kappa_\theta, \eta_z, \eta_{\mathrm{readout}}, \lambda, \sigma_f$ | 7 | Seed NR on $|Z|$ + readback + divisive readout |
 | $\tilde\sigma_\perp, \tilde\sigma_\parallel, s_t, s_n$ | 4 | Splat widths + stencil spacings |
 | $\mathrm{MLP}_{\mathrm{thin}}$ (20→12→1) | 265 | $20\cdot 12 + 12 + 12 + 1$ |
 | **Renderer subtotal** | **269** | |

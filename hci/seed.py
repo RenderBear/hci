@@ -4,7 +4,7 @@ L1 supplies ``rho_peak`` = |Σ z₂| and θ = ½ arg(Σ z₂). With R = |Z|·ok:
 
   ρ_nr(c) = R(c)² / (R(c)² + η_z² + ε) · ok(c)     (learned η_z)
 
-  ρ_coll, e, S, then  ρ(c) = e² / (e² + η² + λ·S² + ε) · ok   (learned β, κ_θ, η, λ, σ_f)
+  ρ_coll, e, S, then  ρ(c) = e² / (e² + η_readout² + λ·S² + ε) · ok   (learned β, κ_θ, η_readout, λ, σ_f)
 
 ``cf_out`` exposes ``rho_nr`` (row‑1 diagnostics) and the returned flat ``ρ`` is the
 final map for the renderer. ``relative_energy`` reuses the same surround neighborhood as the seed readout.
@@ -32,7 +32,9 @@ _ETA_Z_INIT = float(getattr(SEED, "ETA_Z_INIT", 0.30))
 _BETA_SEED_INIT = float(getattr(SEED, "BETA_SEED_INIT", 0.5))
 _BETA_COLL_INIT = float(getattr(SEED, "BETA_COLL_INIT", 0.5))
 _KAPPA_THETA_INIT = float(getattr(SEED, "KAPPA_THETA_INIT", 2.5))
-_ETA_INIT = float(getattr(SEED, "ETA_INIT", 0.30))
+_ETA_READOUT_INIT = float(
+    getattr(SEED, "ETA_READOUT_INIT", getattr(SEED, "ETA_INIT", 0.30))
+)
 _LAMBDA_INIT = float(getattr(SEED, "LAMBDA_INIT", 0.5))
 _SIGMA_F_INIT = float(getattr(SEED, "SIGMA_F_INIT", 1.3))
 _FACIL_RADIUS = int(getattr(SEED, "FACIL_RADIUS", 2))
@@ -202,7 +204,7 @@ def broadside_surround(
 
 
 class ContourSeed(nn.Module):
-    """ρ_nr = R²/(R²+η_z²); then collinear + surround + ρ = e²/(e²+η²+λS²)."""
+    """ρ_nr = R²/(R²+η_z²); then collinear + surround + ρ = e²/(e²+η_readout²+λS²)."""
 
     def __init__(
         self,
@@ -211,7 +213,7 @@ class ContourSeed(nn.Module):
         beta_seed_init: float = _BETA_SEED_INIT,
         beta_coll_init: float = _BETA_COLL_INIT,
         kappa_theta_init: float = _KAPPA_THETA_INIT,
-        eta_init: float = _ETA_INIT,
+        eta_readout_init: float = _ETA_READOUT_INIT,
         lambda_init: float = _LAMBDA_INIT,
         sigma_f_init: float = _SIGMA_F_INIT,
         facil_radius: int = _FACIL_RADIUS,
@@ -233,7 +235,7 @@ class ContourSeed(nn.Module):
         self._beta_seed_raw = nn.Parameter(torch.tensor(_inv_softplus(beta_seed_init)))
         self._beta_coll_raw = nn.Parameter(torch.tensor(_inv_softplus(beta_coll_init)))
         self._kappa_theta_raw = nn.Parameter(torch.tensor(_inv_softplus(kappa_theta_init)))
-        self._eta_raw = nn.Parameter(torch.tensor(_inv_softplus(eta_init)))
+        self._eta_readout_raw = nn.Parameter(torch.tensor(_inv_softplus(eta_readout_init)))
         self._lambda_raw = nn.Parameter(torch.tensor(_inv_softplus(lambda_init)))
         self._sigma_f_raw = nn.Parameter(torch.tensor(_inv_softplus(sigma_f_init)))
 
@@ -254,8 +256,8 @@ class ContourSeed(nn.Module):
         return Fn.softplus(self._kappa_theta_raw).view(())
 
     @property
-    def eta(self) -> torch.Tensor:
-        return Fn.softplus(self._eta_raw).view(())
+    def eta_readout(self) -> torch.Tensor:
+        return Fn.softplus(self._eta_readout_raw).view(())
 
     @property
     def lam(self) -> torch.Tensor:
@@ -334,7 +336,7 @@ class ContourSeed(nn.Module):
             )
 
         e2 = e * e
-        denom_readout = e2 + (self.eta * self.eta) + self.lam * (S * S) + eps
+        denom_readout = e2 + (self.eta_readout * self.eta_readout) + self.lam * (S * S) + eps
         rho = (e2 / denom_readout) * ok
         rho_flat = rho.reshape(N)
 

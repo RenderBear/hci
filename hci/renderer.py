@@ -351,7 +351,7 @@ def _conservative_deposit(
     theta_star = torch.zeros(n_pix, device=device, dtype=dtype)
 
     # Clamp ρ to [0, 1−ε_clip] for log-stability of log1p(−claim).
-    # The seed's divisive readout ρ = e²/(e²+η²+λS²+ε) is already in [0, 1] but a
+    # The seed's divisive readout ρ = e²/(e²+η_readout²+λS²+ε) is already in [0, 1] but a
     # rare cell can come in slightly above due to numerical noise.
     _CLIP = 1.0 - 1e-5
     rho_clamped = rho_active.clamp(min=0.0, max=_CLIP)

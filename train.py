@@ -584,6 +584,7 @@ def upgrade_model_state_dict(state_dict: dict) -> dict:
     rename = {
         "seed._beta_raw": "seed._beta_seed_raw",
         "seed._kappa_raw": "seed._beta_coll_raw",
+        "seed._eta_raw": "seed._eta_readout_raw",
     }
     out: dict = {}
     for k, v in state_dict.items():
@@ -596,7 +597,7 @@ def upgrade_model_state_dict(state_dict: dict) -> dict:
 
 
 def debug_seed_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
-    """One training batch: seed stats + ∂loss/∂(η_z, β_seed, β_coll, κ_θ, η, λ, σ_f)."""
+    """One training batch: seed stats + ∂loss/∂(η_z, β_seed, β_coll, κ_θ, η_readout, λ, σ_f)."""
     model.train()
     meta = meta_list[0]
     cf = meta["cells_flat_dev"]
@@ -637,14 +638,14 @@ def debug_seed_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
     print(
         f"\n  η_z={seed.eta_z.item():.4g}  β_seed={seed.beta_seed.item():.4g}  "
         f"β_coll={seed.beta_coll.item():.4g}  κ_θ={seed.kappa_theta.item():.4g}  "
-        f"η={seed.eta.item():.4g}  λ={seed.lam.item():.4g}  σ_f={seed.sigma_f.item():.4g}"
+        f"η_readout={seed.eta_readout.item():.4g}  λ={seed.lam.item():.4g}  σ_f={seed.sigma_f.item():.4g}"
     )
     for name, t in (
         ("η_z", seed._eta_z_raw),
         ("β_seed", seed._beta_seed_raw),
         ("β_coll", seed._beta_coll_raw),
         ("κ_θ", seed._kappa_theta_raw),
-        ("η", seed._eta_raw),
+        ("η_readout", seed._eta_readout_raw),
         ("λ", seed._lambda_raw),
         ("σ_f", seed._sigma_f_raw),
     ):
@@ -731,10 +732,10 @@ def format_seed_param_lines(seed, *, indent: str = "  ") -> list[str]:
     return [
         f"{indent}η_z={seed.eta_z.item():.4g}  β_seed={seed.beta_seed.item():.4g}  "
         f"β_coll={seed.beta_coll.item():.4g}  κ_θ={seed.kappa_theta.item():.4g}  "
-        f"η={seed.eta.item():.4g}  λ={seed.lam.item():.4g}  σ_f={seed.sigma_f.item():.4g}  "
+        f"η_readout={seed.eta_readout.item():.4g}  λ={seed.lam.item():.4g}  σ_f={seed.sigma_f.item():.4g}  "
         f"[{seed.surround_mode} surround]",
         f"{indent}ρ_nr=|Z|²/(|Z|²+η_z²);  e=β_seed·ρ_nr+β_coll·ρ_coll;  "
-        f"ρ=e²/(e²+η²+λ·S²);  S=⟨ρ_nr⟩_𝒩",
+        f"ρ=e²/(e²+η_readout²+λ·S²);  S=⟨ρ_nr⟩_𝒩",
     ]
 
 
@@ -834,7 +835,7 @@ def main():
     ap.add_argument(
         "--debug-seed",
         action="store_true",
-        help="Run one batch, print seed stats and β_seed/β_coll/κ_θ/η_seed/η/λ/σ_f gradients, then exit",
+        help="Run one batch, print seed stats and β_seed/β_coll/κ_θ/η_z/η_readout/λ/σ_f gradients, then exit",
     )
     args = ap.parse_args()
 
@@ -852,8 +853,8 @@ def main():
     )
     print(
         f"Seed: ρ_seed=ρ_peak²/(ρ_peak²+η_seed²);  e=β_seed·ρ_seed+β_coll·ρ_coll;  "
-        f"ρ=e²/(e²+η²+λ·S²);  S=⟨ρ_seed⟩_𝒩 (broadside);  "
-        f"(β_seed,β_coll,κ_θ,η_seed,η,λ,σ_f learned)"
+        f"ρ=e²/(e²+η_readout²+λ·S²);  S=⟨ρ_nr⟩_𝒩 (broadside);  "
+        f"(β_seed,β_coll,κ_θ,η_z,η_readout,λ,σ_f learned)"
     )
     print(
         f"Render: Gaussian-line splat + stencil thinning MLP → "

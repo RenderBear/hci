@@ -568,7 +568,7 @@ def viz_infer_rho(
         ),
         (
             rho_after_suppress,
-            r"row 2 — $\rho$ after collinear + surround ($e^2/(e^2+\eta^2+\lambda S^2)$; splat input)",
+            r"row 2 — $\rho$ after collinear + surround ($e^2/(e^2+\eta_{\mathrm{readout}}^2+\lambda S^2)$; splat input)",
         ),
     ]
 
