@@ -83,7 +83,7 @@ def _sync(device):
         torch.cuda.synchronize()
 
 
-def run_l0_l1(img_path, device, metric=None):
+def run_l0_l1(img_path, device, metric=None, kappa_vm=None):
     timings = {}
 
     _sync(device)
@@ -123,6 +123,9 @@ def run_l0_l1(img_path, device, metric=None):
     timings["l0"] = time.perf_counter() - t0
 
     t1 = time.perf_counter()
+    kvm = kappa_vm
+    if kvm is None:
+        kvm = float(getattr(L1, "KAPPA_VM_INIT", 2.0))
     cells = compute_cell_moments(
         h2m,
         z2,
@@ -133,6 +136,8 @@ def run_l0_l1(img_path, device, metric=None):
         eps=L1.EPS,
         device=device,
         verbose=False,
+        kappa_vm=kvm,
+        num_orient_bins=int(getattr(L1, "NUM_ORIENT_BINS", 8)),
     )
     del h2m, z1, z2, bm_t
     gc.collect()
@@ -404,7 +409,9 @@ def main():
         print()
 
     img_path = os.path.join(args.input_dir, args.image)
-    prep, prep_t = run_l0_l1(img_path, device, metric=model.l0_metric)
+    prep, prep_t = run_l0_l1(
+        img_path, device, metric=model.l0_metric, kappa_vm=model.seed.kappa_vm,
+    )
 
     collect_diags = args.verbose or args.diagnostics
     (

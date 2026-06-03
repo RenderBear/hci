@@ -21,12 +21,14 @@ L0 = SimpleNamespace(
     LEARNED_METRIC=True,
 )
 
-# ── L1: patch geometry + z₂ moment pooling ─────────────────────────────────
+# ── L1: patch geometry + z₂ orientation bins (von Mises on θ_p) ───────────
 L1 = SimpleNamespace(
     PATCH_SIZE=5,
     PATCH_OVERLAP=3,
     BORDER_PATCH_MAX_FRAC=0.2,
     EPS=1e-15,
+    NUM_ORIENT_BINS=8,
+    KAPPA_VM_INIT=2.0,
 )
 
 # ── Seed: η_z NR on |Z|, then collinear + surround + divisive readout (η_readout) ─
@@ -44,6 +46,10 @@ SEED = SimpleNamespace(
     SURROUND_RADIUS=5,
     SURROUND_SIGMA=2.0,
     SURROUND_MODE="broadside",
+    # Learned surround Gaussian scale for orientation-bin surround S^(k) (init ≈ SURROUND_SIGMA).
+    SIGMA_S_INIT=2.0,
+    # Straight-through ρ max: softmax temperature (forward = hard max).
+    RHO_STE_TAU=0.1,
 )
 
 # ── Render: §2.5 anisotropic splat + thinning head (see hci/renderer.py) ─────

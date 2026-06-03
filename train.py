@@ -133,11 +133,13 @@ def build_cells_flat_torch(cells: dict) -> dict:
     nH, nW = int(cells["nH"]), int(cells["nW"])
     N = nH * nW
     rho_t = cells["rho_total"].reshape(N)
-    return {
+    K = int(cells.get("K", getattr(L1, "NUM_ORIENT_BINS", 8)))
+    out = {
         "nH": nH,
         "nW": nW,
         "S": int(cells["S"]),
         "P": int(cells["P"]),
+        "K": K,
         "theta": cells["theta"].reshape(N, 1),
         "rho_peak": cells["rho_peak"].reshape(N),
         "rho_total": rho_t,
@@ -146,6 +148,13 @@ def build_cells_flat_torch(cells: dict) -> dict:
         "cy_z2": cells["cy_z2"].reshape(N),
         "is_border": cells["is_border"].reshape(N).bool(),
     }
+    if "rho_bin" in cells:
+        out["rho_bin"] = cells["rho_bin"].reshape(N, K)
+        out["ax_bin"] = cells["ax_bin"].reshape(N, K)
+        out["ay_bin"] = cells["ay_bin"].reshape(N, K)
+        out["rho_bin_coh"] = cells["rho_bin_coh"].reshape(N, K)
+        out["theta_bins"] = cells["theta_bins"].reshape(K)
+    return out
 
 
 def run_moments_cells_flat(
@@ -154,6 +163,8 @@ def run_moments_cells_flat(
     H0: int,
     W0: int,
     device: torch.device,
+    *,
+    kappa_vm: torch.Tensor | float | None = None,
 ) -> dict:
     """Live z₂ moment pooling from cached L0."""
     h2m = l0_pix["h2m"].to(device=device, dtype=torch.float32)
@@ -162,6 +173,8 @@ def run_moments_cells_flat(
         l0_pix["z2_im"].to(device=device, dtype=torch.float32),
     )
     bm = border_mask.to(device=device).bool()
+    if kappa_vm is None:
+        kappa_vm = float(getattr(L1, "KAPPA_VM_INIT", 2.0))
     cells = compute_cell_moments(
         h2m,
         z2,
@@ -173,6 +186,8 @@ def run_moments_cells_flat(
         device=device,
         verbose=False,
         return_torch=True,
+        kappa_vm=kappa_vm,
+        num_orient_bins=int(getattr(L1, "NUM_ORIENT_BINS", 8)),
     )
     P = int(cells["P"])
     cells["is_border"] = cells["is_border"] | (
@@ -189,11 +204,13 @@ def build_cells_flat(cells: dict) -> dict:
     nH, nW = cells["nH"], cells["nW"]
     N = nH * nW
     rho_t = cells["rho_total"].reshape(N)
-    return {
+    K = int(cells.get("K", getattr(L1, "NUM_ORIENT_BINS", 8)))
+    out = {
         "nH": nH,
         "nW": nW,
         "S": int(cells["S"]),
         "P": int(cells["P"]),
+        "K": K,
         "theta": torch.from_numpy(cells["theta"].reshape(N, 1).astype(np.float32)),
         "rho_peak": torch.from_numpy(
             cells["rho_peak"].reshape(N).astype(np.float32)
@@ -204,6 +221,23 @@ def build_cells_flat(cells: dict) -> dict:
         "cy_z2": torch.from_numpy(cells["cy_z2"].reshape(N).astype(np.float32)),
         "is_border": torch.from_numpy(cells["is_border"].reshape(N).astype(np.bool_)),
     }
+    if "rho_bin" in cells:
+        out["rho_bin"] = torch.from_numpy(
+            np.asarray(cells["rho_bin"], dtype=np.float32).reshape(N, K)
+        )
+        out["ax_bin"] = torch.from_numpy(
+            np.asarray(cells["ax_bin"], dtype=np.float32).reshape(N, K)
+        )
+        out["ay_bin"] = torch.from_numpy(
+            np.asarray(cells["ay_bin"], dtype=np.float32).reshape(N, K)
+        )
+        out["rho_bin_coh"] = torch.from_numpy(
+            np.asarray(cells["rho_bin_coh"], dtype=np.float32).reshape(N, K)
+        )
+        out["theta_bins"] = torch.from_numpy(
+            np.asarray(cells["theta_bins"], dtype=np.float32).reshape(K)
+        )
+    return out
 
 
 class StriateE2E(nn.Module):
@@ -263,6 +297,7 @@ def prepare_batch(items, device, model: StriateE2E):
             H0,
             W0,
             device,
+            kappa_vm=model.seed.kappa_vm,
         )
         p_dev = proj_to_device(gi, device)
         meta.append(
@@ -576,7 +611,6 @@ def upgrade_model_state_dict(state_dict: dict) -> dict:
     drop = {
         "seed._eta_seed_raw",
         "seed._sigma_l1_raw",
-        "_l1_von_mises_kappa_raw",
         "seed._R0",
         "seed._a_raw",
         "seed._b_raw",
@@ -585,6 +619,7 @@ def upgrade_model_state_dict(state_dict: dict) -> dict:
         "seed._beta_raw": "seed._beta_seed_raw",
         "seed._kappa_raw": "seed._beta_coll_raw",
         "seed._eta_raw": "seed._eta_readout_raw",
+        "_l1_von_mises_kappa_raw": "seed._kappa_vm_raw",
     }
     out: dict = {}
     for k, v in state_dict.items():
@@ -636,11 +671,13 @@ def debug_seed_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
                 print(f"  {key}: {st[key]}")
     seed = model.seed
     print(
-        f"\n  η_z={seed.eta_z.item():.4g}  β_seed={seed.beta_seed.item():.4g}  "
-        f"β_coll={seed.beta_coll.item():.4g}  κ_θ={seed.kappa_theta.item():.4g}  "
-        f"η_readout={seed.eta_readout.item():.4g}  λ={seed.lam.item():.4g}  σ_f={seed.sigma_f.item():.4g}"
+        f"\n  κ_vm={seed.kappa_vm.item():.4g}  η_z={seed.eta_z.item():.4g}  "
+        f"β_seed={seed.beta_seed.item():.4g}  β_coll={seed.beta_coll.item():.4g}  "
+        f"κ_θ={seed.kappa_theta.item():.4g}  η_readout={seed.eta_readout.item():.4g}  "
+        f"λ={seed.lam.item():.4g}  σ_f={seed.sigma_f.item():.4g}  σ_S={seed.sigma_s.item():.4g}"
     )
     for name, t in (
+        ("κ_vm", seed._kappa_vm_raw),
         ("η_z", seed._eta_z_raw),
         ("β_seed", seed._beta_seed_raw),
         ("β_coll", seed._beta_coll_raw),
@@ -648,6 +685,7 @@ def debug_seed_batch(model, meta_list, device, *, lam_dice=1.0, lam_bce=0.0):
         ("η_readout", seed._eta_readout_raw),
         ("λ", seed._lambda_raw),
         ("σ_f", seed._sigma_f_raw),
+        ("σ_S", seed._sigma_s_raw),
     ):
         if t.grad is None:
             print(f"  |grad| {name}: grad=None")
@@ -722,20 +760,22 @@ def format_l0_param_lines(model: StriateE2E, *, indent: str = "  ") -> list[str]
 
 
 def format_l1_param_lines(model: StriateE2E, *, indent: str = "  ") -> list[str]:
-    _ = model
+    K = int(getattr(L1, "NUM_ORIENT_BINS", 8))
+    kvm = float(model.seed.kappa_vm.detach().cpu())
     return [
-        f"{indent}z₂ patch sum Z; ρ_peak=|Z|, ρ_total=Σ|z₂|, θ=½arg Z — no learned L1 params",
+        f"{indent}K={K} orientation bins; von Mises κ_vm={kvm:.4g} (learned on seed)",
+        f"{indent}ρ^(k), per-bin anchors; legacy ρ_peak, θ from patch Z₂ kept for diagnostics",
     ]
 
 
 def format_seed_param_lines(seed, *, indent: str = "  ") -> list[str]:
     return [
-        f"{indent}η_z={seed.eta_z.item():.4g}  β_seed={seed.beta_seed.item():.4g}  "
-        f"β_coll={seed.beta_coll.item():.4g}  κ_θ={seed.kappa_theta.item():.4g}  "
-        f"η_readout={seed.eta_readout.item():.4g}  λ={seed.lam.item():.4g}  σ_f={seed.sigma_f.item():.4g}  "
-        f"[{seed.surround_mode} surround]",
-        f"{indent}ρ_nr=|Z|²/(|Z|²+η_z²);  e=β_seed·ρ_nr+β_coll·ρ_coll;  "
-        f"ρ=e²/(e²+η_readout²+λ·S²);  S=⟨ρ_nr⟩_𝒩",
+        f"{indent}κ_vm={seed.kappa_vm.item():.4g}  η_z={seed.eta_z.item():.4g}  "
+        f"β_seed={seed.beta_seed.item():.4g}  β_coll={seed.beta_coll.item():.4g}  "
+        f"κ_θ={seed.kappa_theta.item():.4g}  η_readout={seed.eta_readout.item():.4g}  "
+        f"λ={seed.lam.item():.4g}  σ_f={seed.sigma_f.item():.4g}  σ_S={seed.sigma_s.item():.4g}",
+        f"{indent}Per-bin: ρ_NR on ρ^(k); collinear (tangent kernel); S via B_orthogonal; "
+        f"ρ_out divisive; export ρ STE-max, θ soft double-angle, anchors @ argmax bin",
     ]
 
 

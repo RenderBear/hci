@@ -1,19 +1,19 @@
-r"""L1 — per-cell z₂ moments → cell grid (GPU-native).
+r"""L1 — per-cell z₂: orientation bins (von Mises) + legacy Z₂ moments.
 
-From L0 pixel field z₂ = s₂ + i s₃, over each P×P patch (unweighted sums):
+Per pixel θ_p = ½ arg z₂(p). Per bin k with center ``\\bar θ_k = kπ/K``:
 
-  Z₂(c) = Σ_p z₂(p),   ρ_peak(c) = |Z₂(c)|,   θ(c) = ½ arg Z₂(c).
+  g_k(p) = exp(κ_vm (cos(2(θ_p − \\bar θ_k)) − 1)).
 
-  ρ_total(c) = Σ_p |z₂(p)|   (dilution-robust mass; diagnostics / E_rel).
+  ρ^(k)(c) = Σ_p |z₂| g_k ok_p,   coh^(k) = ρ^(k) / (Σ_p |z₂| ok_p + ε),
 
-``rho_coherence`` = ρ_peak / max(ρ_total, ε) (capped at 1) — coherent fraction of L¹ mass.
+  a_x^(k) = Σ_p |z₂| g_k x_p / (Σ_p |z₂| g_k + ε)   (sub-pixel anchors).
 
-Splat anchors: h₂m-weighted centroid within patch (cx_z2, cy_z2).
-
-The seed applies Naka–Rushton on |Z|: ρ = |Z|²/(|Z|²+η_z²) (``hci/seed.py``).
+Legacy: Z₂ patch sum, ρ_peak = |Z₂|, θ = ½ arg Z₂, ρ_total = Σ|z₂|, h₂m anchors.
 """
 
 from __future__ import annotations
+
+import math
 
 import numpy as np
 import torch
@@ -90,8 +90,13 @@ def compute_cell_moments(
     device: torch.device | str | None = None,
     verbose: bool = True,
     return_torch: bool = False,
+    kappa_vm: float | torch.Tensor = 2.0,
+    num_orient_bins: int | None = None,
+    **kw,
 ) -> dict:
-    """Sum-pool z₂ moments and h₂m anchors per cell."""
+    """Sum-pool z₂ moments, von Mises orientation bins, and h₂m anchors per cell."""
+    _ = kw
+    K = int(num_orient_bins if num_orient_bins is not None else getattr(L1, "NUM_ORIENT_BINS", 8))
     dev = torch.device(device) if device is not None else h2m.device
     h2m = h2m.to(dev, dtype=torch.float32)
     z2 = z2.to(dev)
@@ -104,15 +109,17 @@ def compute_cell_moments(
     n = nH * nW
 
     if verbose:
-        print(f"  grid {nH}x{nW} = {n} cells  (z₂ moments)")
+        print(f"  grid {nH}x{nW} = {n} cells  (z₂ moments, K={K})")
 
     bm_float = border_mask.float()
     bm_patches = _extract_patches_torch(bm_float, nH, nW, P, S)
     is_border_flat = bm_patches.mean(dim=-1) > border_patch_max_frac
 
     z2_patches = _extract_patches_torch(z2, nH, nW, P, S)
+    PP = P * P
 
-    z2_abs_sum = z2_patches.abs().sum(dim=-1).to(torch.float32)
+    z2_abs = z2_patches.abs().to(torch.float32)
+    z2_abs_sum = z2_abs.sum(dim=-1)
     rho_total_flat = z2_abs_sum.reshape(-1)
 
     Z2 = z2_patches.sum(dim=-1)
@@ -124,11 +131,39 @@ def compute_cell_moments(
     )
     rho_peak_flat = rho_peak_cell.reshape(-1)
     rho_coherence_flat = rho_coherence_cell.reshape(-1)
-    del z2_patches
 
     theta_flat = (
         0.5 * torch.atan2(Z2.imag, Z2.real + eps)
     ).to(torch.float32).reshape(-1)
+
+    # --- Orientation bins (von Mises on θ_p) --------------------------------
+    ok_pix = (1.0 - bm_patches).clamp(0.0, 1.0)
+    theta_p = 0.5 * torch.atan2(z2_patches.imag, z2_patches.real + eps).to(torch.float32)
+    bar_theta = (torch.arange(K, device=dev, dtype=torch.float32) * (math.pi / float(K))).view(1, 1, K)
+    if isinstance(kappa_vm, torch.Tensor):
+        kvm = kappa_vm.to(dev, dtype=torch.float32).reshape(())
+    else:
+        kvm = torch.tensor(float(kappa_vm), device=dev, dtype=torch.float32)
+    diff = 2.0 * (theta_p.unsqueeze(-1) - bar_theta)
+    g = torch.exp(kvm * (torch.cos(diff) - 1.0))
+    w_mag = z2_abs.unsqueeze(-1) * g * ok_pix.unsqueeze(-1)
+    rho_bin_flat = w_mag.sum(dim=1)
+    den_anch = w_mag.sum(dim=1) + float(eps)
+
+    pis = torch.arange(nH, device=dev).repeat_interleave(nW)
+    pjs = torch.arange(nW, device=dev).repeat(nH)
+    offs = torch.arange(PP, device=dev)
+    ii = (offs // P).to(torch.float32).view(1, PP)
+    jj = (offs % P).to(torch.float32).view(1, PP)
+    rows_pix = pis.float().unsqueeze(1) * float(S) + ii
+    cols_pix = pjs.float().unsqueeze(1) * float(S) + jj
+    ax_bin_flat = (w_mag * cols_pix.unsqueeze(-1)).sum(dim=1) / den_anch
+    ay_bin_flat = (w_mag * rows_pix.unsqueeze(-1)).sum(dim=1) / den_anch
+
+    z2_ok_sum = (z2_abs * ok_pix).sum(dim=-1).clamp_min(float(eps))
+    rho_bin_coh_flat = rho_bin_flat / z2_ok_sum.unsqueeze(-1)
+
+    del z2_patches
 
     theta_flat = torch.where(is_border_flat, torch.zeros_like(theta_flat), theta_flat)
     rho_total_flat = torch.where(
@@ -140,10 +175,15 @@ def compute_cell_moments(
     rho_coherence_flat = torch.where(
         is_border_flat, torch.zeros_like(rho_coherence_flat), rho_coherence_flat,
     )
+    z0 = torch.zeros(n, K, device=dev, dtype=torch.float32)
+    ib_exp = is_border_flat.unsqueeze(-1).expand(-1, K)
+    rho_bin_flat = torch.where(ib_exp, z0, rho_bin_flat)
+    ax_bin_flat = torch.where(ib_exp, z0, ax_bin_flat)
+    ay_bin_flat = torch.where(ib_exp, z0, ay_bin_flat)
+    rho_bin_coh_flat = torch.where(ib_exp, z0, rho_bin_coh_flat)
+
     ib_grid = is_border_flat.reshape(nH, nW)
 
-    pis = torch.arange(nH, device=dev).repeat_interleave(nW)
-    pjs = torch.arange(nW, device=dev).repeat(nH)
     cx_flat = pjs.double() * S + P / 2.0
     cy_flat = pis.double() * S + P / 2.0
     cx_grid = cx_flat.reshape(nH, nW)
@@ -160,6 +200,11 @@ def compute_cell_moments(
     cx_anchor = torch.where(ib_grid, cx_grid, cx_anchor)
     cy_anchor = torch.where(ib_grid, cy_grid, cy_anchor)
 
+    rho_bin_hwk = rho_bin_flat.reshape(nH, nW, K)
+    ax_bin_hwk = ax_bin_flat.reshape(nH, nW, K)
+    ay_bin_hwk = ay_bin_flat.reshape(nH, nW, K)
+    rho_bin_coh_hwk = rho_bin_coh_flat.reshape(nH, nW, K)
+
     if verbose:
         rt = rho_total_flat.detach().cpu().numpy()
         n_border = int(is_border_flat.sum().item())
@@ -169,6 +214,8 @@ def compute_cell_moments(
         print(f"  rho_peak |Z|: mean={rp.mean():.2f} max={rp.max():.2f}")
         rc = rho_coherence_flat.detach().cpu().numpy()
         print(f"  rho_coherence |Z|/ρ_total: mean={rc.mean():.3f} max={rc.max():.3f}")
+        rb = rho_bin_flat.detach().cpu().numpy()
+        print(f"  rho_bin: mean={rb.mean():.3f} max={rb.max():.3f}")
 
     if return_torch:
         return {
@@ -176,6 +223,7 @@ def compute_cell_moments(
             "nW": nW,
             "S": S,
             "P": P,
+            "K": K,
             "theta": theta_flat.reshape(nH, nW),
             "rho_total": rho_total_flat.reshape(nH, nW),
             "rho_peak": rho_peak_flat.reshape(nH, nW),
@@ -186,6 +234,11 @@ def compute_cell_moments(
             "cx_z2": cx_anchor,
             "cy_z2": cy_anchor,
             "is_border": is_border_flat.reshape(nH, nW),
+            "rho_bin": rho_bin_hwk,
+            "ax_bin": ax_bin_hwk,
+            "ay_bin": ay_bin_hwk,
+            "rho_bin_coh": rho_bin_coh_hwk,
+            "theta_bins": bar_theta.reshape(K),
         }
 
     def _to_np(t):
@@ -197,6 +250,7 @@ def compute_cell_moments(
         "nW": nW,
         "S": S,
         "P": P,
+        "K": K,
         "theta": _to_np(theta_flat.reshape(nH, nW)),
         "rho_total": _to_np(rho_hw),
         "rho_peak": _to_np(rho_peak_flat.reshape(nH, nW)),
@@ -207,6 +261,11 @@ def compute_cell_moments(
         "cx_z2": _to_np(cx_anchor),
         "cy_z2": _to_np(cy_anchor),
         "is_border": _to_np(is_border_flat.reshape(nH, nW)),
+        "rho_bin": _to_np(rho_bin_hwk),
+        "ax_bin": _to_np(ax_bin_hwk),
+        "ay_bin": _to_np(ay_bin_hwk),
+        "rho_bin_coh": _to_np(rho_bin_coh_hwk),
+        "theta_bins": _to_np(bar_theta.reshape(K)),
     }
 
 
@@ -222,10 +281,12 @@ def run_l1(
     device: torch.device | str | None = None,
     verbose: bool = True,
     return_torch: bool = False,
+    kappa_vm: float | torch.Tensor = 2.0,
+    num_orient_bins: int | None = None,
     **kw,
 ) -> dict:
-    """Legacy name for ``compute_cell_moments`` (``z1`` and bin kwargs ignored)."""
-    _ = (z1, kw)
+    """Legacy name for ``compute_cell_moments`` (``z1`` ignored)."""
+    _ = z1
     return compute_cell_moments(
         h2m,
         z2,
@@ -237,4 +298,7 @@ def run_l1(
         device=device,
         verbose=verbose,
         return_torch=return_torch,
+        kappa_vm=kappa_vm,
+        num_orient_bins=num_orient_bins,
+        **kw,
     )
