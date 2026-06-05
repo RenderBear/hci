@@ -291,6 +291,7 @@ def prepare_batch(items, device, model: StriateE2E):
             l0_dev = build_l0_pix_live(img, border_mask, model.l0_metric, device)
         else:
             l0_dev = {k: v.to(device) for k, v in l0_pix.items()}
+        # κ_vm lives on seed; L1 is re-called each batch so ∂loss/∂κ_vm reaches _kappa_vm_raw.
         cf_dev = run_moments_cells_flat(
             l0_dev,
             border_mask,

@@ -144,11 +144,12 @@ def compute_cell_moments(
         kvm = kappa_vm.to(dev, dtype=torch.float32).reshape(())
     else:
         kvm = torch.tensor(float(kappa_vm), device=dev, dtype=torch.float32)
+    kvm = kvm.clamp_min(0.0)
     diff = 2.0 * (theta_p.unsqueeze(-1) - bar_theta)
     g = torch.exp(kvm * (torch.cos(diff) - 1.0))
     w_mag = z2_abs.unsqueeze(-1) * g * ok_pix.unsqueeze(-1)
     rho_bin_flat = w_mag.sum(dim=1)
-    den_anch = w_mag.sum(dim=1) + float(eps)
+    den_anch = rho_bin_flat + float(eps)
 
     pis = torch.arange(nH, device=dev).repeat_interleave(nW)
     pjs = torch.arange(nW, device=dev).repeat(nH)
@@ -178,8 +179,6 @@ def compute_cell_moments(
     z0 = torch.zeros(n, K, device=dev, dtype=torch.float32)
     ib_exp = is_border_flat.unsqueeze(-1).expand(-1, K)
     rho_bin_flat = torch.where(ib_exp, z0, rho_bin_flat)
-    ax_bin_flat = torch.where(ib_exp, z0, ax_bin_flat)
-    ay_bin_flat = torch.where(ib_exp, z0, ay_bin_flat)
     rho_bin_coh_flat = torch.where(ib_exp, z0, rho_bin_coh_flat)
 
     ib_grid = is_border_flat.reshape(nH, nW)
@@ -188,6 +187,11 @@ def compute_cell_moments(
     cy_flat = pis.double() * S + P / 2.0
     cx_grid = cx_flat.reshape(nH, nW)
     cy_grid = cy_flat.reshape(nH, nW)
+
+    cx_cell = cx_grid.reshape(-1, 1).expand(-1, K).to(ax_bin_flat.dtype)
+    cy_cell = cy_grid.reshape(-1, 1).expand(-1, K).to(ay_bin_flat.dtype)
+    ax_bin_flat = torch.where(ib_exp, cx_cell, ax_bin_flat)
+    ay_bin_flat = torch.where(ib_exp, cy_cell, ay_bin_flat)
 
     rows = torch.arange(H, device=dev, dtype=torch.float32).unsqueeze(1).expand(H, W)
     cols = torch.arange(W, device=dev, dtype=torch.float32).unsqueeze(0).expand(H, W)
