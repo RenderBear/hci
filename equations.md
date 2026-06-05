@@ -280,8 +280,16 @@ Logits over patch pixels $p$ in cell $c$:
 
 $$
 \ell_c(p) = \sum_{j=0}^{7} w_{c,j}\, b_j(s(p), n(p)), \qquad
-m_c(p) = \exp\bigl(\ell_c(p) - \max_{p'} \ell_c(p')\bigr) \in [0,1].
+m_c^{\mathrm{raw}}(p) = \exp\bigl(\ell_c(p) - \max_{p'} \ell_c(p')\bigr) \in [0,1].
 $$
+
+Optional **deposit envelope** (default on): $E(s,n)=\exp\bigl(-(s^2+n^2)/(2\sigma_E^2)\bigr)$ in half-width–normalized $(s,n)$, with hyperparameter `DEPOSIT_ENVELOPE_SIGMA` $=\sigma_E$ (set to $0$ to disable). Then
+
+$$
+m_c(p) = \frac{m_c^{\mathrm{raw}}(p)\, E(s(p),n(p))}{\max_{p'} \bigl(m_c^{\mathrm{raw}}(p')\, E(s(p'),n(p'))\bigr)} \in [0,1],
+$$
+
+so the peak is still $1$ but mass cannot stay large far from the anchor in cell frame — reducing flat-surface “tongues” from unbounded $b_1$ / non-decaying $b_4$ within the splat footprint.
 
 **Step 5 — claim and bilinear scatter.** Per-cell claim $c_c(p) = \rho_c\, m_c(p)$, scattered to four pixel targets via bilinear weights of the sub-pixel anchor $(a_x \bmod 1, a_y \bmod 1)$.
 
@@ -299,7 +307,7 @@ $$
 c^\star(p) = \arg\max_c c_c(p).
 $$
 
-Deposit half-width: $\lceil \texttt{DEPOSIT\_HALF\_WIDTH\_STRIDES} \cdot S \rceil$, clamped to `[DEPOSIT_HALF_WIDTH_MIN, DEPOSIT_HALF_WIDTH_MAX]`. Output cropped to content size $(H_0, W_0)$.
+Deposit half-width: $\lceil \texttt{DEPOSIT\_HALF\_WIDTH\_STRIDES} \cdot S \rceil$, clamped to `[DEPOSIT_HALF_WIDTH_MIN, DEPOSIT_HALF_WIDTH_MAX]`. Envelope $\sigma_E$ defaults to `DEPOSIT_ENVELOPE_SIGMA` in `params.RENDER`. Output cropped to content size $(H_0, W_0)$.
 
 The renderer applies **no thinning, splat coherence, or divisive suppression** — precision is upstream in the seed.
 

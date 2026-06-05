@@ -6,7 +6,10 @@ Pipeline:
      curvature/disagreement, tangent-ρ asymmetry, normal-ρ asymmetry.
   3. MLP (6 → 16 → 8) emits basis weights w_k per cell.
   4. Each active cell produces a soft-indicator m_c(p) over a (2H+1)² patch:
-        m_c(p) = exp(Σ_k w_k b_k(s,n) − max_p ...)  ∈ [0, 1],   max_p m_c = 1.
+        m_c(p) = exp(Σ_k w_k b_k(s,n) − max_p ...)  ∈ [0, 1],   max_p m_c = 1,
+     optionally multiplied by a fixed isotropic envelope E(s,n)=exp(−(s²+n²)/(2σ_E²))
+     and re-max-normalized so peaks stay at 1 while tails cannot extend far in (s,n)
+     (structural cap on line / half-plane basis leakage into neighbors).
      (s, n) is the patch pixel in cell-tangent frame (half-width units).
   5. Per-cell claim c_c(p) = ρ_c · m_c(p) ∈ [0, 1].
   6. Output via noisy-OR of independent claims:
@@ -74,6 +77,10 @@ _BASIS_KAPPA = float(getattr(RENDER, "BASIS_KAPPA", 0.5))
 # b_7 places its peak at (L * v̂_s, L * v̂_n) — at half a footprint by default.
 # Tunable via RENDER.EXTENSION_REF; range (0, 1].
 _EXTENSION_REF = float(getattr(RENDER, "EXTENSION_REF", 0.5))
+
+# Optional isotropic Gaussian on (s, n) in half-width units — applied to m_c after
+# max-normalize, then re-max-normalized. σ_E≈0.4–0.6 matches stride-to-half-width scale.
+_DEPOSIT_ENVELOPE_SIGMA = float(getattr(RENDER, "DEPOSIT_ENVELOPE_SIGMA", 0.52))
 
 # Init priors for basis MLP output bias (favor "line" deposit at t=0)
 _BASIS_INIT_BIAS = {
@@ -303,7 +310,9 @@ def _conservative_deposit(
 
     Per cell c, the patch-pixel mass is normalized to **peak at 1**, not to **sum to 1**:
 
-        m_c(p) = exp(ℓ_c(p) − max_p ℓ_c(p))  ∈ [0, 1],   max_p m_c(p) = 1.
+        m_c(p) = exp(ℓ_c(p) − max_p ℓ_c(p))  ∈ [0, 1],   max_p m_c(p) = 1,
+     optionally times E(s,n)=exp(−(s²+n²)/(2σ_E²)) with a second max-normalize
+     (see RENDER.DEPOSIT_ENVELOPE_SIGMA; 0 disables).
 
     The cell's per-pixel **claim** is c_c(p) = ρ_c · m_c(p) ∈ [0, 1].  Each claim is
     scattered to the four nearest pixels via bilinear weights of the sub-pixel anchor
@@ -411,6 +420,16 @@ def _conservative_deposit(
         logits = torch.where(in_bounds_any, logits, torch.full_like(logits, -1e9))
         logits_max = logits.max(dim=1, keepdim=True).values
         mass = torch.exp(logits - logits_max) * in_bounds_any.to(dtype=dtype)
+
+        # Compact footprint: basis b_1 / b_4 can assign near-peak mass far along s or n
+        # within the patch; multiply by E(s,n) and re-max-normalize so max m_c = 1.
+        if _DEPOSIT_ENVELOPE_SIGMA > 0.0:
+            sig = float(_DEPOSIT_ENVELOPE_SIGMA)
+            rsq = s_loc * s_loc + n_loc * n_loc
+            env = torch.exp(-rsq / (2.0 * sig * sig))
+            mass = mass * env
+            mm = mass.max(dim=1, keepdim=True).values
+            mass = torch.where(mm > eps, mass / mm, mass)
 
         # Per-cell claim, clipped strictly below 1 for log1p stability.
         claim = (rho_clamped[b0:b1].unsqueeze(1) * mass).clamp(min=0.0, max=_CLIP)

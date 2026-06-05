@@ -54,6 +54,9 @@ SEED = SimpleNamespace(
 
 # ── Render: §2.5 anisotropic splat + thinning head (see hci/renderer.py) ─────
 RENDER = SimpleNamespace(
+    # Soft-indicator deposit (hci/renderer.py): isotropic Gaussian envelope on m_c
+    # in half-width–normalized (s, n); σ≈0.4–0.6 kills cross-patch line streaks. 0 = off.
+    DEPOSIT_ENVELOPE_SIGMA=0.52,
     SIGMA_PAR_INIT=2.0,  # along-edge width; init ≈ L1 stride S (= P − overlap)
     SIGMA_PERP_INIT=1.0,
     SIGMA_PAR_MAX=32.0,
