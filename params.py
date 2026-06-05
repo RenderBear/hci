@@ -52,18 +52,39 @@ SEED = SimpleNamespace(
     RHO_STE_TAU=0.1,
 )
 
-# ── Render: §2.5 anisotropic splat + thinning head (see hci/renderer.py) ─────
+# ── Render: harmonic-inversion deposit + per-bin curvature correction ────────
+# Pipeline (see hci/renderer.py):
+#   per (cell c, bin k) — F^(k)_c ∈ ℝ⁴ → MLP_{4→8→2} → bounded (κ, e_s)
+#   stroke f^(k)_c(p) = exp(−(n − ½ κ s̃²)² / 2σ⊥² − s̃² / 2σ∥²)   s̃ = s − e_s
+#   gate g^(k)_c = σ(α_g (ρ^(k) − τ · max_j ρ^(j)))
+#   noisy-OR aggregation across ALL (c, k) pairs.
 RENDER = SimpleNamespace(
-    # Soft-indicator deposit (hci/renderer.py): isotropic Gaussian envelope on m_c
-    # in half-width–normalized (s, n); σ≈0.4–0.6 kills cross-patch line streaks. 0 = off.
-    DEPOSIT_ENVELOPE_SIGMA=0.52,
-    SIGMA_PAR_INIT=2.0,  # along-edge width; init ≈ L1 stride S (= P − overlap)
-    SIGMA_PERP_INIT=1.0,
+    # ── Deposit footprint (pixels): half_w = clamp(⌈STRIDES · S⌉, [MIN, MAX]) ──
+    DEPOSIT_HALF_WIDTH_STRIDES=2.0,
+    DEPOSIT_HALF_WIDTH_MIN=4,
+    DEPOSIT_HALF_WIDTH_MAX=24,
+
+    # ── Gaussian stroke widths in pixel units ──────────────────────────────
+    SIGMA_PERP_INIT=0.6,        # edge thickness (perpendicular to tangent)
+    SIGMA_PAR_INIT=2.0,         # stroke extent along tangent; init ≈ stride S
+
+    # ── Per-(cell, bin) correction bounds (signed via tanh on MLP outputs) ──
+    KAPPA_MAX_INIT=0.1,         # 1/pixel; |κ| ≤ κ_max — small to encourage straight strokes at init
+    EXT_MAX_INIT=1.0,           # pixels; signed tangent shift e_s of stroke vertex
+
+    # ── Sparsity gate: bin retained when ρ^(k) > τ · max_j ρ^(j) ───────────
+    BIN_GATE_TAU_INIT=0.4,      # τ ∈ [0, 1] via sigmoid; inference-time data-awareness lever
+    BIN_GATE_ALPHA_INIT=10.0,   # gate sharpness
+
+    # ── Correction MLP topology ────────────────────────────────────────────
+    CORR_HIDDEN=8,              # 4 features → 8 hidden → 2 outputs  (66 params)
+
+    # ── Legacy / unused (kept so old configs don't crash on import) ────────
+    DEPOSIT_ENVELOPE_SIGMA=0.0,
     SIGMA_PAR_MAX=32.0,
     SIGMA_PERP_MAX=8.0,
-    SPLAT_RADIUS_SIGMAS=3.0,  # splat kernel radius in max(σ_∥, σ_⊥) units
-    THETA_SMOOTH_PASSES=4,
-    # Thinning head: F_p ∈ R^20 = [ρ̄, coh, tang9, norm9]; MLP 20→12→1
+    SPLAT_RADIUS_SIGMAS=3.0,
+    THETA_SMOOTH_PASSES=0,
     THINNING_IN=20,
     THINNING_HIDDEN=12,
 )
