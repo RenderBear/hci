@@ -3,8 +3,9 @@ r"""Renderer — FBP-style filtered back-projection with learned 1D kernels.
 The 82-param Gaussian-stroke renderer is generalized along three axes:
 
   1. Learned 1D reconstruction kernels (h_⊥, h_∥) replace the fixed Gaussian.
-     h_⊥ is the FBP-analogue *ramp filter* (perpendicular to tangent): even
-     symmetric, free-sign side-lobes around a positive peak.  h_∥ is the
+     h_⊥ is a *windowed ramp filter* (perpendicular to tangent): H_⊥(ω) = |ω|·W(ω)
+     with the ramp baked in and only a small learned window W — strictly inside
+     the inverse-Radon family.  h_∥ is the
      longitudinal profile along the tangent: even, monotone-decay from a
      positive peak.  Both are sampled at continuous query positions via linear
      interpolation, so geometry corrections (κ, e, δ_n) and kernel taps both
@@ -55,15 +56,14 @@ WHY FBP-LIKE:
   The whole stack factors as forward-Radon (L0 + L1) → gain-control (seed) →
   inverse-Radon (this renderer).  The previous renderer was missing the *filter*
   slot in the inverse — synthesis was unfiltered back-projection of Gaussian
-  mollifiers, which fattens edges.  Learning h_⊥ as the radial filter lets the
-  renderer place arbitrary 1D profiles (sharp delta-like, Gaussian, ramp-with-
-  side-lobes, etc.) and produces visibly thinner edges when the data warrants.
+  mollifiers, which fattens edges.  The windowed ramp constrains h_⊥ to valid
+  inverse-Radon family: h_⊥ = IFFT(|ω|·W(ω)) with monotone-decreasing W.
 
 Param inventory (with H_w = 4 from L1.PATCH_SIZE=5, PATCH_OVERLAP=3 → S=2):
   Correction MLP 5→12→4         60 + 12 + 48 + 4 = 124
   4 correction bounds            (κ_max, e_max, δ_n_max, α_range)         4
   2 gate scalars                 (τ, α_g)                                 2
-  h_⊥: phi_perp ∈ ℝ^(H_w+1) (free-sign sides, +peak softplus)             5
+  h_⊥: phi_perp ∈ ℝ^(H_w+1) (monotone window logits → |ω|·W)             5
   h_∥: psi_par ∈ ℝ^H_w (monotone-decay logits) + peak softplus            5
   Total                                                                  140
 """
@@ -110,9 +110,10 @@ _FEATURE_DIM = 5
 _HIDDEN_DIM = int(getattr(RENDER, "CORR_HIDDEN", 12))
 _OUT_DIM = 4
 
-# Kernel init shape (Gaussian σ) — kernels learn freely from these starting points.
-_SIGMA_PERP_INIT = float(getattr(RENDER, "SIGMA_PERP_INIT", 0.6))
+# Kernel init shapes.
+_SIGMA_PERP_INIT = float(getattr(RENDER, "SIGMA_PERP_INIT", 0.6))   # legacy display
 _SIGMA_PAR_INIT  = float(getattr(RENDER, "SIGMA_PAR_INIT", 2.0))
+_RAMP_CUTOFF_INIT = float(getattr(RENDER, "RAMP_CUTOFF_INIT", 0.5))  # Hann ω_c for h_⊥ init
 
 # Correction bounds (signed, applied via tanh on raw MLP outputs).
 _KAPPA_MAX_INIT    = float(getattr(RENDER, "KAPPA_MAX_INIT", 0.1))
@@ -137,6 +138,54 @@ _FEAT_SOFTFLOOR = 5e-2
 
 def _inv_softplus(x: float) -> float:
     return math.log(math.expm1(max(float(x), 1e-8)))
+
+
+def _init_phi_perp_raw_hann(kernel_h_w: int, omega_c: float) -> torch.Tensor:
+    """Inverse-map a mild Hann window onto monotone window logits."""
+    H = kernel_h_w
+    L = 2 * H + 1
+    oc = max(min(float(omega_c), 0.5), 1e-3)
+    mags = torch.arange(H + 1, dtype=torch.float32) / L
+    ratio = (mags / oc).clamp(max=1.0)
+    W = torch.cos(0.5 * math.pi * ratio).clamp(min=0.0) ** 2
+    decay = (W[1:] / W[:-1].clamp(min=1e-8)).clamp(1e-6, 1.0 - 1e-6)
+    raw = torch.empty(H + 1, dtype=torch.float32)
+    raw[0] = _inv_softplus(float(W[0]))
+    raw[1:] = torch.log(decay / (1.0 - decay))
+    return raw
+
+
+def _windowed_ramp_from_logits(
+    kernel_h_w: int,
+    phi_perp_raw: torch.Tensor,
+) -> torch.Tensor:
+    """Spatial taps of h_⊥ = IFFT(|ω| · W(ω)) on the matched length-L grid.
+
+    W is monotone-decreasing in |ω|, parameterized by ``phi_perp_raw`` using
+    the same cumprod trick as ``h_par``.  The ramp |ω| is baked in; every point
+    in parameter space is a valid windowed inverse-Radon radial filter.
+    """
+    H = kernel_h_w
+    device = phi_perp_raw.device
+    dtype = phi_perp_raw.dtype
+    raw = phi_perp_raw
+    L = 2 * H + 1
+
+    W0 = F.softplus(raw[0:1])
+    decay = torch.sigmoid(raw[1:])
+    W_half = W0 * torch.cat([
+        torch.ones(1, device=device, dtype=dtype),
+        torch.cumprod(decay, dim=0),
+    ], dim=0)
+
+    idx_abs = torch.arange(-H, H + 1, device=device).abs()
+    W_full = W_half[idx_abs]
+    omega = torch.arange(-H, H + 1, device=device, dtype=dtype) / L
+    H_omega = omega.abs() * W_full
+
+    n_idx = torch.arange(-H, H + 1, device=device, dtype=dtype)
+    cos_basis = torch.cos(2.0 * math.pi * omega.unsqueeze(0) * n_idx.unsqueeze(1))
+    return (H_omega.unsqueeze(0) * cos_basis).sum(dim=1) / L
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -534,7 +583,7 @@ class ModulationRenderer(nn.Module):
         CorrectionMLP 5→12→4                     124
         κ_max, e_max, δ_n_max, α_range             4
         τ, α_g                                     2
-        h_⊥ raw (H_w+1 entries)                    5
+        h_⊥ window logits (H_w+1) → |ω|·W(ω)       5
         h_∥ raw: H_w decay-ratio logits + peak     5
     """
 
@@ -548,21 +597,13 @@ class ModulationRenderer(nn.Module):
 
         self.correction = CorrectionMLP()
 
-        # ── h_⊥ parameterization (radial filter; FBP-analogue) ────────────
-        # Raw vector of length H+1, indexed by |m|.
-        # phi_perp[0] = softplus(raw[0])           positive peak (peak amplitude)
-        # phi_perp[m] = raw[m]  for |m| ≥ 1        free-sign side-lobes
-        # h_⊥[m] = phi_perp[|m|]                   reflective even-symmetry
-        # Init: Gaussian with σ = _SIGMA_PERP_INIT.
-        sig_p = max(_SIGMA_PERP_INIT, 1e-6)
-        phi_init = torch.tensor([
-            math.exp(-(j * j) / (2.0 * sig_p * sig_p))
-            for j in range(H + 1)
-        ], dtype=torch.float32)
-        phi_init_raw = phi_init.clone()
-        phi_init_raw[0] = _inv_softplus(float(phi_init[0]))   # softplus⁻¹ of 1.0
-        # Remaining (free-sign) entries pass through verbatim.
-        self._phi_perp_raw = nn.Parameter(phi_init_raw)
+        # ── h_⊥ parameterization (windowed ramp: IFFT(|ω| · W(ω))) ─────────
+        # phi_perp_raw ∈ ℝ^(H+1): monotone-decreasing W at |ω| = 0, 1/L, …, H/L.
+        # W[0] = softplus(raw[0]); W[m] = W[m-1]·sigmoid(raw[m]) for m ≥ 1.
+        # Init: mild Hann with cutoff ω_c = RAMP_CUTOFF_INIT.
+        self._phi_perp_raw = nn.Parameter(
+            _init_phi_perp_raw_hann(H, _RAMP_CUTOFF_INIT)
+        )
 
         # ── h_∥ parameterization (longitudinal profile) ───────────────────
         # Even, monotone-decay from positive peak.
@@ -596,14 +637,8 @@ class ModulationRenderer(nn.Module):
 
     @property
     def h_perp(self) -> torch.Tensor:
-        """Even-symmetric radial filter, length 2*H_w + 1."""
-        H = self._kernel_h_w
-        raw = self._phi_perp_raw
-        peak = F.softplus(raw[0:1])                     # (1,)
-        side = raw[1:]                                  # (H,) free sign
-        phi = torch.cat([peak, side], dim=0)            # (H+1,)
-        idx = torch.arange(-H, H + 1, device=raw.device).abs()
-        return phi[idx]                                 # (2H+1,)
+        """Windowed ramp filter h_⊥ = IFFT(|ω| · W(ω)), length 2*H_w + 1."""
+        return _windowed_ramp_from_logits(self._kernel_h_w, self._phi_perp_raw)
 
     @property
     def h_par(self) -> torch.Tensor:
@@ -693,7 +728,11 @@ def upgrade_renderer_state_dict(state_dict: dict, prefix: str = "") -> dict:
     """Strip legacy renderer keys and shape-incompatible correction-MLP keys."""
     legacy = {
         # Older renderers (Gaussian-stroke 82-version, soft-indicator basis,
-        # stencil-thinning splat, etc.).  None of these exist in the FBP version.
+        # stencil-thinning splat, 4-param ramp experiment, etc.).
+        f"{prefix}_ramp_cutoff_raw",
+        f"{prefix}_ramp_rolloff_raw",
+        f"{prefix}_ramp_ram_lak_raw",
+        f"{prefix}_ramp_gain_raw",
         f"{prefix}_sigma_perp_raw",
         f"{prefix}_sigma_par_raw",
         f"{prefix}_sigma_pre_raw",

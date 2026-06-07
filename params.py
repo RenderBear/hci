@@ -61,8 +61,8 @@ SEED = SimpleNamespace(
 #   claim = α · g · ρ^(k) · f                                  per-bin amp modulation
 #   noisy-OR across ALL (c, k) pairs.
 #
-# h_⊥ (radial filter, FBP-analogue ramp filter):
-#   even-symmetric, free-sign side-lobes around a positive central peak.
+# h_⊥ (radial filter, windowed FBP ramp):
+#   h_⊥ = IFFT(|ω| · W(ω)); W monotone-decreasing, 5 window logits (H_w+1).
 #   length 2·H_w + 1 taps, sampled via linear interpolation at continuous query.
 # h_∥ (longitudinal profile):
 #   even, monotonically decaying from a positive peak (sigmoid-product param.).
@@ -78,12 +78,11 @@ RENDER = SimpleNamespace(
     DEPOSIT_HALF_WIDTH_MIN=4,
     DEPOSIT_HALF_WIDTH_MAX=24,
 
-    # ── 1D kernel init shapes (Gaussian σ in pixel units) ─────────────────
-    # h_⊥ and h_∥ start as Gaussians with these σ; both learn freely from there.
-    # The filters can become non-Gaussian (e.g. h_⊥ with negative side-lobes for
-    # FBP-style sharpening).
-    SIGMA_PERP_INIT=0.6,
+    # ── 1D kernel init shapes ─────────────────────────────────────────────
+    # h_⊥: Hann window cutoff ω_c for windowed-ramp init.  h_∥: Gaussian σ.
+    SIGMA_PERP_INIT=0.6,        # legacy display
     SIGMA_PAR_INIT=2.0,
+    RAMP_CUTOFF_INIT=0.5,       # Hann ω_c (cycles/sample) for h_⊥ cold start
 
     # ── Per-(cell, bin) correction bounds (signed via tanh on MLP outputs) ──
     KAPPA_MAX_INIT=0.1,         # 1/pixel — curvature
