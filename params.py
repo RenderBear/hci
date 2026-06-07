@@ -52,34 +52,53 @@ SEED = SimpleNamespace(
     RHO_STE_TAU=0.1,
 )
 
-# ── Render: harmonic-inversion deposit + per-bin curvature correction ────────
+# ── Render: FBP-style filtered back-projection with learned 1D kernels ────────
 # Pipeline (see hci/renderer.py):
-#   per (cell c, bin k) — F^(k)_c ∈ ℝ⁴ → MLP_{4→8→2} → bounded (κ, e_s)
-#   stroke f^(k)_c(p) = exp(−(n − ½ κ s̃²)² / 2σ⊥² − s̃² / 2σ∥²)   s̃ = s − e_s
-#   gate g^(k)_c = σ(α_g (ρ^(k) − τ · max_j ρ^(j)))
-#   noisy-OR aggregation across ALL (c, k) pairs.
+#   per (cell c, bin k) — F^(k)_c ∈ ℝ⁵ → MLP_{5→12→4} → bounded (κ, e, δ_n, log α)
+#   anchor shift: tilde_a = a + δ_n · n̂                       (2D anchor correction)
+#   gate g = σ(α_g (ρ^(k) − τ · max_j ρ^(j)))
+#   stroke f(s, n) = relu( h_⊥(n − ½ κ s̃²) · h_∥(s̃) )         s̃ = s − e
+#   claim = α · g · ρ^(k) · f                                  per-bin amp modulation
+#   noisy-OR across ALL (c, k) pairs.
+#
+# h_⊥ (radial filter, FBP-analogue ramp filter):
+#   even-symmetric, free-sign side-lobes around a positive central peak.
+#   length 2·H_w + 1 taps, sampled via linear interpolation at continuous query.
+# h_∥ (longitudinal profile):
+#   even, monotonically decaying from a positive peak (sigmoid-product param.).
+#
+# Both filters init to Gaussians (σ_⊥, σ_∥ below) — strict generalization of the
+# prior 82-param Gaussian-stroke renderer.  See renderer docstring for full math.
 RENDER = SimpleNamespace(
     # ── Deposit footprint (pixels): half_w = clamp(⌈STRIDES · S⌉, [MIN, MAX]) ──
+    # Determines kernel length: filters have 2·H_w + 1 taps.  H_w is FIXED at
+    # renderer construction time (using canonical S from L1).  Changing L1 stride
+    # invalidates saved filters.
     DEPOSIT_HALF_WIDTH_STRIDES=2.0,
     DEPOSIT_HALF_WIDTH_MIN=4,
     DEPOSIT_HALF_WIDTH_MAX=24,
 
-    # ── Gaussian stroke widths in pixel units ──────────────────────────────
-    SIGMA_PERP_INIT=0.6,        # edge thickness (perpendicular to tangent)
-    SIGMA_PAR_INIT=2.0,         # stroke extent along tangent; init ≈ stride S
+    # ── 1D kernel init shapes (Gaussian σ in pixel units) ─────────────────
+    # h_⊥ and h_∥ start as Gaussians with these σ; both learn freely from there.
+    # The filters can become non-Gaussian (e.g. h_⊥ with negative side-lobes for
+    # FBP-style sharpening).
+    SIGMA_PERP_INIT=0.6,
+    SIGMA_PAR_INIT=2.0,
 
     # ── Per-(cell, bin) correction bounds (signed via tanh on MLP outputs) ──
-    KAPPA_MAX_INIT=0.1,         # 1/pixel; |κ| ≤ κ_max — small to encourage straight strokes at init
-    EXT_MAX_INIT=1.0,           # pixels; signed tangent shift e_s of stroke vertex
+    KAPPA_MAX_INIT=0.1,         # 1/pixel — curvature
+    EXT_MAX_INIT=1.0,           # pixels — tangent vertex shift
+    DELTA_N_MAX_INIT=1.0,       # pixels — normal anchor correction (2D shift in normal dir)
+    ALPHA_RANGE_INIT=0.5,       # log-range — α ∈ [e^{-0.5}, e^{+0.5}] ≈ [0.6, 1.65]
 
-    # ── Sparsity gate: bin retained when ρ^(k) > τ · max_j ρ^(j) ───────────
-    BIN_GATE_TAU_INIT=0.4,      # τ ∈ [0, 1] via sigmoid; inference-time data-awareness lever
+    # ── Sparsity gate: bin retained when ρ^(k) > τ · max_j ρ^(j) ──────────
+    BIN_GATE_TAU_INIT=0.4,      # τ ∈ [0, 1] via sigmoid; data-awareness lever
     BIN_GATE_ALPHA_INIT=10.0,   # gate sharpness
 
-    # ── Correction MLP topology ────────────────────────────────────────────
-    CORR_HIDDEN=8,              # 4 features → 8 hidden → 2 outputs  (66 params)
+    # ── Correction MLP topology ───────────────────────────────────────────
+    CORR_HIDDEN=12,             # 5 features → 12 hidden → 4 outputs (124 params)
 
-    # ── Legacy / unused (kept so old configs don't crash on import) ────────
+    # ── Legacy / unused (kept so old configs don't crash on import) ───────
     DEPOSIT_ENVELOPE_SIGMA=0.0,
     SIGMA_PAR_MAX=32.0,
     SIGMA_PERP_MAX=8.0,
