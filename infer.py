@@ -32,6 +32,7 @@ from hci.diagnostics_viz import (
     viz_infer_l1_rho_masses,
     viz_infer_rho,
     viz_infer_geometry,
+    viz_infer_h2m,
     save_rho_png,
     viz_infer_shape_readout,
     viz_infer_base_edges_overlay,
@@ -375,9 +376,9 @@ def main():
         "-d",
         "--diagnostics",
         action="store_true",
-        help="Save additional diagnostics: base, l0_pinwheel, l1_moments, "
-        "rho (row1: η_z NR, row2: after collinear+surround), geometry (ρ_coll, S), "
-        "render_softmap, render_theta_bins, overlay.",
+        help="Save additional diagnostics: base, l0_pinwheel, h2m (lum/chr/combined), "
+        "l1_moments, rho (row1: η_z NR, row2: after collinear+surround), "
+        "geometry (ρ_coll, S), render_softmap, render_theta_bins, overlay.",
     )
     ap.add_argument(
         "--gt_dir",
@@ -458,6 +459,17 @@ def main():
         p_pin = os.path.join(od, f"{stem}_l0_pinwheel.png")
         viz_infer_l0_pinwheel(prep["h_np"], prep["img_pinwheel"], p_pin)
         saved_files.append(p_pin)
+
+        H0, W0 = prep["H0"], prep["W0"]
+        l0 = prep["l0_pix"]
+        p_h2m = os.path.join(od, f"{stem}_h2m.png")
+        viz_infer_h2m(
+            l0["h2m_lum"].numpy()[:H0, :W0],
+            l0["h2m_chr"].numpy()[:H0, :W0],
+            l0["h2m"].numpy()[:H0, :W0],
+            p_h2m,
+        )
+        saved_files.append(p_h2m)
 
         p_rho = os.path.join(od, f"{stem}_l1_moments.png")
         viz_infer_l1_rho_masses(

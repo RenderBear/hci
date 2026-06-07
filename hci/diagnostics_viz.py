@@ -524,6 +524,48 @@ def viz_infer_l0_pinwheel(
     viz_l0_pinwheel(h_np, img_pinwheel, out_path)
 
 
+def viz_infer_h2m(
+    h2m_lum: np.ndarray,
+    h2m_chr: np.ndarray,
+    h2m: np.ndarray,
+    out_path: str,
+) -> None:
+    """L0 second-harmonic magnitudes: lum, chr, and combined h2m (pixel heatmaps)."""
+    panels = [
+        (np.asarray(h2m_lum, dtype=np.float64), r"$h_{2m}^{\mathrm{lum}}$"),
+        (np.asarray(h2m_chr, dtype=np.float64), r"$h_{2m}^{\mathrm{chr}}$"),
+        (np.asarray(h2m, dtype=np.float64), r"$h_{2m}$"),
+    ]
+    cmap = rho_heatmap_cmap()
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5), facecolor=VIZ.BG)
+    for ax, (arr, label) in zip(axes, panels):
+        ax.set_facecolor(VIZ.PANEL_BG)
+        ax.axis("off")
+        m = max(float(np.max(arr)), VIZ.EPS)
+        ax.imshow(
+            np.clip(arr / m, 0.0, 1.0),
+            cmap=cmap,
+            vmin=0.0,
+            vmax=1.0,
+            interpolation="nearest",
+        )
+        ax.set_title(
+            f"{label}\nraw max={m:.4g}",
+            fontsize=9,
+            color=VIZ.FG,
+            fontfamily="monospace",
+        )
+    fig.suptitle(
+        r"L0 $h_{2m}$ — luminance, chrominance, combined (per-panel max → 0…1)",
+        fontsize=10,
+        color=VIZ.FG,
+        fontfamily="monospace",
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    fig.savefig(out_path, dpi=140, bbox_inches="tight", facecolor=VIZ.BG)
+    plt.close(fig)
+
+
 def viz_infer_l1_rho_masses(
     rho_total: np.ndarray,
     rho_peak: np.ndarray,
