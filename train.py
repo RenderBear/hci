@@ -993,64 +993,112 @@ def main():
                 moved.append((gi, gt, Hp, Wp, Hg, Wg, H0, W0, l0_pix, border_mask, img))
 
             meta_list = prepare_batch(moved, device, model)
-            bmaps = model.forward_batch(meta_list)
+            n_bm = len(meta_list)
 
-            dice_sum = None
-            bce_sum = None
-            for bmap, m in zip(bmaps, meta_list):
-                Hg, Wg = m["Hg"], m["Wg"]
-                bc = bmap[:Hg, :Wg]
-                gc_ = m["gt"][:Hg, :Wg]
-                loss_dice = soft_dice_loss_with_ignore(bc, gc_)
-                loss_bce = bce_loss_balanced(bc, gc_)
-                dice_sum = loss_dice if dice_sum is None else dice_sum + loss_dice
-                bce_sum = loss_bce if bce_sum is None else bce_sum + loss_bce
-            n_bm = len(bmaps)
-            mean_dice = dice_sum / n_bm
-            mean_bce = bce_sum / n_bm
-            loss = args.lam_dice * mean_dice + args.lam_bce * mean_bce
-            soft_dice_mean = mean_dice
-            bce_mean = mean_bce
-
-            if not loss.requires_grad:
-                raise RuntimeError(
-                    "loss has no grad_fn — check λ_dice/λ_bce, GT η band, ρ/renderer graph"
-                )
-
+            # Per-image forward + backward.  The previous loop collected all
+            # bmaps into a list and computed loss in a second pass, which kept
+            # every image's full autograd graph (L0 / L1 / seed / renderer
+            # intermediates) alive until the single ``loss.backward()`` ran.
+            # Gradients accumulate across ``.backward()`` calls, so doing the
+            # backward per image — with each per-image loss pre-divided by
+            # ``n_bm`` — produces the identical optimizer step while freeing
+            # each image's graph as soon as its gradients have been written.
             optimizer.zero_grad()
-            loss.backward()
+            batch_loss_val = 0.0   # sum of per-image (lam_dice*dice + lam_bce*bce)/n_bm — equals original batch-mean loss
+            dice_sum_val = 0.0     # sum of raw per-image dice values
+            bce_sum_val = 0.0      # sum of raw per-image bce values
+            skip_batch = False
+
+            for m in meta_list:
+                cf_flat = m["cells_flat_dev"]
+                rho_out, branch, _, _, _, cf_out, _ = model.seed(cells_flat=cf_flat)
+                bmap_i = render_boundary_map_torch(
+                    rho_out,
+                    m["proj_dev"],
+                    model.renderer,
+                    cf_out,
+                    m["Hp"], m["Wp"], m["l0_pix"],
+                    eps=model.render_eps,
+                    training=model.training,
+                    branch_pick=branch.reshape(-1).long(),
+                    content_h=m["H0"],
+                    content_w=m["W0"],
+                )
+                Hg_i, Wg_i = m["Hg"], m["Wg"]
+                bc = bmap_i[:Hg_i, :Wg_i]
+                gc_ = m["gt"][:Hg_i, :Wg_i]
+                loss_dice_i = soft_dice_loss_with_ignore(bc, gc_)
+                loss_bce_i = bce_loss_balanced(bc, gc_)
+                # Divide here so summed gradients == gradient of the batch mean.
+                loss_i = (
+                    args.lam_dice * loss_dice_i + args.lam_bce * loss_bce_i
+                ) / n_bm
+
+                if not loss_i.requires_grad:
+                    raise RuntimeError(
+                        "loss_i has no grad_fn — check λ_dice/λ_bce, GT η band, "
+                        "ρ/renderer graph"
+                    )
+                if not torch.isfinite(loss_i):
+                    print(
+                        f"    [warn] non-finite per-image loss="
+                        f"{loss_i.item()} — skipping batch"
+                    )
+                    skip_batch = True
+                    break
+
+                loss_i.backward()       # frees this image's graph immediately
+
+                batch_loss_val += loss_i.item()        # already /n_bm
+                dice_sum_val += loss_dice_i.item()
+                bce_sum_val += loss_bce_i.item()
+
+                # Drop per-image refs eagerly so the next iter starts clean.
+                del bmap_i, bc, gc_, loss_dice_i, loss_bce_i, loss_i
+                del rho_out, branch, cf_out, cf_flat
+
+            if skip_batch:
+                optimizer.zero_grad()
+                del meta_list, moved
+                continue
+
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(active_params, args.grad_clip)
-            if not torch.isfinite(loss):
-                print(f"    [warn] non-finite loss={loss.item()} — skipping step")
-                continue
+
             bad_grad = [
                 n for n, p in model.named_parameters()
                 if p.grad is not None and not torch.isfinite(p.grad).all()
             ]
             if bad_grad:
                 print(f"    [warn] non-finite grad in {bad_grad[:3]} — skipping step")
+                optimizer.zero_grad()
+                del meta_list, moved
                 continue
+
             optimizer.step()
 
-            n_img += len(meta_list)
-            ep_loss += loss.item()
-            ep_soft_dice += soft_dice_mean.item()
-            ep_bce += bce_mean.item()
+            soft_dice_mean_val = dice_sum_val / n_bm
+            bce_mean_val = bce_sum_val / n_bm
+            loss_item = batch_loss_val
+
+            n_img += n_bm
+            ep_loss += loss_item
+            ep_soft_dice += soft_dice_mean_val
+            ep_bce += bce_mean_val
             n_batch += 1
-            loss_item = loss.item()
+
             while n_img >= next_dbg_img:
                 dt_p = time.time() - t0
                 print(
                     f"    [dbg] epoch {epoch + 1}/{args.epochs}  ~img {next_dbg_img}/{n_fit}"
                     f"  batch {n_batch}  loss(run)={ep_loss / n_batch:.4f}"
                     f"  batch_loss={loss_item:.4f}"
-                    f"  dice={soft_dice_mean.item():.4f}  bce={bce_mean.item():.4f}"
+                    f"  dice={soft_dice_mean_val:.4f}  bce={bce_mean_val:.4f}"
                     f"  {dt_p:.1f}s elapsed",
                     flush=True,
                 )
                 next_dbg_img += dbg_img_step
-            del meta_list, bmaps, loss, moved
+            del meta_list, moved
 
         scheduler.step()
         al = ep_loss / max(n_batch, 1)

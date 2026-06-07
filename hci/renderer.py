@@ -78,6 +78,7 @@ from scipy import ndimage
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from params import L1, RENDER
 
@@ -306,6 +307,55 @@ def _interp_kernel(h: torch.Tensor, u: torch.Tensor, H_w: int) -> torch.Tensor:
 # Synthesis: per-(c, k) FBP-style stroke + global noisy-OR
 # ═══════════════════════════════════════════════════════════════
 
+def _chunk_log_neg(
+    rho_c: torch.Tensor,            # (bs,)
+    gate_c: torch.Tensor,           # (bs,)
+    alpha_c: torch.Tensor,          # (bs,)
+    ax_f: torch.Tensor,             # (bs, 1)
+    ay_f: torch.Tensor,             # (bs, 1)
+    ca: torch.Tensor,               # (bs, 1)
+    sa: torch.Tensor,               # (bs, 1)
+    kappa_c: torch.Tensor,          # (bs,)
+    ext_s_c: torch.Tensor,          # (bs,)
+    ox_l: torch.Tensor,             # (P,)  detached
+    oy_l: torch.Tensor,             # (P,)  detached
+    h_perp_l: torch.Tensor,         # (2H+1,)
+    h_par_l: torch.Tensor,          # (2H+1,)
+    in_bounds_l: torch.Tensor,      # (bs, P) bool, no grad
+    half_w: int,
+) -> torch.Tensor:
+    """Synthesis math for one chunk — wrapped in ``checkpoint`` from the caller.
+
+    All intermediate ``(bs, P)`` tensors (``s, n, s_tilde, n_curv, h_perp_val,
+    h_par_val, f_val, claim, claim_safe``) are local; on backward they're
+    recomputed instead of retained.  Returns ``log1p(-claim_safe)`` of shape
+    ``(bs, P)`` — the only tensor handed back across the checkpoint boundary.
+    """
+    dx = ox_l.unsqueeze(0) - ax_f                       # (bs, P)
+    dy = oy_l.unsqueeze(0) - ay_f
+
+    # Tangent / normal projection — (dy, dx) order, matches seed convention.
+    s =  dy * ca + dx * sa
+    n = -dy * sa + dx * ca
+
+    s_tilde = s - ext_s_c.unsqueeze(1)
+    n_curv  = n - 0.5 * kappa_c.unsqueeze(1) * (s_tilde * s_tilde)
+
+    # Sample the learned 1D kernels at continuous (n_curv, s_tilde).
+    h_perp_val = _interp_kernel(h_perp_l, n_curv,  half_w)
+    h_par_val  = _interp_kernel(h_par_l,  s_tilde, half_w)
+
+    # ReLU keeps claim non-negative for noisy-OR probabilistic semantics
+    # (h_perp may have negative side-lobes → sharpening via suppression
+    # rather than via subtraction).
+    f_val = F.relu(h_perp_val * h_par_val)
+
+    amp = (alpha_c * gate_c * rho_c).unsqueeze(1)       # (bs, 1)
+    claim = (amp * f_val).clamp(min=0.0, max=_CLAIM_CLIP)
+    claim_safe = torch.where(in_bounds_l, claim, torch.zeros_like(claim))
+    return torch.log1p(-claim_safe)                     # (bs, P)
+
+
 def _fbp_deposit(
     rho_active: torch.Tensor,       # (A,) ρ^(k)_c                   grad-bearing
     gate_active: torch.Tensor,      # (A,) g^(k)_c                   grad-bearing
@@ -322,8 +372,25 @@ def _fbp_deposit(
     kernel_h_w: int,
     H: int, W: int,
     eps: float = 1e-6,
+    use_checkpoint: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-(c, k) stroke synthesis via interpolated 1D kernels, then noisy-OR.
+
+    Memory layout:
+      * Synthesis math runs inside ``_chunk_log_neg``, wrapped per chunk in
+        ``torch.utils.checkpoint.checkpoint(..., use_reentrant=False)``.  Each
+        chunk's ``(bs, P)`` intermediates (``s, n, s_tilde, n_curv,
+        h_perp_val, h_par_val, f_val, claim, claim_safe``) are freed after
+        forward and recomputed in backward.  Only the returned ``log_neg`` of
+        shape ``(bs, P)`` is retained per chunk.
+      * The in-place ``scatter_add_`` into ``log_neg_acc`` and the no-grad θ★
+        tracking stay OUTSIDE the checkpoint so they're not re-executed.
+      * Pixel-index arithmetic (``px, py, in_bounds, flat_idx``) is computed
+        outside the checkpoint (no grad anyway) so backward doesn't redo it.
+
+    With this layout, peak retained activation memory in the synthesis is
+    roughly ``2·bs·P·sizeof(dtype)`` per live chunk (``log_neg`` + the bool
+    mask) rather than the ~6× that figure under naive autograd.
 
     Returns:
         bmap:       (H, W) ∈ [0, 1].
@@ -365,6 +432,11 @@ def _fbp_deposit(
 
     max_batch = max(1, 4_000_000 // P)
 
+    # Checkpointing only matters under autograd; inside ``torch.no_grad()``
+    # (inference) we skip the wrapper to avoid its overhead and keep behavior
+    # bit-for-bit identical to the eager path.
+    do_ckpt = bool(use_checkpoint) and torch.is_grad_enabled()
+
     for b0 in range(0, A, max_batch):
         b1 = min(b0 + max_batch, A)
         bs = b1 - b0
@@ -374,52 +446,45 @@ def _fbp_deposit(
         ca = cos_a[b0:b1].unsqueeze(1)
         sa = sin_a[b0:b1].unsqueeze(1)
 
-        # Δ = pixel − corrected anchor.
-        dx = ox.unsqueeze(0) - ax_f                     # (bs, P)
-        dy = oy.unsqueeze(0) - ay_f
-
-        # Tangent / normal projection — (dy, dx) order, matches seed convention.
-        s =  dy * ca + dx * sa
-        n = -dy * sa + dx * ca
-
-        s_tilde = s - ext_s_active[b0:b1].unsqueeze(1)
-        n_curv  = n - 0.5 * kappa_active[b0:b1].unsqueeze(1) * (s_tilde * s_tilde)
-
-        # Sample the learned 1D kernels at continuous (n_curv, s_tilde).
-        h_perp_val = _interp_kernel(h_perp, n_curv,  kernel_h_w)
-        h_par_val  = _interp_kernel(h_par,  s_tilde, kernel_h_w)
-        f_val = h_perp_val * h_par_val
-
-        # ReLU keeps claim non-negative for noisy-OR probabilistic semantics
-        # (h_perp may have negative side-lobes → sharpening via suppression
-        # rather than via subtraction).
-        f_val = F.relu(f_val)
-
-        amp = (
-            alpha_active[b0:b1] * gate_active[b0:b1] * rho_active[b0:b1]
-        ).unsqueeze(1)                                  # (bs, 1)
-        claim = (amp * f_val).clamp(min=0.0, max=_CLAIM_CLIP)
-
+        # Pixel-index arithmetic (no grad — computed once, outside checkpoint).
         px = ax_int[b0:b1].unsqueeze(1) + ox.unsqueeze(0).long()
         py = ay_int[b0:b1].unsqueeze(1) + oy.unsqueeze(0).long()
         in_bounds = (py >= 0) & (py < H) & (px >= 0) & (px < W)
-
-        claim_safe = torch.where(in_bounds, claim, torch.zeros_like(claim))
-        log_neg = torch.log1p(-claim_safe)
-
         flat_idx = (py.clamp(0, H - 1) * W + px.clamp(0, W - 1))
+
+        # Synthesis math — heavy intermediates live behind the checkpoint.
+        chunk_args = (
+            rho_active[b0:b1], gate_active[b0:b1], alpha_active[b0:b1],
+            ax_f, ay_f, ca, sa,
+            kappa_active[b0:b1], ext_s_active[b0:b1],
+            ox, oy,
+            h_perp, h_par,
+            in_bounds, half_w,
+        )
+        if do_ckpt:
+            log_neg = checkpoint(_chunk_log_neg, *chunk_args, use_reentrant=False)
+        else:
+            log_neg = _chunk_log_neg(*chunk_args)
+
+        # In-place scatter into the global log-space accumulator — kept OUT of
+        # the checkpoint because (a) it's in-place on a tensor that crosses
+        # iterations, (b) its backward only needs ``flat_idx`` and the source
+        # gradient, neither of which benefits from recomputation.
         log_neg_acc.scatter_add_(0, flat_idx.reshape(-1), log_neg.reshape(-1))
 
-        # θ★ tracking (no gradient).
-        cl_det = claim_safe.detach().to(torch.float32).reshape(-1)
-        idx_flat = flat_idx.reshape(-1)
-        th_expand = bar_theta_active[b0:b1].unsqueeze(1).expand(bs, P).reshape(-1)
-        cur = max_claim[idx_flat]
-        upd = cl_det > cur
-        if upd.any():
-            upd_idx = idx_flat[upd]
-            max_claim[upd_idx] = cl_det[upd]
-            theta_star[upd_idx] = th_expand[upd].to(dtype=dtype)
+        # θ★ tracking (no gradient).  ``claim_safe`` is not retained from the
+        # checkpoint; recover it from ``log_neg`` (precision irrelevant since
+        # this branch carries no gradient and only feeds NMS at inference).
+        with torch.no_grad():
+            cl_det = (-torch.expm1(log_neg.detach())).to(torch.float32).reshape(-1)
+            idx_flat = flat_idx.reshape(-1)
+            th_expand = bar_theta_active[b0:b1].unsqueeze(1).expand(bs, P).reshape(-1)
+            cur = max_claim[idx_flat]
+            upd = cl_det > cur
+            if upd.any():
+                upd_idx = idx_flat[upd]
+                max_claim[upd_idx] = cl_det[upd]
+                theta_star[upd_idx] = th_expand[upd].to(dtype=dtype)
 
     bmap = -torch.expm1(log_neg_acc)
     return bmap.reshape(H, W), theta_star.reshape(H, W)
@@ -754,15 +819,10 @@ def render_boundary_map_torch(
     feats = _per_bin_features(rho_out_bins.detach(), bar_theta, ib_g, eps=eps)
     feats_flat = feats.reshape(N * K, _FEATURE_DIM)
 
-    # ── Step 2: correction MLP → bounded (κ, e, δ_n, log α) ─────────────
-    raw = renderer.correction(feats_flat)               # (N*K, 4)
-    kappa_flat     = renderer.kappa_max   * torch.tanh(raw[:, 0])
-    ext_s_flat     = renderer.ext_max     * torch.tanh(raw[:, 1])
-    delta_n_flat   = renderer.delta_n_max * torch.tanh(raw[:, 2])
-    log_alpha_flat = renderer.alpha_range * torch.tanh(raw[:, 3])
-    alpha_flat = torch.exp(log_alpha_flat)              # α ∈ [e^{-range}, e^{+range}]
-
-    # ── Step 3: sparsity gate (relative to per-cell max) ────────────────
+    # ── Step 2: sparsity gate + active-set selection (BEFORE the MLP) ───
+    # The previous order ran the MLP on all N·K features and discarded ≥90 %
+    # of the output.  Selecting first means the MLP only sees the active
+    # subset — substantially smaller forward + retained graph.
     rho_flat_bins = rho_out_bins.reshape(N, K)
     rho_max_cell = rho_flat_bins.max(dim=-1, keepdim=True).values
     ok = (~is_border).to(dtype=dtype).unsqueeze(-1)
@@ -771,13 +831,14 @@ def render_boundary_map_torch(
         * ok
     )
 
-    # ── Step 4: select active (c, k) pairs ─────────────────────────────
     gate_NK = gate_flat.reshape(-1)
     rho_NK = rho_flat_bins.reshape(-1)
     keep = (gate_NK > _GATE_ACTIVE_THRESHOLD) & (rho_NK > _RHO_ACTIVE_FLOOR)
 
     if not bool(keep.any().item()):
         # No-op fallback — keep autograd graph alive on every renderer param.
+        # The correction MLP didn't run on a real input here, so a one-row
+        # sentinel pass keeps its weights in the graph too.
         h_perp = renderer.h_perp
         h_par  = renderer.h_par
         zero = (
@@ -785,8 +846,8 @@ def render_boundary_map_torch(
             + renderer.kappa_max * 0.0 + renderer.ext_max * 0.0
             + renderer.delta_n_max * 0.0 + renderer.alpha_range * 0.0
             + renderer.tau * 0.0 + renderer.alpha_g * 0.0
-            + 0.0 * raw.sum()
             + 0.0 * rho_out_bins.sum()
+            + 0.0 * renderer.correction(feats_flat[:1]).sum()
         )
         bmap = torch.zeros(H, W, device=device, dtype=dtype) + zero
         theta_star = torch.zeros(H, W, device=device, dtype=dtype)
@@ -795,17 +856,23 @@ def render_boundary_map_torch(
             return out, theta_star[:Hp, :Wp]
         return out
 
+    # ── Step 3: correction MLP on the active subset only ───────────────
+    feats_active = feats_flat[keep]                     # (A, 5)
+    raw_active = renderer.correction(feats_active)      # (A, 4)
+    kappa_active     = renderer.kappa_max   * torch.tanh(raw_active[:, 0])
+    ext_s_active     = renderer.ext_max     * torch.tanh(raw_active[:, 1])
+    delta_n_active   = renderer.delta_n_max * torch.tanh(raw_active[:, 2])
+    log_alpha_active = renderer.alpha_range * torch.tanh(raw_active[:, 3])
+    alpha_active = torch.exp(log_alpha_active)          # α ∈ [e^{-range}, e^{+range}]
+
+    # ── Step 4: gather remaining active inputs (anchors, ρ, gate, θ) ───
     bin_idx_full = torch.arange(K, device=device).unsqueeze(0).expand(N, K).reshape(-1)
     active_bin = bin_idx_full[keep]
 
-    ax_active      = ax_bin.reshape(-1)[keep].detach()
-    ay_active      = ay_bin.reshape(-1)[keep].detach()
-    rho_active     = rho_NK[keep]
-    gate_active    = gate_NK[keep]
-    alpha_active   = alpha_flat[keep]
-    kappa_active   = kappa_flat[keep]
-    ext_s_active   = ext_s_flat[keep]
-    delta_n_active = delta_n_flat[keep]
+    ax_active   = ax_bin.reshape(-1)[keep].detach()
+    ay_active   = ay_bin.reshape(-1)[keep].detach()
+    rho_active  = rho_NK[keep]
+    gate_active = gate_NK[keep]
 
     cos_a = torch.cos(bar_theta).index_select(0, active_bin)
     sin_a = torch.sin(bar_theta).index_select(0, active_bin)
