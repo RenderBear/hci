@@ -443,7 +443,7 @@ def _fbp_deposit(
 
     Returns:
         bmap:       (H, W) ∈ [0, 1].
-        theta_star: (H, W) — bar_theta_k of the dominant claimant (for NMS).
+        theta_star: (H, W) — claim-weighted circular mean of θ̄_k (for NMS).
     """
     A = rho_active.shape[0]
     device, dtype = rho_active.device, rho_active.dtype
@@ -461,8 +461,8 @@ def _fbp_deposit(
     P = oy.shape[0]
 
     log_neg_acc = torch.zeros(n_pix, device=device, dtype=dtype)
-    max_claim = torch.full((n_pix,), -1.0, device=device, dtype=torch.float32)
-    theta_star = torch.zeros(n_pix, device=device, dtype=dtype)
+    mom_re = torch.zeros(n_pix, device=device, dtype=torch.float32)
+    mom_im = torch.zeros(n_pix, device=device, dtype=torch.float32)
 
     # 2D anchor correction: shift by δ_n along normal in image (col, row) coords.
     #   tangent in image (col, row) = (sin θ̄, cos θ̄)
@@ -521,21 +521,19 @@ def _fbp_deposit(
         # gradient, neither of which benefits from recomputation.
         log_neg_acc.scatter_add_(0, flat_idx.reshape(-1), log_neg.reshape(-1))
 
-        # θ★ tracking (no gradient).  ``claim_safe`` is not retained from the
-        # checkpoint; recover it from ``log_neg`` (precision irrelevant since
-        # this branch carries no gradient and only feeds NMS at inference).
+        # θ★ — claim-weighted circular mean (no gradient; feeds NMS only).
         with torch.no_grad():
             cl_det = (-torch.expm1(log_neg.detach())).to(torch.float32).reshape(-1)
             idx_flat = flat_idx.reshape(-1)
-            th_expand = bar_theta_active[b0:b1].unsqueeze(1).expand(bs, P).reshape(-1)
-            cur = max_claim[idx_flat]
-            upd = cl_det > cur
-            if upd.any():
-                upd_idx = idx_flat[upd]
-                max_claim[upd_idx] = cl_det[upd]
-                theta_star[upd_idx] = th_expand[upd].to(dtype=dtype)
+            cos2 = torch.cos(2.0 * bar_theta_active[b0:b1])
+            sin2 = torch.sin(2.0 * bar_theta_active[b0:b1])
+            cos2_expand = cos2.unsqueeze(1).expand(bs, P).reshape(-1)
+            sin2_expand = sin2.unsqueeze(1).expand(bs, P).reshape(-1)
+            mom_re.scatter_add_(0, idx_flat, cl_det * cos2_expand)
+            mom_im.scatter_add_(0, idx_flat, cl_det * sin2_expand)
 
     bmap = -torch.expm1(log_neg_acc)
+    theta_star = (0.5 * torch.atan2(mom_im, mom_re)).to(dtype=dtype)
     return bmap.reshape(H, W), theta_star.reshape(H, W)
 
 

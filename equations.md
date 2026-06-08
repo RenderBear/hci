@@ -6,14 +6,14 @@ This file records the **notation and equations implemented in this repository**:
 
 ## 1. End-to-end pipeline
 
-1. **L0** — RGB directional differences → per-direction min subtraction → independent Naka–Rushton per channel with **fixed** $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ (`L0.ETA_LUM`, `L0.ETA_CHR`) and gain $\gamma$ (`L0.GAMMA`). Produces harmonic stack $s$, magnitudes $h_{1m}, h_{2m}$, split $h_{2m}^{\mathrm{lum}}, h_{2m}^{\mathrm{chr}}$, and complex fields $z_1, z_2$ (`z_from_l0_harmonics`). With **`L0.LEARNED_METRIC`** (default), a **learned** $3\times3$ matrix $W$ (`L0LearnedMetric`) replaces the fixed lum/chr split for distance; L0 is recomputed **live each training step** from cached RGB. Without it, L0 uses the fixed orthonormal lum/chr split and may be precomputed into the disk cache.
+1. **L0** — Split-channel harmonic projection with **fixed** $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ (`L0.ETA_LUM`, `L0.ETA_CHR`). Produces harmonic stack $s$, magnitudes $h_{1m}, h_{2m}$, split $h_{2m}^{\mathrm{lum}}, h_{2m}^{\mathrm{chr}}$, and complex fields $z_1, z_2$ (`z_from_l0_harmonics`). **Default training path** (`L0.LEARNED_METRIC` + `L0.NOTCH_ENABLED`): live L0 from cached RGB via learned $W$ (`L0LearnedMetric`) and JPEG notch (`L0Notch`) — project $\to$ notch $\to$ squared directional differences $\to$ NR $\to$ harmonics with $\gamma$ on $h_{2m}$ only (§2.2). **Legacy / cache path** (no learned metric): fixed lum/chr split, per-direction min subtraction, $\gamma$ inside NR (§2.1); may be precomputed into the disk cache.
 2. **L1** — From L0 pixel field $z_2$, pool over $P\times P$ patches → **$K$ orientation bins** (von Mises on $\theta_p$) giving $\rho^{(k)}, a_x^{(k)}, a_y^{(k)}, \mathrm{coh}^{(k)}$, plus legacy scalar moments $\rho_{\mathrm{total}}, \rho_{\mathrm{peak}}=|Z_2|, \theta, h_{2m}$ anchors. **Runs live** each training step (`run_moments_cells_flat` in `prepare_batch`) with **`seed.kappa_vm`** passed in so $\kappa_{\mathrm{vm}}$ is trainable end-to-end.
 3. **Seed** (`AndGateSeed` / `ContourSeed`) — **Per orientation bin** $k$: $\rho_{\mathrm{NR}}^{(k)} = (\rho^{(k)})^2/((\rho^{(k)})^2+\eta_z^2)$; same-bin collinear readback $\rho_{\mathrm{coll}}^{(k)}$; orthogonal-bin surround $S^{(k)}$ via fixed matrix $B$; excitation $e^{(k)} = \beta_{\mathrm{seed}}\rho_{\mathrm{NR}}^{(k)} + \beta_{\mathrm{coll}}\rho_{\mathrm{coll}}^{(k)}$; divisive readout $\rho_{\mathrm{out}}^{(k)} = (e^{(k)})^2/((e^{(k)})^2 + \eta_{\mathrm{readout}}^2 + \lambda (S^{(k)})^2)$. **Export** scalar cell $\rho$ via STE hard-max over bins; $\theta$ via double-angle soft blend; splat anchors from argmax bin. Also exports the **per-bin tensor** $\rho_{\mathrm{out}}^{(k)}$ (gradient-bearing) which is the renderer's primary input. (**Learned:** $\kappa_{\mathrm{vm}}, \eta_z, \beta_{\mathrm{seed}}, \beta_{\mathrm{coll}}, \eta_{\mathrm{readout}}, \lambda, \sigma_f, \sigma_S$.)
 4. **Renderer** (`ModulationRenderer`) — **FBP-style filtered back-projection** of the per-bin tensor. Per active $(c, k)$ pair: 5 contextual features $F^{(k)}_c$ → MLP $5\to 12\to 4$ → bounded corrections $(\kappa, e, \delta_n, \log\alpha)$; sparsity gate $g^{(k)}_c$; stroke synthesis via **learned 1D reconstruction kernels** $h_\perp, h_\parallel$ sampled at continuous query positions; **noisy-OR** aggregation across ALL $(c, k)$:
    $$\hat B(p) = 1 - \prod_{c,k} \bigl(1 - \alpha^{(k)}_c\, g^{(k)}_c\, \rho_{\mathrm{out}}^{(k)}(c)\, f^{(k)}_c(p)\bigr).$$
    The renderer applies no thinning or divisive suppression; precision lives at the seed.
 
-At inference, optional **ridge NMS** (`ridge_nms`) thins $\hat B$ using per-pixel dominant orientation $\theta^\star(p)$.
+At inference, optional **ridge NMS** (`ridge_nms`) thins $\hat B$ using per-pixel orientation $\theta^\star(p)$ — a **claim-weighted circular mean** of $\bar\theta_k$ accumulated during noisy-OR (§5.8), not an argmax over individual claims.
 
 ---
 
@@ -21,25 +21,14 @@ At inference, optional **ridge NMS** (`ridge_nms`) thins $\hat B$ using per-pixe
 
 Eight offsets $\delta_k \in \mathbb{Z}^2$ (`L0.OFFSETS`).
 
-### Fixed metric (default split, or init of learned $W$)
+### 2.1 Legacy path (fixed metric / no notch / disk cache)
 
-RGB maps to luminance $L=(R{+}G{+}B)/3$ and chrominance $C=(R,G,B)-L\mathbf{1}$. Directional differences:
-
-$$
-d_k^{\mathrm{lum}}(p) = \bigl|L(p) - L(p+\delta_k)\bigr|, \qquad
-d_k^{\mathrm{chr}}(p) = \bigl\|C(p) - C(p+\delta_k)\bigr\|_2 .
-$$
-
-### Learned metric (`L0LearnedMetric`, $M = W^\top W$)
-
-For RGB difference $\Delta\mathbf{c}_k(p) = \mathbf{I}(p)-\mathbf{I}(p+\delta_k)$:
+Used when `L0.NOTCH_ENABLED` is off or `L0.LEARNED_METRIC` is off (`--no-l0-metric`). RGB maps to luminance $L=(R{+}G{+}B)/3$ and chrominance $C=(R,G,B)-L\mathbf{1}$ (or learned $W$ on **differences** only). Directional distances:
 
 $$
-d_k^{\mathrm{lum}}(p) = \bigl|(W\Delta\mathbf{c}_k)_0\bigr|, \qquad
-d_k^{\mathrm{chr}}(p) = \bigl\|(W\Delta\mathbf{c}_k)_{1:3}\bigr\|_2 .
+d_k^{\mathrm{lum}}(p) = \bigl|L(p) - L(p+\delta_k)\bigr|\ \text{(or } |(W\Delta\mathbf{c}_k)_0|\text{)}, \qquad
+d_k^{\mathrm{chr}}(p) = \bigl\|C(p) - C(p+\delta_k)\bigr\|_2\ \text{(or } \|(W\Delta\mathbf{c}_k)_{1:3}\|_2\text{)}.
 $$
-
-$W$ is initialized to the orthonormal lum/chr basis (row 0 = luminance, rows 1–2 = chrominance). Norms use $\varepsilon$ (`L0.EPS`) inside the square root for stable backprop.
 
 **Per-direction min subtraction** (index $j$ runs over directions):
 
@@ -48,28 +37,101 @@ $$
 \tilde d_k^{\mathrm{chr}} = d_k^{\mathrm{chr}} - \min_j d_j^{\mathrm{chr}} .
 $$
 
-**Naka–Rushton** (independent per channel, per direction; $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ fixed from `params.L0`):
+**Naka–Rushton** ($\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ fixed from `params.L0`; $\gamma$ inside NR):
 
 $$
 h_k^{\mathrm{lum}} = \gamma\,\frac{(\tilde d_k^{\mathrm{lum}})^2}{\eta_{\mathrm{lum}}^2 + (\tilde d_k^{\mathrm{lum}})^2}, \qquad
 h_k^{\mathrm{chr}} = \gamma\,\frac{(\tilde d_k^{\mathrm{chr}})^2}{\eta_{\mathrm{chr}}^2 + (\tilde d_k^{\mathrm{chr}})^2}.
 $$
 
-Combined directional response $h_k = h_k^{\mathrm{lum}} + h_k^{\mathrm{chr}}$.
+**Harmonics** — $h_{2m} = \sqrt{|z_2|^2 + \varepsilon}$ (no extra $\gamma$ on magnitude).
 
-**Harmonics** (unit bearings $\hat u_k$ from offsets; $F$ stacks $\cos\varphi_k, \sin\varphi_k, \cos 2\varphi_k, \sin 2\varphi_k$):
+### 2.2 Notched path (default training: `L0LearnedMetric` + `L0Notch`)
+
+Image $\mathbf{c} : \Omega \to \mathbb{R}^3$. Learned $W \in \mathbb{R}^{3\times 3}$ (init = orthonormal lum/chr basis).
+
+**1. Project.**
 
 $$
-s(p) = \sum_k h_k(p)\, F_k \in \mathbb{R}^4, \qquad
-z_1(p) = s_0 + i s_1, \quad z_2(p) = s_2 + i s_3,
-$$
-$$
-h_{1m}(p) = \sqrt{|z_1(p)|^2 + \varepsilon}, \qquad h_{2m}(p) = \sqrt{|z_2(p)|^2 + \varepsilon}.
+\mathbf{u}(p) = W\,\mathbf{c}(p) \in \mathbb{R}^3.
 $$
 
-Split second-harmonic magnitudes $h_{2m}^{\mathrm{lum}}, h_{2m}^{\mathrm{chr}}$ use the same projection on $h_k^{\mathrm{lum}}, h_k^{\mathrm{chr}}$ alone (`compute_l0_rgb`). Border pixels are zeroed before L1.
+**2. Notch** each projected channel (shared kernel, separable 2D):
 
-*(Legacy path: grayscale / non-RGB uses divisive normalization $h_k = \gamma\, d_k^2 / (\eta_0^2 + \sum_j d_j^2)$ in `compute_contrast_field`.)*
+$$
+(\mathcal{N}\,u)_i(p) = \bigl(h_n *_x (h_n *_y\, u_i)\bigr)(p), \qquad i \in \{0,1,2\},
+$$
+
+with replicate padding at image borders (standard for boundary detection; avoids zero-pad ramp artifacts).
+
+**Notch frequency response** (real, even; $\omega \in [-\tfrac{1}{2}, \tfrac{1}{2}]$ cycles/pixel):
+
+$$
+N(\omega) = 1 - d\cdot\exp\!\left(-\frac{(|\omega| - \omega_n)^2}{2\sigma_n^2}\right).
+$$
+
+**Spatial kernel** on matched lattice $\omega_m = m/L$, $L = 2H + 1$ (`L0.NOTCH_HALF_WIDTH` $= H$, default $H=4$):
+
+$$
+h_n[n] = \frac{1}{L}\sum_{m=-H}^{H} N(\omega_m)\cos(2\pi\omega_m n), \qquad n = -H,\ldots,H.
+$$
+
+**Learned reparameterization** (`L0Notch`):
+
+$$
+\omega_n = \tfrac{1}{2}\sigma(\rho_\omega), \quad \sigma_n = \mathrm{softplus}(\rho_\sigma), \quad d = \sigma(\rho_d).
+$$
+
+Inits: $\omega_n = 1/8$ (JPEG fundamental), $\sigma_n \approx 1/32$, $d \approx 0.8$.
+
+**Commutativity.** $\mathcal{N}$ (convolution) and $\Delta_{\delta_k}$ (shift minus identity) are linear and shift-invariant, so notch-before-difference (step 2 then 3) equals notch-after-difference at $K\times$ lower cost.
+
+**3. Split.** Row 0 = lum, rows 1–2 = chr:
+
+$$
+\tilde u_{\mathrm{lum}} = \tilde u_0, \qquad \tilde u_{\mathrm{chr}} = (\tilde u_1, \tilde u_2) \in \mathbb{R}^2.
+$$
+
+**4. Directional differences** (no per-direction min subtraction):
+
+$$
+\Delta\tilde u_{\mathrm{lum},k}(p) = \tilde u_{\mathrm{lum}}(p+\delta_k) - \tilde u_{\mathrm{lum}}(p), \qquad
+\Delta\tilde u_{\mathrm{chr},k}(p) = \tilde u_{\mathrm{chr}}(p+\delta_k) - \tilde u_{\mathrm{chr}}(p).
+$$
+
+**5. Squared magnitudes.**
+
+$$
+m_{\mathrm{lum},k}^2(p) = \bigl(\Delta\tilde u_{\mathrm{lum},k}(p)\bigr)^2, \qquad
+m_{\mathrm{chr},k}^2(p) = \bigl\|\Delta\tilde u_{\mathrm{chr},k}(p)\bigr\|^2.
+$$
+
+**6. Naka–Rushton** (independent per channel; no $\gamma$ here):
+
+$$
+e_{\mathrm{lum},k} = \frac{m_{\mathrm{lum},k}^2}{m_{\mathrm{lum},k}^2 + \eta_{\mathrm{lum}}^2}, \qquad
+e_{\mathrm{chr},k} = \frac{m_{\mathrm{chr},k}^2}{m_{\mathrm{chr},k}^2 + \eta_{\mathrm{chr}}^2}.
+$$
+
+**7. Combine + harmonics.**
+
+$$
+h_k = e_{\mathrm{lum},k} + e_{\mathrm{chr},k}, \qquad
+z_2(p) = \sum_k h_k(p)\, e^{i 2\varphi_k}
+$$
+
+(unit bearings $\varphi_k$ from offsets; implemented via $F$ stacking $\cos\varphi_k, \sin\varphi_k, \cos 2\varphi_k, \sin 2\varphi_k$).
+
+**8. Magnitudes** ($\gamma$ on second harmonic only):
+
+$$
+h_{1m}(p) = \sqrt{|z_1(p)|^2 + \varepsilon}, \qquad
+h_{2m}(p) = \bigl(\sqrt{|z_2(p)|^2 + \varepsilon}\bigr)^{\gamma}.
+$$
+
+Split $h_{2m}^{\mathrm{lum}}, h_{2m}^{\mathrm{chr}}$ from $e_{\mathrm{lum},k}$, $e_{\mathrm{chr},k}$ alone. Border pixels (1-pixel `border_mask` from `compute_interior`) are zeroed before L1.
+
+*(Grayscale / non-RGB: divisive normalization $h_k = \gamma\, d_k^2 / (\eta_0^2 + \sum_j d_j^2)$ in `compute_contrast_field` — unchanged.)*
 
 ---
 
@@ -310,13 +372,15 @@ $$
 
 $\kappa$: signed curvature (1/pixel). $e$: signed tangent shift of stroke vertex (pixels). $\delta_n$: signed normal-direction anchor correction (pixels) — the new 2D anchor correction. $\alpha$: per-(cell, bin) amplitude modulation around 1.
 
-### 5.3 Sparsity gate
+### 5.3 Sparsity gate (near-winner-take-all per cell)
 
 $$
 g^{(k)}(c) = \sigma\!\Bigl(\alpha_g\bigl(\rho_{\mathrm{out}}^{(k)}(c) - \tau\cdot\max_j \rho_{\mathrm{out}}^{(j)}(c)\bigr)\Bigr)\,\mathrm{ok}(c).
 $$
 
-$\tau \in [0, 1]$ via sigmoid on a raw param; $\alpha_g > 0$ via softplus.
+$\tau \in [0, 1]$ via sigmoid on a raw param; $\alpha_g > 0$ via softplus. **Purpose:** suppress multi-bin “fan” deposits at a single cell — only bins near the per-cell maximum pass with $g \approx 1$; weaker competing orientations are gated out. Junctions where evidence is genuinely split across bins can still fire multiple strokes.
+
+**Inits** (`RENDER.BIN_GATE_TAU_INIT`, `RENDER.BIN_GATE_ALPHA_INIT`): $\tau \approx 0.75$, $\alpha_g \approx 20$ (sharper than the earlier $\tau=0.4$, $\alpha_g=10$ defaults). Both are learned end-to-end.
 
 **Active set:** $\mathcal{A} = \{(c, k) : g^{(k)}(c) > g_{\min}\text{ and }\rho_{\mathrm{out}}^{(k)}(c) > \rho_{\min}\}$. $g_{\min} = 10^{-3}$, $\rho_{\min} = 10^{-4}$ are fixed (not learned). Only active $(c, k)$ pairs are evaluated downstream.
 
@@ -420,14 +484,22 @@ $$
 
 Pixels outside every active deposit window contribute $c = 0$, so $\hat B(p) = 0$ on untouched pixels.
 
-### 5.8 Per-pixel dominant orientation (for inference NMS)
+### 5.8 Per-pixel orientation for inference NMS
+
+During noisy-OR scatter, accumulate claim-weighted complex moments (double-angle trick; no gradient):
 
 $$
-(c^\star(p), k^\star(p)) = \arg\max_{(c, k) \in \mathcal{A}} c^{(k)}_c(p),\qquad
-\theta^\star(p) = \bar\theta_{k^\star(p)}.
+M_{\mathrm{re}}(p) \mathrel{+}= c^{(k)}_c(p)\,\cos(2\bar\theta_k), \qquad
+M_{\mathrm{im}}(p) \mathrel{+}= c^{(k)}_c(p)\,\sin(2\bar\theta_k),
 $$
 
-Tracked during the scatter; no gradient.
+over all active $(c, k)$ deposit pixels $p$. Then:
+
+$$
+\theta^\star(p) = \tfrac{1}{2}\operatorname{atan2}\!\bigl(M_{\mathrm{im}}(p),\, M_{\mathrm{re}}(p)\bigr).
+$$
+
+This is the **claim-weighted circular mean** of $\bar\theta_k$ — smooth across the ridge, avoiding argmax flip-flop when several bins fire nearly equally (which fragments ridge NMS). Replaces the prior “$\bar\theta_k$ of the single largest claim” rule.
 
 ### 5.9 Why FBP-like and what this buys vs. the prior renderer
 
@@ -442,7 +514,7 @@ The renderer applies **no thinning, splat coherence, or divisive suppression** �
 ## 6. Training (`train.py`)
 
 - **Disk cache** (`precompute_image`): padded RGB `img`, `l0_pix` (fallback when `--no-l0-metric`), `border_mask`, GT, `proj_info`. Invalidation: `TRAIN.L0_CACHE_VERSION` (currently **2**; bump when L0/pad/cache schema changes — not L1 binning or seed).
-- **Each step** (`prepare_batch`): if `L0.LEARNED_METRIC`, **live L0** from cached RGB + learned $W$ → live L1 (`kappa_vm=seed.kappa_vm`) → seed (which writes `rho_out_bins` into `cells_flat`) → renderer. Gradients flow through $W$, $\kappa_{\mathrm{vm}}$, all seed scalars, and all renderer parameters.
+- **Each step** (`prepare_batch`): if `L0.LEARNED_METRIC`, **live L0** from cached RGB + learned $W$ + `L0Notch` (when `L0.NOTCH_ENABLED`) → live L1 (`kappa_vm=seed.kappa_vm`) → seed (which writes `rho_out_bins` into `cells_flat`) → renderer. Gradients flow through $W$, notch $(\rho_\omega, \rho_\sigma, \rho_d)$, $\kappa_{\mathrm{vm}}$, all seed scalars, and all renderer parameters.
 
 **Loss** (defaults `TRAIN.LAM_DICE=0`, `TRAIN.LAM_BCE=1`): weighted sum of soft-Dice and/or BCE on the **η± edge band** — valid pixels where $\mathrm{GT} \ge \eta_{\mathrm{pos}}$ or $\mathrm{GT} < \eta_{\mathrm{neg}}$ (default $\eta_{\mathrm{pos}} = \eta_{\mathrm{neg}} = 0.5$).
 
@@ -455,6 +527,7 @@ Checkpoints store `{"model_state": state_dict}` (`intermediate.pt`, `final.pt`).
 | Block | Count | Notes |
 |------:|------:|------|
 | $W$ (`L0LearnedMetric`) | 9 | $3\times3$ RGB metric; omitted with `--no-l0-metric` |
+| $\rho_\omega, \rho_\sigma, \rho_d$ (`L0Notch`) | 3 | JPEG notch $(\omega_n, \sigma_n, d)$; omitted when `NOTCH_ENABLED` off |
 | $\kappa_{\mathrm{vm}}, \eta_z, \beta_{\mathrm{seed}}, \beta_{\mathrm{coll}}, \kappa_\theta, \eta_{\mathrm{readout}}, \lambda, \sigma_f, \sigma_S$ | 9 | Seed ($\kappa_\theta$ used in legacy path only) |
 | Correction MLP $5\to 12\to 4$ | 124 | $5\cdot 12 + 12 + 12\cdot 4 + 4$ |
 | $\kappa_{\max}, e_{\max}, \delta_{n,\max}, \alpha_{\mathrm{range}}$ | 4 | correction bounds (softplus) |
@@ -462,7 +535,7 @@ Checkpoints store `{"model_state": state_dict}` (`intermediate.pt`, `final.pt`).
 | $\phi_\perp \in \mathbb{R}^{H_w + 1}$ | 5 | radial filter taps (peak softplus, sides free-sign), at $H_w = 4$ |
 | $\psi_\parallel \in \mathbb{R}^{H_w}, h_\parallel^{\mathrm{peak}}$ | 5 | longitudinal monotone-decay logits + peak softplus, at $H_w = 4$ |
 | **Renderer subtotal** | **140** | |
-| **Total (`StriateE2E`, default)** | **158** | 9 L0 + 9 seed + 140 renderer |
+| **Total (`StriateE2E`, default)** | **161** | 9 W + 3 notch + 9 seed + 140 renderer |
 
 L0 $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ are **fixed** (`params.L0`). Fixed buffers on seed: `theta_bins`, `B_orth` ($K\times K$). Filter half-width $H_w$ is fixed at renderer construction from canonical L1 stride; changing `L1.PATCH_SIZE` or `PATCH_OVERLAP` requires fresh-init of the filters.
 
@@ -472,7 +545,7 @@ L0 $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ are **fixed** (`params.L0`). Fixed
 
 | Stage | Primary code |
 |-------|----------------|
-| $d_k$, NR, harmonics, $z_1, z_2$, learned $W$, interior mask | `hci/L0.py` |
+| $d_k$, NR, harmonics, $z_1, z_2$, learned $W$, `L0Notch`, interior mask | `hci/L0.py` |
 | z₂ moments, von Mises bins $\rho^{(k)}$, per-bin anchors, legacy $|Z_2|$ | `hci/L1.py` |
 | Per-bin NR, collinear, $B$-surround, per-bin tensor + STE export, legacy scalar path | `hci/seed.py` |
 | Per-(c, k) features + MLP, learned 1D kernels, FBP synthesis, noisy-OR, ridge NMS | `hci/renderer.py` |
@@ -484,10 +557,11 @@ L0 $\eta_{\mathrm{lum}}, \eta_{\mathrm{chr}}$ are **fixed** (`params.L0`). Fixed
 
 ## 9. Revision note
 
-This document matches the **STRIATE** stack as of the **K-tensor L1 + per-bin seed + FBP-style renderer** architecture:
+This document matches the **STRIATE** stack as of the **notched L0 + K-tensor L1 + per-bin seed + FBP-style renderer** architecture:
 
+- **L0 (default training):** learned $W$ + `L0Notch` — project $\to$ separable JPEG notch (replicate-padded) $\to$ squared differences $\to$ NR $\to$ harmonics with $\gamma$ on $h_{2m}$ only. Legacy path (fixed metric, min subtraction, $\gamma$ in NR) retained for disk cache / `--no-l0-metric`.
 - **L1:** $K = 8$ von Mises orientation bins with learned $\kappa_{\mathrm{vm}}$ (on seed, consumed by L1 each step). $\bar\theta_k$ is a gradient angle; tangent is $(\cos\bar\theta, \sin\bar\theta)$ in $(\mathrm{row}, \mathrm{col})$ order.
 - **Seed:** per-bin NR → same-bin collinear → $B$-orthogonal surround → divisive readout; exports both per-bin tensor `rho_out_bins` (renderer input) and STE scalar $\rho$ + soft double-angle $\theta$ + argmax-bin anchors (legacy / diagnostics).
-- **Renderer:** 5-feature per-(c, k) context → MLP $5\to 12\to 4$ → bounded $(\kappa, e, \delta_n, \log\alpha)$ corrections; sparsity gate; **learned 1D reconstruction kernels** $h_\perp$ (free-sign side-lobes) and $h_\parallel$ (monotone-decay) sampled by linear interpolation at continuous query; per-(c, k) Gaussian-stroke synthesis; noisy-OR across all active $(c, k)$ — **not** the earlier soft-indicator basis splat, anisotropic Gaussian splat + 20→12→1 thinning head, or the intermediate 82-param Gaussian-stroke renderer.
+- **Renderer:** 5-feature per-(c, k) context → MLP $5\to 12\to 4$ → bounded $(\kappa, e, \delta_n, \log\alpha)$ corrections; **sharper sparsity gate** ($\tau \approx 0.75$, $\alpha_g \approx 20$ at init); **learned 1D reconstruction kernels** $h_\perp$ and $h_\parallel$ sampled by linear interpolation; per-(c, k) stroke synthesis; noisy-OR; **claim-weighted circular-mean** $\theta^\star$ for ridge NMS — **not** the earlier soft-indicator basis splat, anisotropic Gaussian splat + 20→12→1 thinning head, or the intermediate 82-param Gaussian-stroke renderer.
 
 Legacy scalar seed path (`_forward_legacy`) and legacy L1-only inputs remain for compatibility but are not the default training/inference path when `rho_bin` is present.

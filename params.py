@@ -96,9 +96,9 @@ RENDER = SimpleNamespace(
     DELTA_N_MAX_INIT=1.0,       # pixels — normal anchor correction (2D shift in normal dir)
     ALPHA_RANGE_INIT=0.5,       # log-range — α ∈ [e^{-0.5}, e^{+0.5}] ≈ [0.6, 1.65]
 
-    # ── Sparsity gate: bin retained when ρ^(k) > τ · max_j ρ^(j) ──────────
-    BIN_GATE_TAU_INIT=0.4,      # τ ∈ [0, 1] via sigmoid; data-awareness lever
-    BIN_GATE_ALPHA_INIT=10.0,   # gate sharpness
+    # ── Sparsity gate: near-winner-take-all per cell (soft top-1 / top-2) ───
+    BIN_GATE_TAU_INIT=0.75,     # τ ∈ [0, 1] via sigmoid; bins below τ·ρ_max gated out
+    BIN_GATE_ALPHA_INIT=20.0,   # gate sharpness α_g (higher → harder competition)
 
     # ── Correction MLP topology ───────────────────────────────────────────
     CORR_HIDDEN=12,             # 5 features → 12 hidden → 4 outputs (124 params)
