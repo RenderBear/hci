@@ -84,7 +84,7 @@ def _sync(device):
         torch.cuda.synchronize()
 
 
-def run_l0_l1(img_path, device, metric=None, kappa_vm=None):
+def run_l0_l1(img_path, device, metric=None, notch=None, kappa_vm=None):
     timings = {}
 
     _sync(device)
@@ -103,6 +103,7 @@ def run_l0_l1(img_path, device, metric=None, kappa_vm=None):
             gamma=L0.GAMMA,
             offsets=L0.OFFSETS,
             metric=metric,
+            notch=notch,
         )
     h_np = h.cpu().numpy()
     img_pinwheel = np.clip(ir_p[:H0, :W0].copy(), 0.0, 1.0)
@@ -411,7 +412,11 @@ def main():
 
     img_path = os.path.join(args.input_dir, args.image)
     prep, prep_t = run_l0_l1(
-        img_path, device, metric=model.l0_metric, kappa_vm=model.seed.kappa_vm,
+        img_path,
+        device,
+        metric=model.l0_metric,
+        notch=getattr(model, "l0_notch", None),
+        kappa_vm=model.seed.kappa_vm,
     )
 
     collect_diags = args.verbose or args.diagnostics

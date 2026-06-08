@@ -19,6 +19,12 @@ L0 = SimpleNamespace(
     EPS=1e-6,
     # Learned RGB metric W (M = WᵀW); trained end-to-end, init = orthonormal lum/chr.
     LEARNED_METRIC=True,
+    # JPEG-notch on W-projected channels (before directional differences / NR).
+    NOTCH_ENABLED=True,
+    NOTCH_HALF_WIDTH=4,          # L = 2H + 1 = 9
+    NOTCH_OMEGA_N_INIT=1.0 / 8,  # cycles/pixel — JPEG fundamental
+    NOTCH_SIGMA_N_INIT=1.0 / 32,
+    NOTCH_D_INIT=0.8,
 )
 
 # ── L1: patch geometry + z₂ orientation bins (von Mises on θ_p) ───────────

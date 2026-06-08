@@ -30,6 +30,7 @@ from hci.L0 import (
     compute_l0_rgb,
     compute_interior,
     L0LearnedMetric,
+    L0Notch,
 )
 from hci.L1 import (
     stride_from_patch_overlap,
@@ -91,6 +92,7 @@ def build_l0_pix_live(
     border_mask: torch.Tensor,
     metric: L0LearnedMetric | None,
     device: torch.device,
+    notch: L0Notch | None = None,
 ) -> dict[str, torch.Tensor]:
     """Differentiable L0 pixel features from cached RGB (for learned metric)."""
     if not isinstance(img, torch.Tensor):
@@ -104,6 +106,7 @@ def build_l0_pix_live(
         gamma=L0.GAMMA,
         offsets=L0.OFFSETS,
         metric=metric,
+        notch=notch,
     )
     z1_re, z1_im = s[..., 0], s[..., 1]
     z2_re, z2_im = s[..., 2], s[..., 3]
@@ -250,6 +253,8 @@ class StriateE2E(nn.Module):
         super().__init__()
         _ = kw  # absorbs legacy StriateE2E kwargs if a caller still passes them
         self.l0_metric = L0LearnedMetric() if use_l0_metric else None
+        use_notch = use_l0_metric and bool(getattr(L0, "NOTCH_ENABLED", False))
+        self.l0_notch = L0Notch() if use_notch else None
         self.seed = AndGateSeed(eps=eps)  # alias → ContourSeed; init from params.SEED
         self.renderer = ModulationRenderer()
         self.eps = eps
@@ -288,7 +293,9 @@ def prepare_batch(items, device, model: StriateE2E):
                     "learned L0 metric requires cached RGB ``img``; "
                     "rebuild cache (L0_CACHE_VERSION bump)."
                 )
-            l0_dev = build_l0_pix_live(img, border_mask, model.l0_metric, device)
+            l0_dev = build_l0_pix_live(
+                img, border_mask, model.l0_metric, device, notch=model.l0_notch,
+            )
         else:
             l0_dev = {k: v.to(device) for k, v in l0_pix.items()}
         # κ_vm lives on seed; L1 is re-called each batch so ∂loss/∂κ_vm reaches _kappa_vm_raw.
@@ -752,12 +759,19 @@ def format_l0_param_lines(model: StriateE2E, *, indent: str = "  ") -> list[str]
     if m is None:
         return [f"{indent}fixed lum/chr split (no learned L0 metric)"]
     w = m.W.detach().cpu()
-    return [
+    lines = [
         f"{indent}learned L0 metric W (3×3, M=WᵀW); row-0 lum, rows 1–2 chr",
         f"{indent}W[0]={w[0].tolist()}",
         f"{indent}W[1]={w[1].tolist()}",
         f"{indent}W[2]={w[2].tolist()}",
     ]
+    n = model.l0_notch
+    if n is not None:
+        lines.append(
+            f"{indent}JPEG notch: ω_n={n.omega_n.item():.4g}  "
+            f"σ_n={n.sigma_n.item():.4g}  d={n.d.item():.4g}  L={2 * n.H + 1}"
+        )
+    return lines
 
 
 def format_l1_param_lines(model: StriateE2E, *, indent: str = "  ") -> list[str]:
@@ -793,7 +807,11 @@ def format_renderer_param_lines(r, *, indent: str = "  ") -> list[str]:
 
 def format_model_param_counts(model: StriateE2E) -> tuple[int, int, int, int]:
     """Returns (total, l0, seed, renderer)."""
-    n_l0 = sum(p.numel() for p in model.l0_metric.parameters()) if model.l0_metric else 0
+    n_l0 = 0
+    if model.l0_metric is not None:
+        n_l0 += sum(p.numel() for p in model.l0_metric.parameters())
+    if model.l0_notch is not None:
+        n_l0 += sum(p.numel() for p in model.l0_notch.parameters())
     n_seed = sum(p.numel() for p in model.seed.parameters())
     n_renderer = sum(p.numel() for p in model.renderer.parameters())
     n_total = sum(p.numel() for p in model.parameters())
@@ -909,9 +927,10 @@ def main():
         print("  warning: both lambdas are 0 — loss is identically zero")
     use_l0_metric = L0.LEARNED_METRIC and not args.no_l0_metric
     if use_l0_metric:
+        notch_note = " + JPEG notch" if getattr(L0, "NOTCH_ENABLED", False) else ""
         print(
-            f"L0 (live, learned W): η_lum={L0.ETA_LUM}  η_chr={L0.ETA_CHR}  "
-            f"γ={L0.GAMMA}  (η fixed; W trained end-to-end)"
+            f"L0 (live, learned W{notch_note}): η_lum={L0.ETA_LUM}  η_chr={L0.ETA_CHR}  "
+            f"γ={L0.GAMMA} on h₂m  (η fixed; W/notch trained end-to-end)"
         )
     else:
         print(

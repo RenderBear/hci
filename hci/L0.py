@@ -22,17 +22,23 @@ Optional learned RGB metric ``L0LearnedMetric``: ``d = ‖W Δc‖₂`` with ``M
 row 0 = luminance, rows 1–2 = chrominance at init (orthonormal). Trained end-to-end
 when ``params.L0.LEARNED_METRIC`` is enabled.
 
+With ``L0Notch`` (``params.L0.NOTCH_ENABLED``): project ``u = Wc``, separable
+JPEG notch on all three projected channels, then squared directional differences,
+NR without per-direction min subtraction, and ``γ`` applied to ``h_{2m}`` only.
+
 Non-RGB ``compute_contrast_field`` (divisive NR) is unchanged for grayscale / generic C.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from typing import Union
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 try:
     from params import L0 as _L0_PARAMS
@@ -41,6 +47,8 @@ except Exception:  # pragma: no cover
         EPS = 1e-6
 
 _L0_EPS = float(getattr(_L0_PARAMS, "EPS", 1e-6))
+
+EtaArg = Union[float, int, np.floating, np.integer, Callable[[], float]]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -84,6 +92,94 @@ class L0LearnedMetric(nn.Module):
         d_lum = proj[..., 0].abs()
         d_chr = (proj[..., 1:].square().sum(dim=-1) + _L0_EPS).sqrt()
         return d_lum, d_chr
+
+    def project_image(self, img_rgb: torch.Tensor) -> torch.Tensor:
+        """Map ``(H, W, 3)`` RGB to ``(H, W, 3)`` projected channels."""
+        return torch.einsum("hwi,ji->hwj", img_rgb, self.W)
+
+
+def _logit(p: float) -> float:
+    p = float(np.clip(p, 1e-6, 1.0 - 1e-6))
+    return math.log(p / (1.0 - p))
+
+
+def _softplus_inv(y: float) -> float:
+    y = max(float(y), 1e-8)
+    return math.log(math.expm1(y))
+
+
+class L0Notch(nn.Module):
+    r"""Learnable JPEG notch — separable conv on projected channels before differences.
+
+    Frequency response (cycles/pixel, real even):
+      N(ω) = 1 − d · exp(−(|ω| − ω_n)² / (2σ_n²))
+
+    Spatial kernel on matched lattice ω_m = m/L via cosine synthesis; applied
+    separably in 2D before Naka–Rushton.
+    """
+
+    def __init__(
+        self,
+        *,
+        half_width: int | None = None,
+        omega_n_init: float | None = None,
+        sigma_n_init: float | None = None,
+        d_init: float | None = None,
+        learnable: bool = True,
+    ) -> None:
+        super().__init__()
+        H = int(half_width if half_width is not None else getattr(_L0_PARAMS, "NOTCH_HALF_WIDTH", 4))
+        wn = float(omega_n_init if omega_n_init is not None else getattr(_L0_PARAMS, "NOTCH_OMEGA_N_INIT", 1.0 / 8))
+        sn = float(sigma_n_init if sigma_n_init is not None else getattr(_L0_PARAMS, "NOTCH_SIGMA_N_INIT", 1.0 / 32))
+        dd = float(d_init if d_init is not None else getattr(_L0_PARAMS, "NOTCH_D_INIT", 0.8))
+        self.H = H
+        rho_omega = _logit(2.0 * wn)
+        rho_sigma = _softplus_inv(sn)
+        rho_d = _logit(dd)
+        if learnable:
+            self.rho_omega = nn.Parameter(torch.tensor(rho_omega, dtype=torch.float32))
+            self.rho_sigma = nn.Parameter(torch.tensor(rho_sigma, dtype=torch.float32))
+            self.rho_d = nn.Parameter(torch.tensor(rho_d, dtype=torch.float32))
+        else:
+            self.register_buffer("rho_omega", torch.tensor(rho_omega, dtype=torch.float32))
+            self.register_buffer("rho_sigma", torch.tensor(rho_sigma, dtype=torch.float32))
+            self.register_buffer("rho_d", torch.tensor(rho_d, dtype=torch.float32))
+
+    @property
+    def omega_n(self) -> torch.Tensor:
+        return 0.5 * torch.sigmoid(self.rho_omega)
+
+    @property
+    def sigma_n(self) -> torch.Tensor:
+        return F.softplus(self.rho_sigma)
+
+    @property
+    def d(self) -> torch.Tensor:
+        return torch.sigmoid(self.rho_d)
+
+    def build_kernel(self) -> torch.Tensor:
+        """Length ``L = 2H + 1`` spatial taps ``h_n[n]``."""
+        H = self.H
+        L = 2 * H + 1
+        device = self.rho_omega.device
+        dtype = self.rho_omega.dtype
+        omega_n = self.omega_n.to(dtype=dtype)
+        sigma_n = self.sigma_n.to(dtype=dtype)
+        d = self.d.to(dtype=dtype)
+        m = torch.arange(-H, H + 1, device=device, dtype=dtype)
+        omega_m = m / float(L)
+        N = 1.0 - d * torch.exp(-((omega_m.abs() - omega_n) ** 2) / (2.0 * sigma_n ** 2))
+        n_idx = torch.arange(-H, H + 1, device=device, dtype=dtype)
+        cos_basis = torch.cos(2.0 * math.pi * omega_m.unsqueeze(0) * n_idx.unsqueeze(1))
+        return (N.unsqueeze(0) * cos_basis).sum(dim=1) / float(L)
+
+    def filter_channels(self, u: torch.Tensor) -> torch.Tensor:
+        """Separable notch on each channel of ``(H, W, C)``."""
+        h = self.build_kernel()
+        return torch.stack(
+            [_apply_notch_separable(u[..., i], h) for i in range(u.shape[-1])],
+            dim=-1,
+        )
 
 
 def resolve_eta(eta: EtaArg) -> float:
@@ -134,6 +230,19 @@ def compute_interior(H: int, W: int, device: torch.device) -> torch.Tensor:
     interior[:, 0] = False
     interior[:, -1] = False
     return interior
+
+
+def _apply_notch_separable(ch: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+    """``(h_n *_x (h_n *_y ch))`` with replicate padding at image borders."""
+    H_k = (h.shape[0] - 1) // 2
+    x = ch.unsqueeze(0).unsqueeze(0)
+    x = F.pad(x, [H_k, H_k, H_k, H_k], mode="replicate")
+    h = h.to(device=ch.device, dtype=ch.dtype)
+    h_row = h.view(1, 1, 1, -1)
+    h_col = h.view(1, 1, -1, 1)
+    x = F.conv2d(x, h_row)
+    x = F.conv2d(x, h_col)
+    return x.squeeze(0).squeeze(0)
 
 
 def sf(
@@ -234,6 +343,61 @@ def _compute_d_lum_chroma(
     return d_lum, d_chr
 
 
+def _project_image_rgb(
+    img_rgb: torch.Tensor,
+    metric: L0LearnedMetric | None,
+) -> torch.Tensor:
+    if metric is not None:
+        return metric.project_image(img_rgb)
+    W = orthonormal_lum_chroma_basis().to(device=img_rgb.device, dtype=img_rgb.dtype)
+    return torch.einsum("hwi,ji->hwj", img_rgb, W)
+
+
+def _compute_m_sq_lum_chroma(
+    u_tilde: torch.Tensor,
+    offsets: list[tuple[int, int]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Squared directional magnitudes on notched projected channels."""
+    H, W, _ = u_tilde.shape
+    N = len(offsets)
+    lum = u_tilde[..., 0]
+    chr = u_tilde[..., 1:]
+    m_lum_sq = torch.empty(H, W, N, dtype=torch.float32, device=u_tilde.device)
+    m_chr_sq = torch.empty(H, W, N, dtype=torch.float32, device=u_tilde.device)
+
+    for k, (dy, dx) in enumerate(offsets):
+        r0s, r1s = max(0, -dy), min(H, H - dy)
+        c0s, c1s = max(0, -dx), min(W, W - dx)
+        r0d, r1d = max(0, dy), min(H, H + dy)
+        c0d, c1d = max(0, dx), min(W, W + dx)
+        d_lum = lum[r0s:r1s, c0s:c1s] - lum[r0d:r1d, c0d:c1d]
+        d_chr = chr[r0s:r1s, c0s:c1s] - chr[r0d:r1d, c0d:c1d]
+        m_lum_sq[r0d:r1d, c0d:c1d, k] = d_lum.square()
+        m_chr_sq[r0d:r1d, c0d:c1d, k] = d_chr.square().sum(dim=-1)
+        if dy > 0:
+            m_lum_sq[:dy, :, k] = 0.0
+            m_chr_sq[:dy, :, k] = 0.0
+        elif dy < 0:
+            m_lum_sq[dy:, :, k] = 0.0
+            m_chr_sq[dy:, :, k] = 0.0
+        if dx > 0:
+            m_lum_sq[:, :dx, k] = 0.0
+            m_chr_sq[:, :dx, k] = 0.0
+        elif dx < 0:
+            m_lum_sq[:, dx:, k] = 0.0
+            m_chr_sq[:, dx:, k] = 0.0
+    return m_lum_sq, m_chr_sq
+
+
+def _naka_squared(
+    m_sq: torch.Tensor,
+    eta: float,
+) -> torch.Tensor:
+    """m² / (η² + m²) — no per-direction min subtraction, no γ."""
+    eta_sq = float(eta) * float(eta)
+    return m_sq / (eta_sq + m_sq)
+
+
 def _naka_per_direction(
     d: torch.Tensor,
     eta: float,
@@ -306,6 +470,52 @@ def compute_contrast_field_rgb(
     return h, vld, el, g
 
 
+def _compute_l0_rgb_notched(
+    img_rgb: torch.Tensor,
+    *,
+    eta_lum: float,
+    eta_chr: float,
+    gamma: float,
+    offsets: list[tuple[int, int]],
+    metric: L0LearnedMetric | None,
+    notch: L0Notch,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    float,
+    float,
+    float,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Project → notch → differences → NR → harmonics (γ on h₂m only)."""
+    H, W, _ = img_rgb.shape
+    device = img_rgb.device
+    u = _project_image_rgb(img_rgb, metric)
+    u_tilde = notch.filter_channels(u)
+    m_lum_sq, m_chr_sq = _compute_m_sq_lum_chroma(u_tilde, offsets)
+
+    h_lum = _naka_squared(m_lum_sq, eta_lum)
+    h_chr = _naka_squared(m_chr_sq, eta_chr)
+    h = h_lum + h_chr
+
+    vld = compute_valid(H, W, offsets, device)
+    s, h1m, h2m = compute_harmonics(h, offsets)
+    _, _, h2m_lum = compute_harmonics(h_lum, offsets)
+    _, _, h2m_chr = compute_harmonics(h_chr, offsets)
+
+    if gamma != 1.0:
+        g = float(gamma)
+        h2m = h2m.pow(g)
+        h2m_lum = h2m_lum.pow(g)
+        h2m_chr = h2m_chr.pow(g)
+
+    return h, vld, eta_lum, eta_chr, float(gamma), s, h1m, h2m, h2m_lum, h2m_chr
+
+
 def compute_l0_rgb(
     img_rgb: torch.Tensor,
     *,
@@ -314,6 +524,7 @@ def compute_l0_rgb(
     gamma: float,
     offsets: list[tuple[int, int]],
     metric: L0LearnedMetric | None = None,
+    notch: L0Notch | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -340,6 +551,17 @@ def compute_l0_rgb(
     eta_l = resolve_eta(eta_lum)
     eta_c = resolve_eta(eta_chr)
     gamma_used = float(gamma)
+
+    if notch is not None:
+        return _compute_l0_rgb_notched(
+            img_rgb,
+            eta_lum=eta_l,
+            eta_chr=eta_c,
+            gamma=gamma_used,
+            offsets=offsets,
+            metric=metric,
+            notch=notch,
+        )
 
     vld = compute_valid(H, W, offsets, device)
     d_lum, d_chr = _compute_d_lum_chroma(img_rgb, offsets, metric=metric)
@@ -411,6 +633,7 @@ def run_l0(
     offsets: list[tuple[int, int]],
     verbose: bool = True,
     metric: L0LearnedMetric | None = None,
+    notch: L0Notch | None = None,
 ) -> dict:
     H, W = ir.shape[:2]
     device = ir.device
@@ -437,6 +660,7 @@ def run_l0(
             gamma=gamma,
             offsets=offsets,
             metric=metric,
+            notch=notch,
         )
         eta_used_print = float(eta_l)
     else:

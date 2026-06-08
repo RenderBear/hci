@@ -158,6 +158,7 @@ def run_image_inference(
             gamma=L0.GAMMA,
             offsets=L0.OFFSETS,
             metric=getattr(model, "l0_metric", None),
+            notch=getattr(model, "l0_notch", None),
         )
     bm_t = ~compute_interior(ir_p.shape[0], ir_p.shape[1], device)
     z1, z2 = z_from_l0_harmonics(s, bm_t)
