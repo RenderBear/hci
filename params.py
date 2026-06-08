@@ -47,9 +47,9 @@ SEED = SimpleNamespace(
     ETA_READOUT_INIT=0.30,
     LAMBDA_INIT=0.5,
     SIGMA_F_INIT=0.5,
-    FACIL_RADIUS=2,
+    FACIL_RADIUS=5,
     FACIL_MODE="collinear",
-    SURROUND_RADIUS=5,
+    SURROUND_RADIUS=7,
     SURROUND_SIGMA=2.0,
     SURROUND_MODE="broadside",
     # Learned surround Gaussian scale for orientation-bin surround S^(k) (init ≈ SURROUND_SIGMA).
