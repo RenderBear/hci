@@ -117,41 +117,27 @@ Expect `True` for the second value on the CUDA path. Training auto-selects `cuda
 
 ## Usage
 
-### Inference input layout
+### Inference input
 
-`infer.py` takes a **filename** (`-i` / `--image`) and looks for that file under `--input_dir` (default: `data/infer/`):
-
-```
-data/infer/
-  cat.png          # default location — run with -i cat.png
-  photo.jpg
-```
-
-Put the image you want to process in `data/infer/`, then pass only its basename:
+`infer.py` takes the path to the image with `-i` / `--image`:
 
 ```bash
-uv run infer.py -i cat.png --model pretrained/final.pt
-```
-
-If the image lives elsewhere, set `--input_dir` to that folder (path only — still pass the basename with `-i`):
-
-```bash
-uv run infer.py -i cat.png --input_dir ~/Pictures --model pretrained/final.pt
-# reads ~/Pictures/cat.png
+uv run infer.py -i data/infer/cat.png
+uv run infer.py -i ~/Pictures/cat.png
 ```
 
 Outputs go to `--output_dir` (default: `output/results/`). Add `-d` / `--diagnostics` for pinwheel, ρ maps, and overlay PNGs; add `-v` / `--verbose` to print learned parameters.
 
 ### Pretrained model
 
-A pretrained checkpoint is included at `pretrained/final.pt` (learned L0 metric, seed, renderer). Use it to run **infer** or **test** without training your own weights:
+A pretrained checkpoint is included at `pretrained/final.pt` (learned L0 metric, seed, renderer). It's the default `--model` for **infer** and **test**, so you can run them without training your own weights:
 
 ```bash
-# inference (image in data/infer/ by default)
-uv run infer.py -i cat.png --model pretrained/final.pt
+# inference
+uv run infer.py -i data/infer/cat.png
 
 # evaluation on a paired test set
-uv run test.py --images data/test/imgs --test_gt data/test/gt --model pretrained/final.pt
+uv run test.py --images data/test/imgs --test_gt data/test/gt
 ```
 
 Training still writes new checkpoints under `output/checkpoints/`; pass `--model` to point at those instead.
@@ -331,7 +317,7 @@ uv run test.py --model output/checkpoints/final.pt
 | `--images`     | `data/test/imgs`              | RGB test images (`.jpg`/`.png`)                                   |
 | `--test_gt`    | `data/test/gt`                | Ground truth maps (`.png`/`.jpg`/`.mat`)                          |
 | `--gt_format`  | auto                          | `png` or `mat` (BSDS)                                             |
-| `--model`      | `output/checkpoints/final.pt` | Checkpoint                                                        |
+| `--model`      | `pretrained/final.pt`         | Checkpoint                                                        |
 | `--output_dir` | `output/test`                 | Output directory                                                  |
 | `--max_images` | all                           | Cap number of images                                              |
 | `--device`     | CUDA if available             | `cpu`, `cuda`, or `mps`                                           |
@@ -342,22 +328,21 @@ uv run test.py --model output/checkpoints/final.pt
 
 ### Infer
 
-Single-image edge detection. Resolves the input as `{input_dir}/{image}` (see [Inference input layout](#inference-input-layout) above).
+Single-image edge detection on the image at the `-i` path.
 
 ```bash
-# default: data/infer/photo.png → output/results/
-uv run infer.py -i photo.png --model pretrained/final.pt
+# data/infer/photo.png → output/results/
+uv run infer.py -i data/infer/photo.png
 
-# custom input folder + diagnostics
-uv run infer.py -i photo.png --input_dir /path/to/images \
+# image elsewhere + diagnostics
+uv run infer.py -i /path/to/images/photo.png \
   --model output/checkpoints/final.pt -d -v
 ```
 
 | Flag           | Default                       | Role                                                              |
 | -------------- | ----------------------------- | ----------------------------------------------------------------- |
-| `-i`, `--image`| *(required)*                  | Image filename (resolved under `--input_dir`)                     |
-| `--input_dir`  | `data/infer`                  | Folder containing the input image                                 |
-| `--model`      | `output/checkpoints/intermediate.pt` | Checkpoint                                                 |
+| `-i`, `--image`| *(required)*                  | Path to the input image                                           |
+| `--model`      | `pretrained/final.pt`         | Checkpoint                                                        |
 | `--output_dir` | `output/results`              | Where edge PNGs (and diagnostics) are written                     |
 | `-d`, `--diagnostics` | off                    | Save pinwheel, ρ maps, geometry, overlay, etc.                    |
 | `-t`, `--threshold` | `0.5`                     | Binarization threshold on the soft boundary map                   |

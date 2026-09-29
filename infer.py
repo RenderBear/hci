@@ -364,10 +364,9 @@ def _format_model_summary(model) -> list[str]:
 
 def main():
     ap = argparse.ArgumentParser(description="HCI single-image inference")
-    ap.add_argument("-i", "--image", required=True)
-    ap.add_argument("--input_dir", default="data/infer")
+    ap.add_argument("-i", "--image", required=True, help="Path to the input image.")
     ap.add_argument("--output_dir", default="output/results")
-    ap.add_argument("--model", default="output/checkpoints/intermediate.pt")
+    ap.add_argument("--model", default="pretrained/final.pt")
     ap.add_argument(
         "-t",
         "--threshold",
@@ -413,7 +412,7 @@ def main():
     device = torch.device(
         args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
     )
-    stem = os.path.splitext(args.image)[0]
+    stem = os.path.splitext(os.path.basename(args.image))[0]
 
     ckpt = torch.load(args.model, map_location="cpu", weights_only=False)
     model = build_model(ckpt, device)
@@ -423,7 +422,7 @@ def main():
             print(line)
         print()
 
-    img_path = os.path.join(args.input_dir, args.image)
+    img_path = args.image
     prep, prep_t = run_l0_l1(
         img_path,
         device,

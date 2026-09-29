@@ -237,7 +237,7 @@ def main():
     ap.add_argument("--max_images", type=int, default=None)
     ap.add_argument("--test_gt", default="data/test/gt")
     ap.add_argument("--gt_format", default=None)
-    ap.add_argument("--model", default="output/checkpoints/intermediate.pt")
+    ap.add_argument("--model", default="pretrained/final.pt")
     ap.add_argument("--output_dir", default="output/test")
     ap.add_argument("--device", default=None)
     ap.add_argument(
