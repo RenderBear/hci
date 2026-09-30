@@ -153,7 +153,7 @@ def run_moments_cells_flat(
     W0: int,
     device: torch.device,
     *,
-    kappa_vm: torch.Tensor | float | None = None,
+    kappa_vm: torch.Tensor | float,
 ) -> dict:
     h2m = l0_pix["h2m"].to(device=device, dtype=torch.float32)
     z2 = torch.complex(
@@ -161,8 +161,6 @@ def run_moments_cells_flat(
         l0_pix["z2_im"].to(device=device, dtype=torch.float32),
     )
     bm = border_mask.to(device=device).bool()
-    if kappa_vm is None:
-        kappa_vm = float(getattr(L1, "KAPPA_VM_INIT", 2.0))
     cells = compute_cell_moments(
         h2m,
         z2,

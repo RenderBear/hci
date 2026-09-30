@@ -1,4 +1,4 @@
-r"""test.py — HCI test-set evaluation on the BSDS500 boundary benchmark (ODS, OIS, AP)"""
+r"""test.py — HCI test-set evaluation with the Berkeley boundary benchmark (ODS, OIS, AP)"""
 
 from __future__ import annotations
 
@@ -189,7 +189,12 @@ def run_image_inference(
 
 
 def main():
-    ap = argparse.ArgumentParser(description="HCI test-set metrics (BSDS500 boundary benchmark)")
+    ap = argparse.ArgumentParser(description="HCI test-set metrics (Berkeley boundary benchmark)")
+    ap.add_argument(
+        "--dataset",
+        default="BRIND",
+        help="Dataset name shown in the report (default matches data/test: BRIND).",
+    )
     ap.add_argument("--images", default="data/test/imgs")
     ap.add_argument("--max_images", type=int, default=None)
     ap.add_argument("--test_gt", default="data/test/gt")
@@ -351,14 +356,18 @@ def main():
 
     gt_kind = "per-annotator .mat" if gt_format == "mat" else "single-map PNG"
     print(f"\n{'=' * 50}")
-    print(f"BSDS500 boundary benchmark  nthresh={args.nthresh}  maxDist={args.tol:g}  GT: {gt_kind}")
+    print(
+        f"{args.dataset}  (Berkeley boundary benchmark  nthresh={args.nthresh}  "
+        f"maxDist={args.tol:g}  GT: {gt_kind})"
+    )
     for mode in eval_modes:
         s = collect(per_image[mode])
         mode_dir = os.path.join(args.output_dir, mode)
         write_bsr_files(mode_dir, s)
         summary = {
             "mode": mode,
-            "protocol": "BSDS500 boundary benchmark (bwmorph thin + one-to-one correspondPixels)",
+            "dataset": args.dataset,
+            "protocol": "Berkeley boundary benchmark (bwmorph thin + one-to-one correspondPixels)",
             "nthresh": args.nthresh,
             "max_dist": args.tol,
             "gt_format": gt_format,

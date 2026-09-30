@@ -25,6 +25,15 @@ A compact, fully distributed algorithm that extracts edges from RGB images throu
 
 <p align="center"><em>Left: input image. Right: HCI edge map from the bundled pretrained model.</em></p>
 
+## Benchmarks
+
+Scores for `pretrained/final.pt` on the BRIND test set (200 images; the model was trained on the 300-image BRIND train split). Evaluation uses the Berkeley boundary benchmark: 99 thresholds and `maxDist` 0.0075 (≈4.3 px on 481×321 images). Predictions are thinned before one-to-one matching; see [Test](#test).
+
+| Output | ODS | OIS | AP |
+| --- | --- | --- | --- |
+| NMS-thinned map (`s_eval`) | 0.661 | 0.692 | 0.684 |
+| Raw soft map (`c_eval`) | 0.661 | 0.691 | 0.537 |
+
 ## Structure
 
 ```
@@ -40,6 +49,7 @@ HCI/
 │   ├── L1.py                # cell-level z₂ moments (E, C, θ)
 │   ├── seed.py              # η_z NR + collinear + surround → cell ρ for splat
 │   ├── renderer.py          # learned ridge projection
+│   ├── boundary_bench.py    # Berkeley boundary benchmark (ODS, OIS, AP)
 │   └── diagnostics_viz.py   # visualisation utilities
 ├── data/                    
 │   ├── train/imgs, train/gt # training pairs
@@ -49,7 +59,7 @@ HCI/
 │   └── final.pt             # bundled weights — infer / test without training
 └── output/
     ├── checkpoints/         # final.pt, intermediate.pt
-    └── test/results.json
+    └── test/{c_eval,s_eval}/ # results.json, eval_bdry*.txt, preds/
 ```
 
 
@@ -184,6 +194,7 @@ Use a dedicated `--cache_dir` so BIPED caches do not mix with other experiments.
 
 ```bash
 uv run test.py \
+  --dataset BIPED \
   --images BIPED/edges/imgs/test/rgbr \
   --test_gt BIPED/edges/edge_maps/test/rgbr \
   --output_dir output/test_biped
@@ -214,6 +225,7 @@ uv run train.py \
 
 ```bash
 uv run test.py \
+  --dataset BRIND \
   --images BRIND/edges/imgs/test/rgbr \
   --test_gt BRIND/edges/edge_maps/test/rgbr \
   --output_dir output/test_brind
@@ -247,6 +259,7 @@ Use a dedicated `--cache_dir` so BSDS caches do not mix with BIPED or other runs
 
 ```bash
 uv run test.py \
+  --dataset BSDS500 \
   --images BSDS500/BSDS500/data/images/test \
   --test_gt BSDS500/BSDS500/data/groundTruth/test \
   --gt_format mat \
@@ -282,6 +295,7 @@ Use a dedicated `--cache_dir` so NYUD caches do not mix with other experiments. 
 
 ```bash
 uv run test.py \
+  --dataset NYUDv2 \
   --images NYUDv2/images \
   --test_gt NYUDv2/GT \
   --output_dir output/test_nyudv2
@@ -315,6 +329,7 @@ The protocol follows the Berkeley benchmark (`hci/boundary_bench.py`). At each o
 
 | Flag           | Default                       | Role                                                              |
 | -------------- | ----------------------------- | ----------------------------------------------------------------- |
+| `--dataset`    | `BRIND`                       | Dataset name shown in the report and `results.json`               |
 | `--images`     | `data/test/imgs`              | RGB test images (`.jpg`/`.png`)                                   |
 | `--test_gt`    | `data/test/gt`                | Ground truth maps (`.png`/`.jpg`/`.mat`)                          |
 | `--gt_format`  | auto                          | `png` or `mat` (BSDS)                                             |
