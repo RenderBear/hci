@@ -305,12 +305,13 @@ Use the corresponding split paths with `train.py` and `test.py`.
 
 ### Test
 
-Walks a single image directory, pairs each image with ground truth by matching filename stems:
+Walks a single image directory, pairs each image with ground truth by matching filename stems, and scores both the raw map (`c_eval`) and the NMS-thinned map (`s_eval`) with the BRIND boundary benchmark:
 
 ```bash
 uv run test.py --model output/checkpoints/final.pt
 ```
 
+The protocol follows the Berkeley benchmark (`hci/boundary_bench.py`). At each of `--nthresh` thresholds, the saved 8-bit prediction is binarised and thinned (`bwmorph(·, 'thin', inf)`). It is then matched one-to-one against each annotator within `tol × image diagonal` pixels. ODS interpolates between thresholds, OIS uses each image's best threshold, and AP is the area under the PR curve resampled at 0.01 recall. With `.mat` ground truth each BRIND annotator is matched separately. A PNG ground-truth map counts as a single annotator, so a PNG made by merging annotators scores lower than the official per-annotator `.mat` evaluation. Scores from `test.py` before this change used a dilation match and are not comparable.
 
 | Flag           | Default                       | Role                                                              |
 | -------------- | ----------------------------- | ----------------------------------------------------------------- |
@@ -321,7 +322,11 @@ uv run test.py --model output/checkpoints/final.pt
 | `--output_dir` | `output/test`                 | Output directory                                                  |
 | `--max_images` | all                           | Cap number of images                                              |
 | `--device`     | CUDA if available             | `cpu`, `cuda`, or `mps`                                           |
-| `--tol`        | `0.0075`                      | Precision-match radius factor (`max_dist = tol * image_diagonal`) |
+| `--tol`        | `0.0075`                      | Matching distance as a fraction of the image diagonal (NYUD convention: `0.011`) |
+| `--nthresh`    | `99`                          | Number of thresholds                                              |
+| `--workers`    | `min(8, cores)`               | Benchmark processes (inference stays on `--device`)               |
+
+Each `output_dir/{c_eval,s_eval}/` gets `results.json` (summary, PR curve, per-image counts) and `eval_bdry.txt`, `eval_bdry_thr.txt`, `eval_bdry_img.txt` in the Berkeley column layout, so standard PR-curve plotting scripts can read them.
 
 
 

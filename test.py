@@ -1,4 +1,4 @@
-r"""test.py — HCI test-set evaluation (ODS, OIS, AP)"""
+r"""test.py — HCI test-set evaluation on the BSDS500 boundary benchmark (ODS, OIS, AP)"""
 
 from __future__ import annotations
 
@@ -6,13 +6,15 @@ import argparse
 import gc
 import glob
 import json
+import multiprocessing
 import os
 import time
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import torch
 from PIL import Image
-from scipy.ndimage import binary_dilation
 
 from params import L0, L1, SEED, EVAL
 from hci.L0 import compute_l0_rgb, compute_interior
@@ -24,6 +26,7 @@ from hci.renderer import (
     ridge_nms,
     upgrade_renderer_state_dict,
 )
+from hci.boundary_bench import collect, evaluate_image, score_image, write_bsr_files
 from hci.diagnostics_viz import viz_infer_rho, viz_infer_geometry
 from train import (
     HCIE2E,
@@ -33,8 +36,6 @@ from train import (
     upgrade_model_state_dict,
 )
 
-EVAL_THRESHOLDS = np.linspace(0.01, 0.99, EVAL.THRESHOLD_COUNT)
-
 
 def build_model(ckpt, device):
     m = HCIE2E(eps=SEED.EPS)
@@ -43,12 +44,6 @@ def build_model(ckpt, device):
     incompatible = m.load_state_dict(sd, strict=False)
     report_checkpoint_compatibility(incompatible, context="test build_model")
     return m.to(device).eval()
-
-
-def precision_max_dist(H, W, tol=None):
-
-    d = (EVAL.MAX_DIST_FRAC if tol is None else float(tol)) * float(np.hypot(H, W))
-    return max(1, int(round(d)))
 
 
 def _detect_gt_format(gt_dir):
@@ -70,53 +65,13 @@ def _find_gt(gt_dir, stem, gt_format):
 
 
 def _load_gt(gt_path, gt_format):
+    """Boundary maps to match against: one per annotator (BSDS .mat) or a single PNG map."""
     if gt_format == "mat":
         import scipy.io as sio
 
-        m = sio.loadmat(gt_path)
-        gt = m["groundTruth"]
-        combined = None
-        for i in range(gt.shape[1]):
-            b = gt[0, i]["Boundaries"][0, 0].astype(np.float32)
-            combined = b if combined is None else np.maximum(combined, b)
-        return combined
-    return np.array(Image.open(gt_path).convert("L")).astype(np.float32) / 255.0
-
-
-def _eval_at_thresholds(bmap, gt, thresholds, max_dist):
-    gt_bin = gt >= 0.5
-    struct = np.ones((2 * max_dist + 1, 2 * max_dist + 1), dtype=bool)
-    gt_dilated = binary_dilation(gt_bin, structure=struct)
-    n_gt = int(gt_bin.sum())
-    results = []
-    for t in thresholds:
-        pred = bmap >= t
-        pred_dilated = binary_dilation(pred, structure=struct)
-        tp_p = int((pred & gt_dilated).sum())
-        tp_r = int((gt_bin & pred_dilated).sum())
-        n_pred = int(pred.sum())
-        prec = tp_p / max(n_pred, 1)
-        rec = tp_r / max(n_gt, 1)
-        f1 = 2 * prec * rec / max(prec + rec, 1e-15)
-        results.append({
-            "t": float(t), "P": prec, "R": rec, "F1": f1,
-            "tp_p": tp_p, "tp_r": tp_r, "n_pred": n_pred, "n_gt": n_gt,
-        })
-    return results
-
-
-def _ap_from_pr(results):
-    recs = np.array([r["R"] for r in results])
-    precs = np.array([r["P"] for r in results])
-    order = np.argsort(recs)
-    recs = recs[order]
-    precs = precs[order]
-    mrec = np.concatenate([[0.0], recs, [1.0]])
-    mpre = np.concatenate([[0.0], precs, [0.0]])
-    for i in range(len(mpre) - 2, -1, -1):
-        mpre[i] = max(mpre[i], mpre[i + 1])
-    idx = np.where(mrec[1:] != mrec[:-1])[0]
-    return float(((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1]).sum())
+        gt = sio.loadmat(gt_path)["groundTruth"]
+        return [gt[0, i]["Boundaries"][0, 0].astype(bool) for i in range(gt.shape[1])]
+    return [np.array(Image.open(gt_path).convert("L")).astype(np.float32) / 255.0 >= 0.5]
 
 
 def run_image_inference(
@@ -168,6 +123,8 @@ def run_image_inference(
         eps=L1.EPS,
         device=device,
         verbose=False,
+        kappa_vm=model.seed.kappa_vm.detach(),
+        num_orient_bins=int(L1.NUM_ORIENT_BINS),
     )
     del h2m, z1, z2, bm_t, ir_t
     gc.collect()
@@ -232,7 +189,7 @@ def run_image_inference(
 
 
 def main():
-    ap = argparse.ArgumentParser(description="HCI test-set metrics")
+    ap = argparse.ArgumentParser(description="HCI test-set metrics (BSDS500 boundary benchmark)")
     ap.add_argument("--images", default="data/test/imgs")
     ap.add_argument("--max_images", type=int, default=None)
     ap.add_argument("--test_gt", default="data/test/gt")
@@ -248,9 +205,21 @@ def main():
     ap.add_argument(
         "--tol",
         type=float,
-        default=None,
-        help="Tolerance factor for precision matching radius: max_dist = tol * diagonal "
-        "(default: 0.0075).",
+        default=EVAL.MAX_DIST_FRAC,
+        help="Matching distance as a fraction of the image diagonal "
+        "(BSDS maxDist: 0.0075; NYUD convention: 0.011).",
+    )
+    ap.add_argument(
+        "--nthresh",
+        type=int,
+        default=EVAL.THRESHOLD_COUNT,
+        help="Number of thresholds (BSDS: 99).",
+    )
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=min(8, os.cpu_count() or 1),
+        help="Processes running the benchmark; inference stays on --device.",
     )
     args = ap.parse_args()
 
@@ -315,152 +284,117 @@ def main():
     if diag_dir:
         print(f"diagnostics -> {diag_dir}  (<stem>_rho.png, <stem>_geometry.png per image)")
 
-    state = {
-        m: {
-            "per_image": [],
-            "agg_tp_p": np.zeros(len(EVAL_THRESHOLDS)),
-            "agg_tp_r": np.zeros(len(EVAL_THRESHOLDS)),
-            "agg_n_pred": np.zeros(len(EVAL_THRESHOLDS)),
-            "agg_n_gt": 0,
-            "ois_tp_p_sum": 0,
-            "ois_tp_r_sum": 0,
-            "ois_n_pred_sum": 0,
-            "ois_n_gt_sum": 0,
-        }
-        for m in eval_modes
-    }
+    per_image = {m: [] for m in eval_modes}
+    stems = []
     t_total = time.perf_counter()
 
-    for idx, (stem, img_path, gt_path) in enumerate(pairs):
-        t0 = time.perf_counter()
-        bmap_c, theta, H0, W0 = run_image_inference(
-            model,
-            img_path,
-            device,
-            diagnostics_dir=diag_dir,
-            stem=stem if diag_dir else None,
-        )
-        bmap_s = ridge_nms(bmap_c, theta=theta)
-        gt = _load_gt(gt_path, gt_format)
-
-        H = min(bmap_c.shape[0], gt.shape[0])
-        W = min(bmap_c.shape[1], gt.shape[1])
-        bmaps = {"c_eval": bmap_c[:H, :W], "s_eval": bmap_s[:H, :W]}
-        gt = gt[:H, :W]
-
-        eval_max_dist = precision_max_dist(H, W, tol=args.tol)
-
-        for m in eval_modes:
-            png = np.clip(bmaps[m], 0.0, 1.0)
-            png = (png * 255.0 + 0.5).astype(np.uint8)
-            Image.fromarray(png, mode="L").save(
-                os.path.join(pred_dirs[m], f"{stem}.png")
-            )
-
-        gt_png = ((gt >= 0.5).astype(np.uint8)) * 255
-        Image.fromarray(gt_png, mode="L").save(os.path.join(gt_dir, f"{stem}.png"))
-
+    def _report(idx, stem, dt, futures):
         line_parts = [f"  [{idx + 1}/{len(pairs)}] {stem}"]
         for m in eval_modes:
-            results = _eval_at_thresholds(bmaps[m], gt, EVAL_THRESHOLDS, eval_max_dist)
-            st = state[m]
-
-            n_gt_img = results[0]["n_gt"]
-            st["agg_n_gt"] += n_gt_img
-            for ti, r in enumerate(results):
-                st["agg_tp_p"][ti] += r["tp_p"]
-                st["agg_tp_r"][ti] += r["tp_r"]
-                st["agg_n_pred"][ti] += r["n_pred"]
-
-            best_per_img = max(results, key=lambda r: r["F1"])
-            st["ois_tp_p_sum"] += best_per_img["tp_p"]
-            st["ois_tp_r_sum"] += best_per_img["tp_r"]
-            st["ois_n_pred_sum"] += best_per_img["n_pred"]
-            st["ois_n_gt_sum"] += n_gt_img
-
-            ap_i = _ap_from_pr(results)
-            st["per_image"].append(
-                {
-                    "stem": stem,
-                    "OIS_F1": best_per_img["F1"],
-                    "OIS_P": best_per_img["P"],
-                    "OIS_R": best_per_img["R"],
-                    "OIS_t": best_per_img["t"],
-                    "AP": ap_i,
-                }
-            )
+            ev = futures[m].result()
+            per_image[m].append(ev)
+            sc = score_image(ev)
             tag = "C" if m == "c_eval" else "S"
-            line_parts.append(
-                f"{tag}: OIS={best_per_img['F1']:.3f}@{best_per_img['t']:.2f} "
-                f"AP={ap_i:.3f}"
+            line_parts.append(f"{tag}: OIS={sc['F']:.3f}@{sc['T']:.2f} AP={sc['AP']:.3f}")
+        stems.append(stem)
+        line_parts.append(f"infer {dt:.2f}s")
+        print("  ".join(line_parts), flush=True)
+
+    n_workers = max(1, args.workers)
+    pending = deque()
+    with ProcessPoolExecutor(
+        max_workers=n_workers, mp_context=multiprocessing.get_context("spawn"),
+    ) as pool:
+        for idx, (stem, img_path, gt_path) in enumerate(pairs):
+            t0 = time.perf_counter()
+            bmap_c, theta, H0, W0 = run_image_inference(
+                model,
+                img_path,
+                device,
+                diagnostics_dir=diag_dir,
+                stem=stem if diag_dir else None,
             )
+            bmap_s = ridge_nms(bmap_c, theta=theta)
+            dt = time.perf_counter() - t0
+            gts = _load_gt(gt_path, gt_format)
 
-        dt = time.perf_counter() - t0
-        line_parts.append(f"{dt:.2f}s")
-        print("  ".join(line_parts))
+            H = min(bmap_c.shape[0], gts[0].shape[0])
+            W = min(bmap_c.shape[1], gts[0].shape[1])
+            gts = [g[:H, :W] for g in gts]
 
-        del bmap_c, bmap_s, theta, gt, bmaps
-        gc.collect()
+            futures = {}
+            for m, bmap in (("c_eval", bmap_c), ("s_eval", bmap_s)):
+                png = (np.clip(bmap[:H, :W], 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+                Image.fromarray(png, mode="L").save(os.path.join(pred_dirs[m], f"{stem}.png"))
+                # Score the saved 8-bit map, as the MATLAB benchmark reads it back.
+                futures[m] = pool.submit(
+                    evaluate_image, png / 255.0, gts, nthresh=args.nthresh, max_dist=args.tol,
+                )
+
+            gt_png = np.logical_or.reduce(gts).astype(np.uint8) * 255
+            Image.fromarray(gt_png, mode="L").save(os.path.join(gt_dir, f"{stem}.png"))
+
+            pending.append((idx, stem, dt, futures))
+            while pending and (
+                len(pending) > n_workers
+                or all(f.done() for f in pending[0][3].values())
+            ):
+                _report(*pending.popleft())
+
+            del bmap_c, bmap_s, theta, gts
+            gc.collect()
+
+        while pending:
+            _report(*pending.popleft())
 
     dt_total = time.perf_counter() - t_total
 
-    def _finalize(mode):
-        st = state[mode]
-        agg_prec = st["agg_tp_p"] / np.maximum(st["agg_n_pred"], 1)
-        agg_rec = st["agg_tp_r"] / max(st["agg_n_gt"], 1)
-        agg_f1 = 2 * agg_prec * agg_rec / np.maximum(agg_prec + agg_rec, 1e-15)
-
-        ods_idx = int(np.argmax(agg_f1))
-        ods_f1 = float(agg_f1[ods_idx])
-        ods_p = float(agg_prec[ods_idx])
-        ods_r = float(agg_rec[ods_idx])
-        ods_t = float(EVAL_THRESHOLDS[ods_idx])
-
-        ois_prec = st["ois_tp_p_sum"] / max(st["ois_n_pred_sum"], 1)
-        ois_rec = st["ois_tp_r_sum"] / max(st["ois_n_gt_sum"], 1)
-        ois_f1 = 2 * ois_prec * ois_rec / max(ois_prec + ois_rec, 1e-15)
-        mean_ois_macro = float(np.mean([r["OIS_F1"] for r in st["per_image"]]))
-
-        agg_results = [
-            {
-                "t": float(EVAL_THRESHOLDS[i]),
-                "P": float(agg_prec[i]),
-                "R": float(agg_rec[i]),
-                "F1": float(agg_f1[i]),
-            }
-            for i in range(len(EVAL_THRESHOLDS))
-        ]
-        ap_global = _ap_from_pr(agg_results)
-
+    gt_kind = "per-annotator .mat" if gt_format == "mat" else "single-map PNG"
+    print(f"\n{'=' * 50}")
+    print(f"BSDS500 boundary benchmark  nthresh={args.nthresh}  maxDist={args.tol:g}  GT: {gt_kind}")
+    for mode in eval_modes:
+        s = collect(per_image[mode])
+        mode_dir = os.path.join(args.output_dir, mode)
+        write_bsr_files(mode_dir, s)
         summary = {
             "mode": mode,
-            "ODS_F1": ods_f1,
-            "ODS_P": ods_p,
-            "ODS_R": ods_r,
-            "ODS_t": ods_t,
-            "OIS_F1": ois_f1,
-            "OIS_P": ois_prec,
-            "OIS_R": ois_rec,
-            "OIS_F1_macro": mean_ois_macro,
-            "AP": ap_global,
-            "n_images": len(pairs),
+            "protocol": "BSDS500 boundary benchmark (bwmorph thin + one-to-one correspondPixels)",
+            "nthresh": args.nthresh,
+            "max_dist": args.tol,
+            "gt_format": gt_format,
+            "ODS_F1": s["ODS"]["F"],
+            "ODS_P": s["ODS"]["P"],
+            "ODS_R": s["ODS"]["R"],
+            "ODS_t": s["ODS"]["T"],
+            "OIS_F1": s["OIS"]["F"],
+            "OIS_P": s["OIS"]["P"],
+            "OIS_R": s["OIS"]["R"],
+            "AP": s["AP"],
+            "n_images": len(stems),
             "time": dt_total,
             "max_images": args.max_images,
             "images_dir": args.images,
             "model": args.model,
             "preds_dir": pred_dirs[mode],
             "gt_dir": gt_dir,
-            "per_image": st["per_image"],
-            "pr_curve": agg_results,
+            "per_image": [
+                {
+                    "stem": stem,
+                    "OIS_F1": sc["F"],
+                    "OIS_P": sc["P"],
+                    "OIS_R": sc["R"],
+                    "OIS_t": sc["T"],
+                    "AP": sc["AP"],
+                    "counts": {k: ev[k].tolist() for k in ("cntR", "sumR", "cntP", "sumP")},
+                }
+                for stem, sc, ev in zip(stems, s["per_image"], per_image[mode])
+            ],
+            "pr_curve": s["pr_curve"],
         }
-        out_path = os.path.join(args.output_dir, mode, "results.json")
+        out_path = os.path.join(mode_dir, "results.json")
         with open(out_path, "w") as f:
             json.dump(summary, f, indent=2)
-        return summary, out_path
 
-    print(f"\n{'=' * 50}")
-    for mode in eval_modes:
-        summary, out_path = _finalize(mode)
         label = "C_EVAL (raw)" if mode == "c_eval" else "S_EVAL (NMS-thinned)"
         print(f"[{label}]")
         print(
@@ -474,8 +408,9 @@ def main():
         print(f"  AP   {summary['AP']:.4f}")
         print(f"  preds -> {pred_dirs[mode]}")
         print(f"  json  -> {out_path}")
+        print(f"  bsr   -> {mode_dir}/eval_bdry.txt, eval_bdry_thr.txt, eval_bdry_img.txt")
 
-    print(f"[GT (aligned to preds, binary PNG)]")
+    print(f"[GT (aligned to preds, binary PNG; union of annotators for .mat)]")
     print(f"  gt    -> {gt_dir}  ({len(pairs)} files)")
 
     print(f"{'=' * 50}")
