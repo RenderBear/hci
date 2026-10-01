@@ -41,6 +41,9 @@ _CROSS_SURROUND_RADIUS = int(
 )
 _SURROUND_SIGMA = float(getattr(SEED, "SURROUND_SIGMA", 2.0))
 _RHO_STE_TAU = float(getattr(SEED, "RHO_STE_TAU", 0.1))
+_SIGMA_F_MIN = float(getattr(SEED, "SIGMA_F_MIN", 1.0))
+_KAPPA_A_INIT = float(getattr(SEED, "KAPPA_A_INIT", 8.0))
+_BETA_GAP_INIT = float(getattr(SEED, "BETA_GAP_INIT", 0.5))
 
 
 def _inv_softplus(x: float) -> float:
@@ -255,38 +258,38 @@ def _gaussian_exponent(
     return torch.exp(-d2 / (2.0 * sigma_sq.clamp_min(1e-12)))
 
 
-def collinear_facilitation_bins(
+def bipole_facilitation_bins(
     rho_nr: torch.Tensor,
     bar_theta: torch.Tensor,
     *,
     sigma_f: torch.Tensor,
+    kappa_a: torch.Tensor,
     radius: int,
     eps: float,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Same-bin support ahead of and behind each cell along the bin tangent.
+
+    w(δ) = exp(-|δ|²/2σ_f²) · exp(κ_a(cos 2φ - 1)), φ = angle between δ and the tangent, so
+    reach (σ_f) and direction tuning (κ_a) are separate knobs. Each lobe is normalised by its own
+    weight sum: a cell inside a long contour sees f_fwd ≈ f_bwd ≈ the contour's ρ.
+    """
     nH, nW, K = rho_nr.shape
     dtype, dev = rho_nr.dtype, rho_nr.device
-    ct = torch.cos(bar_theta)
-    st = torch.sin(bar_theta)
-    sigma_sq = (sigma_f * sigma_f).clamp_min(eps)
-    ks = 2 * int(radius) + 1
-    center = int(radius)
-    kernel = torch.zeros(K, 1, ks, ks, device=dev, dtype=dtype)
-    offs = _spatial_offsets(radius, dev, dtype)
-    if offs.numel() == 0:
-        return torch.zeros_like(rho_nr)
-    dy = offs[:, 0]
-    dx = offs[:, 1]
-    d2 = (dy * dy + dx * dx).to(dtype=dtype)
-    g = _gaussian_exponent(d2, sigma_sq)
-    t_proj = dy.to(dtype=dtype).view(1, -1) * ct.view(K, 1) + dx.to(dtype=dtype).view(1, -1) * st.view(K, 1)
-    w = g.view(1, -1) * (t_proj * t_proj) / (d2.view(1, -1) + eps)
-    for m in range(offs.shape[0]):
-        oy = int(dy[m].item()) + center
-        ox = int(dx[m].item()) + center
-        kernel[:, 0, oy, ox] = w[:, m]
-    numer = _reflect_conv_hwk(rho_nr, kernel, groups=K)
-    denom = kernel.sum(dim=(-2, -1)).view(1, 1, K) + eps
-    return torch.relu(numer / denom)
+    r = torch.arange(-radius, radius + 1, device=dev, dtype=dtype)
+    dy, dx = torch.meshgrid(r, r, indexing="ij")
+    d2 = dy * dy + dx * dx
+    ct = torch.cos(bar_theta).view(K, 1, 1)
+    st = torch.sin(bar_theta).view(K, 1, 1)
+    t = dy * ct + dx * st
+    n = -dy * st + dx * ct
+    cos2phi = (t * t - n * n) / d2.clamp_min(1.0)
+    radial = torch.exp(-d2 / (2.0 * (sigma_f * sigma_f).clamp_min(eps)))
+    w = radial * torch.exp(kappa_a * (cos2phi - 1.0))
+    fwd = (w * (t > 1e-6)).unsqueeze(1)
+    bwd = (w * (t < -1e-6)).unsqueeze(1)
+    f_fwd = _reflect_conv_hwk(rho_nr, fwd, groups=K) / (fwd.sum(dim=(-2, -1)).view(1, 1, K) + eps)
+    f_bwd = _reflect_conv_hwk(rho_nr, bwd, groups=K) / (bwd.sum(dim=(-2, -1)).view(1, 1, K) + eps)
+    return f_fwd, f_bwd
 
 
 def surround_bins_B_weighted(
@@ -369,6 +372,8 @@ class ContourSeed(nn.Module):
         surround_sigma: float = float(getattr(SEED, "SURROUND_SIGMA", 2.0)),
         surround_mode: str = str(getattr(SEED, "SURROUND_MODE", "broadside")),
         rho_ste_tau: float = _RHO_STE_TAU,
+        kappa_a_init: float = _KAPPA_A_INIT,
+        beta_gap_init: float = _BETA_GAP_INIT,
         *,
         surround_radius: int | None = None,
         **kw,
@@ -400,7 +405,11 @@ class ContourSeed(nn.Module):
         )
         self._eta_readout_raw = nn.Parameter(torch.tensor(_inv_softplus(eta_readout_init)))
         self._lambda_raw = nn.Parameter(torch.tensor(_inv_softplus(lambda_init)))
-        self._sigma_f_raw = nn.Parameter(torch.tensor(_inv_softplus(sigma_f_init)))
+        # σ_f = floor + softplus(raw): unlike a clamp, the gradient never dies at the floor.
+        self.sigma_f_min = _SIGMA_F_MIN
+        self._sigma_f_raw = nn.Parameter(torch.tensor(_inv_softplus(sigma_f_init - self.sigma_f_min)))
+        self._kappa_a_raw = nn.Parameter(torch.tensor(_inv_softplus(kappa_a_init)))
+        self._beta_gap_raw = nn.Parameter(torch.tensor(_inv_softplus(beta_gap_init)))
         self._sigma_s_raw = nn.Parameter(torch.tensor(_inv_softplus(sigma_s_init)))
 
     @property
@@ -433,7 +442,15 @@ class ContourSeed(nn.Module):
 
     @property
     def sigma_f(self) -> torch.Tensor:
-        return Fn.softplus(self._sigma_f_raw).view(()).clamp_min(0.3)
+        return self.sigma_f_min + Fn.softplus(self._sigma_f_raw).view(())
+
+    @property
+    def kappa_a(self) -> torch.Tensor:
+        return Fn.softplus(self._kappa_a_raw).view(())
+
+    @property
+    def beta_gap(self) -> torch.Tensor:
+        return Fn.softplus(self._beta_gap_raw).view(())
 
     @property
     def sigma_s(self) -> torch.Tensor:
@@ -491,13 +508,20 @@ class ContourSeed(nn.Module):
         eta_z_sq = self.eta_z * self.eta_z
         rho_nr = (Rsq / (Rsq + eta_z_sq + eps)) * ok.unsqueeze(-1)
 
-        rho_coll = collinear_facilitation_bins(
+        f_fwd, f_bwd = bipole_facilitation_bins(
             rho_nr,
             bar_theta,
             sigma_f=self.sigma_f,
+            kappa_a=self.kappa_a,
             radius=self.facil_radius,
             eps=eps,
         )
+        rho_coll = 0.5 * (f_fwd + f_bwd)
+        # Gain: collinear support scales the cell's own response, so it cannot create edges
+        # past line ends. Bridge: harmonic mean of the two lobes, non-zero only when support
+        # exists on both sides, so it fills gaps without extending ends.
+        bridge = 2.0 * f_fwd * f_bwd / (f_fwd + f_bwd + eps)
+        e = rho_nr * (self.beta_seed + self.beta_coll * rho_coll) + self.beta_gap * bridge
 
         S = surround_bins_B_weighted(
             rho_nr,
@@ -507,7 +531,6 @@ class ContourSeed(nn.Module):
             eps=eps,
         )
 
-        e = self.beta_seed * rho_nr + self.beta_coll * rho_coll
         e2 = e * e
         eta_r = self.eta_readout * self.eta_readout
         pool = self.lam * (S * S)
@@ -539,9 +562,7 @@ class ContourSeed(nn.Module):
             radius=self.cross_surround_radius,
             sigma=float(self.surround_sigma),
         )
-        cf_out["g_R"] = ((self.beta_seed * rho_nr + self.beta_coll * rho_coll) * ok.unsqueeze(-1)).mean(
-            dim=-1,
-        )
+        cf_out["g_R"] = cf_out["exc"]
         cf_out["g_E"] = cf_out["sur"]
         cf_out["rho_out_bins"] = rho_out
         cf_out["theta"] = theta_flat

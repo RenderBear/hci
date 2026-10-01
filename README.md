@@ -9,7 +9,7 @@ A compact, fully distributed algorithm that extracts edges from RGB images throu
    L0 harmonics are summed over small, overlapping patches on a sparse cell grid. Each cell gets a dominant orientation `θ`.
 
 3. **Seed — facilitation and suppression**  
-   Cell responses pass through Naka–Rushton gain control, collinear facilitation along contours, and cross-orientation surround suppression. A divisive readout yields per-cell contour density `ρ`.
+   Cell responses pass through Naka–Rushton gain control, collinear support along contours, and cross-orientation surround suppression. Collinear support scales each cell's own response and bridges gaps that have support on both sides. A divisive readout yields per-cell contour density `ρ`.
 
 4. **Render — ridge back-projection**  
    Cell `ρ` is splatted back to full resolution with learned 1D kernels aligned to local `θ`, producing a soft boundary map. Non-max suppression yields the final edge map.
@@ -50,6 +50,7 @@ HCI/
 │   ├── seed.py              # η_z NR + collinear + surround → cell ρ for splat
 │   ├── renderer.py          # learned ridge projection
 │   ├── boundary_bench.py    # Berkeley boundary benchmark (ODS, OIS, AP)
+│   ├── cli.py               # `uv run train` / `test` / `infer` entry points
 │   └── diagnostics_viz.py   # visualisation utilities
 ├── data/                    
 │   ├── train/imgs, train/gt # training pairs
@@ -132,8 +133,8 @@ Expect `True` for the second value on the CUDA path. Training auto-selects `cuda
 `infer.py` takes the path to the image with `-i` / `--image`:
 
 ```bash
-uv run infer.py -i data/infer/cat.png
-uv run infer.py -i ~/Pictures/cat.png
+uv run infer -i data/infer/cat.png
+uv run infer -i ~/Pictures/cat.png
 ```
 
 Outputs go to `--output_dir` (default: `output/results/`). Add `-d` / `--diagnostics` for pinwheel, ρ maps, and overlay PNGs; add `-v` / `--verbose` to print learned parameters.
@@ -144,10 +145,10 @@ A pretrained checkpoint is included at `pretrained/final.pt` (learned L0 metric,
 
 ```bash
 # inference
-uv run infer.py -i data/infer/cat.png
+uv run infer -i data/infer/cat.png
 
 # evaluation on a paired test set
-uv run test.py --images data/test/imgs --test_gt data/test/gt
+uv run test --images data/test/imgs --test_gt data/test/gt
 ```
 
 Training still writes new checkpoints under `output/checkpoints/`; pass `--model` to point at those instead.
@@ -155,7 +156,7 @@ Training still writes new checkpoints under `output/checkpoints/`; pass `--model
 ### Train
 
 ```bash
-uv run train.py --train_imgs data/train/imgs --train_gt data/train/gt
+uv run train --train_imgs data/train/imgs --train_gt data/train/gt
 ```
 
 Main flags: `--epochs`, `--lr` (default `5e-2`), `--batch_size`, `--max_val_ratio`, `--device`, `--output_dir`, `--checkpoints_dir`, `--cache_dir`, `--gt_format` (`png` / `mat`; auto-detected from GT dir if omitted).
@@ -182,7 +183,7 @@ sh scripts/biped.sh --version bipedv2 --kaggle   # recommended
 **Train** on the BIPED train split (writes checkpoints under `output/checkpoints` unless overridden):
 
 ```bash
-uv run train.py \
+uv run train \
   --train_imgs BIPED/edges/imgs/train/rgbr/real \
   --train_gt BIPED/edges/edge_maps/train/rgbr/real \
   --cache_dir cache/biped_train \
@@ -193,7 +194,7 @@ Use a dedicated `--cache_dir` so BIPED caches do not mix with other experiments.
 **Test** on the BIPED test split (ODS / OIS / AP; pairs images to GT by filename stem):
 
 ```bash
-uv run test.py \
+uv run test \
   --dataset BIPED \
   --images BIPED/edges/imgs/test/rgbr \
   --test_gt BIPED/edges/edge_maps/test/rgbr \
@@ -215,7 +216,7 @@ sh scripts/brind.sh --src-dir /path/to/extracted/BRIND --data-root BRIND --gt-ty
 **Train** on BRIND (combined `all` edges by default):
 
 ```bash
-uv run train.py \
+uv run train \
   --train_imgs BRIND/edges/imgs/train/rgbr/real \
   --train_gt BRIND/edges/edge_maps/train/rgbr/real \
   --cache_dir cache/brind_train
@@ -224,7 +225,7 @@ uv run train.py \
 **Test** on BRIND:
 
 ```bash
-uv run test.py \
+uv run test \
   --dataset BRIND \
   --images BRIND/edges/imgs/test/rgbr \
   --test_gt BRIND/edges/edge_maps/test/rgbr \
@@ -246,7 +247,7 @@ Paths below assume the usual layout inside the clone: `BSDS500/BSDS500/data/imag
 **Train** on the BSDS500 train split (MAT ground truth):
 
 ```bash
-uv run train.py \
+uv run train \
   --train_imgs BSDS500/BSDS500/data/images/train \
   --train_gt BSDS500/BSDS500/data/groundTruth/train \
   --gt_format mat \
@@ -258,7 +259,7 @@ Use a dedicated `--cache_dir` so BSDS caches do not mix with BIPED or other runs
 **Test** on the BSDS500 test split (MAT ground truth):
 
 ```bash
-uv run test.py \
+uv run test \
   --dataset BSDS500 \
   --images BSDS500/BSDS500/data/images/test \
   --test_gt BSDS500/BSDS500/data/groundTruth/test \
@@ -283,7 +284,7 @@ NYUDv2/
 **Train** on the downloaded NYUDv2 layout (writes checkpoints under `output/checkpoints` unless overridden):
 
 ```bash
-uv run train.py \
+uv run train \
   --train_imgs NYUDv2/images \
   --train_gt NYUDv2/GT \
   --cache_dir cache/nyudv2_train
@@ -294,7 +295,7 @@ Use a dedicated `--cache_dir` so NYUD caches do not mix with other experiments. 
 **Test** on the downloaded NYUDv2 layout:
 
 ```bash
-uv run test.py \
+uv run test \
   --dataset NYUDv2 \
   --images NYUDv2/images \
   --test_gt NYUDv2/GT \
@@ -322,7 +323,7 @@ Use the corresponding split paths with `train.py` and `test.py`.
 Walks a single image directory, pairs each image with ground truth by matching filename stems, and scores both the raw map (`c_eval`) and the NMS-thinned map (`s_eval`) with the BRIND boundary benchmark:
 
 ```bash
-uv run test.py --model output/checkpoints/final.pt
+uv run test --model output/checkpoints/final.pt
 ```
 
 The protocol follows the Berkeley benchmark (`hci/boundary_bench.py`). At each of `--nthresh` thresholds, the saved 8-bit prediction is binarised and thinned (`bwmorph(·, 'thin', inf)`). It is then matched one-to-one against each annotator within `tol × image diagonal` pixels. ODS interpolates between thresholds, OIS uses each image's best threshold, and AP is the area under the PR curve resampled at 0.01 recall. With `.mat` ground truth each BRIND annotator is matched separately. A PNG ground-truth map counts as a single annotator, so a PNG made by merging annotators scores lower than the official per-annotator `.mat` evaluation. Scores from `test.py` before this change used a dilation match and are not comparable.
@@ -352,10 +353,10 @@ Single-image edge detection on the image at the `-i` path.
 
 ```bash
 # data/infer/photo.png → output/results/
-uv run infer.py -i data/infer/photo.png
+uv run infer -i data/infer/photo.png
 
 # image elsewhere + diagnostics
-uv run infer.py -i /path/to/images/photo.png \
+uv run infer -i /path/to/images/photo.png \
   --model output/checkpoints/final.pt -d -v
 ```
 

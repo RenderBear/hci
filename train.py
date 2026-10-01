@@ -623,6 +623,8 @@ def debug_seed_batch(
         ("λ", seed._lambda_raw),
         ("σ_f", seed._sigma_f_raw),
         ("σ_S", seed._sigma_s_raw),
+        ("κ_a", seed._kappa_a_raw),
+        ("β_gap", seed._beta_gap_raw),
     ):
         if t.grad is None:
             print(f"  |grad| {name}: grad=None")
@@ -699,6 +701,7 @@ def format_seed_param_lines(seed, *, indent: str = "  ") -> list[str]:
         f"β_coll={seed.beta_coll.item():.4g}  κ_θ={seed.kappa_theta.item():.4g}",
         f"{indent}η_readout={seed.eta_readout.item():.4g}  λ={seed.lam.item():.4g}  "
         f"σ_f={seed.sigma_f.item():.4g}  σ_S={seed.sigma_s.item():.4g}  R={seed.cross_surround_radius}",
+        f"{indent}κ_a={seed.kappa_a.item():.4g}  β_gap={seed.beta_gap.item():.4g}",
     ]
 
 def format_renderer_param_lines(r, *, indent: str = "  ") -> list[str]:
