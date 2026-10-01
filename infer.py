@@ -36,12 +36,14 @@ from train import (
     HCIE2E,
     build_cells_flat,
     build_l0_pix,
+    coarse_rho_bins,
     format_l0_param_lines,
     format_l1_param_lines,
     format_seed_param_lines,
     format_model_param_summary,
     format_renderer_param_lines,
     report_checkpoint_compatibility,
+    scales_from_state_dict,
     upgrade_model_state_dict,
     load_png_gt,
     load_bsds_gt,
@@ -66,9 +68,9 @@ def _resolve_gt_path(gt_dir: str, stem: str, gt_format: str | None) -> tuple[str
 
 
 def build_model(ckpt, device):
-    m = HCIE2E(eps=SEED.EPS)
     sd = upgrade_model_state_dict(ckpt["model_state"])
     sd = upgrade_renderer_state_dict(sd, prefix="renderer.")
+    m = HCIE2E(eps=SEED.EPS, scales=scales_from_state_dict(sd))
     incompatible = m.load_state_dict(sd, strict=False)
     report_checkpoint_compatibility(incompatible, context="infer build_model")
     return m.to(device).eval()
@@ -79,7 +81,7 @@ def _sync(device):
         torch.cuda.synchronize()
 
 
-def run_l0_l1(img_path, device, metric=None, notch=None, *, kappa_vm):
+def run_l0_l1(img_path, device, metric=None, notch=None, *, kappa_vm, scales=()):
     timings = {}
 
     _sync(device)
@@ -138,6 +140,13 @@ def run_l0_l1(img_path, device, metric=None, notch=None, *, kappa_vm):
     cells["is_border"] |= (cells["cy"] + cells["P"] / 2 > H0) | (
         cells["cx"] + cells["P"] / 2 > W0
     )
+    rho_coarse = None
+    if scales:
+        with torch.no_grad():
+            rho_coarse = coarse_rho_bins(
+                ir_t, H0, W0, cells["nH"], cells["nW"], scales,
+                metric, device, notch=notch, kappa_vm=kappa_vm,
+            )
     _sync(device)
     timings["l1"] = time.perf_counter() - t1
 
@@ -148,6 +157,8 @@ def run_l0_l1(img_path, device, metric=None, notch=None, *, kappa_vm):
     gc.collect()
 
     cells_flat = build_cells_flat(cells)
+    if rho_coarse is not None:
+        cells_flat["rho_bin_coarse"] = rho_coarse
 
     rho_total_grid = cells["rho_total"].astype(np.float64, copy=True)
     rho_peak_grid = cells["rho_peak"].astype(np.float64, copy=True)
@@ -426,6 +437,7 @@ def main():
         metric=model.l0_metric,
         notch=getattr(model, "l0_notch", None),
         kappa_vm=model.seed.kappa_vm,
+        scales=model.seed.scales,
     )
 
     if args.verbose:

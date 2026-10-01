@@ -185,6 +185,62 @@ def run_moments_cells_flat(
 run_l1_cells_flat = run_moments_cells_flat
 
 
+def coarse_rho_bins(
+    img: torch.Tensor,
+    H0: int,
+    W0: int,
+    nH: int,
+    nW: int,
+    scales: tuple[int, ...],
+    metric: L0LearnedMetric,
+    device: torch.device,
+    notch: L0Notch | None = None,
+    *,
+    kappa_vm: torch.Tensor | float,
+) -> torch.Tensor:
+    r"""Per-bin drive at coarser scales, on the fine cell grid: (len(scales), nH·nW, K).
+
+    For each factor f the image is f×f average-pooled and passed through the same L0 → L1 as the
+    full-resolution image (same weights), so a coarse cell covers f× the footprint of a fine one.
+    The coarse grid is then sampled bilinearly at the fine cell centres.
+    """
+    P = int(L1.PATCH_SIZE)
+    S = stride_from_patch_overlap(P, L1.PATCH_OVERLAP)
+    K = int(getattr(L1, "NUM_ORIENT_BINS", 8))
+    if not isinstance(img, torch.Tensor):
+        img = torch.as_tensor(np.asarray(img), dtype=torch.float32)
+    x = img.to(device=device, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
+    cy = torch.arange(nH, device=device, dtype=torch.float32) * S + P / 2.0
+    cx = torch.arange(nW, device=device, dtype=torch.float32) * S + P / 2.0
+    out = []
+    for f in scales:
+        xc = F.avg_pool2d(x, int(f))
+        Hc, Wc = int(xc.shape[-2]), int(xc.shape[-1])
+        if min(Hc, Wc) < P:
+            out.append(torch.zeros(nH * nW, K, device=device))
+            continue
+        # Reflect-pad to a whole number of patches, as pad_for_patch_grid does at full resolution.
+        Hpc = ((Hc - P + S - 1) // S) * S + P
+        Wpc = ((Wc - P + S - 1) // S) * S + P
+        xc = F.pad(xc, (0, Wpc - Wc, 0, Hpc - Hc), mode="reflect")
+        bm = ~compute_interior(Hpc, Wpc, device)
+        l0_c = build_l0_pix_live(xc.squeeze(0).permute(1, 2, 0), bm, metric, device, notch=notch)
+        cf_c = run_moments_cells_flat(
+            l0_c, bm, H0 // int(f), W0 // int(f), device, kappa_vm=kappa_vm,
+        )
+        nHc, nWc = int(cf_c["nH"]), int(cf_c["nW"])
+        rho_c = cf_c["rho_bin"].reshape(nHc, nWc, K).permute(2, 0, 1).unsqueeze(0)
+        # A fine cell centred at pixel c sits at coarse-grid index (c / f − P/2) / S.
+        gy = ((cy / f - P / 2.0) / S) / max(nHc - 1, 1) * 2.0 - 1.0
+        gx = ((cx / f - P / 2.0) / S) / max(nWc - 1, 1) * 2.0 - 1.0
+        grid = torch.stack(
+            [gx.view(1, nW).expand(nH, nW), gy.view(nH, 1).expand(nH, nW)], dim=-1,
+        ).unsqueeze(0)
+        up = F.grid_sample(rho_c, grid, mode="bilinear", padding_mode="border", align_corners=True)
+        out.append(up.squeeze(0).permute(1, 2, 0).reshape(nH * nW, K))
+    return torch.stack(out, dim=0)
+
+
 def build_cells_flat(cells: dict) -> dict:
     nH, nW = cells["nH"], cells["nW"]
     N = nH * nW
@@ -229,13 +285,14 @@ class HCIE2E(nn.Module):
     def __init__(
         self,
         eps: float = SEED.EPS,
+        scales: tuple[int, ...] = tuple(SEED.SCALES),
         **kw,
     ):
         super().__init__()
         _ = kw
         self.l0_metric = L0LearnedMetric()
         self.l0_notch = L0Notch() if bool(getattr(L0, "NOTCH_ENABLED", False)) else None
-        self.seed = AndGateSeed(eps=eps)
+        self.seed = AndGateSeed(eps=eps, scales=scales)
         self.renderer = ModulationRenderer()
         self.eps = eps
         self.render_eps = max(float(eps), 1e-6)
@@ -283,6 +340,12 @@ def prepare_batch(items, device, model: HCIE2E):
             device,
             kappa_vm=model.seed.kappa_vm,
         )
+        if model.seed.scales:
+            cf_dev["rho_bin_coarse"] = coarse_rho_bins(
+                img, H0, W0, cf_dev["nH"], cf_dev["nW"], model.seed.scales,
+                model.l0_metric, device, notch=model.l0_notch,
+                kappa_vm=model.seed.kappa_vm,
+            )
         p_dev = proj_to_device(gi, device)
         meta.append(
             {
@@ -568,6 +631,12 @@ def upgrade_model_state_dict(state_dict: dict) -> dict:
     return out
 
 
+def scales_from_state_dict(state_dict: dict) -> tuple[int, ...]:
+    """Coarse scales a checkpoint was trained with; empty for a single-scale checkpoint."""
+    sf = state_dict.get("seed.scale_factors")
+    return tuple(int(s) for s in sf.tolist()) if sf is not None else ()
+
+
 def debug_seed_batch(
     model,
     meta_list,
@@ -625,6 +694,7 @@ def debug_seed_batch(
         ("σ_S", seed._sigma_s_raw),
         ("κ_a", seed._kappa_a_raw),
         ("β_gap", seed._beta_gap_raw),
+        *((("β_scale", seed._beta_scale_raw),) if seed.scales else ()),
     ):
         if t.grad is None:
             print(f"  |grad| {name}: grad=None")
@@ -696,13 +766,20 @@ def format_l1_param_lines(model: HCIE2E, *, indent: str = "  ") -> list[str]:
 
 
 def format_seed_param_lines(seed, *, indent: str = "  ") -> list[str]:
-    return [
+    lines = [
         f"{indent}η_z={seed.eta_z.item():.4g}  β_seed={seed.beta_seed.item():.4g}  "
         f"β_coll={seed.beta_coll.item():.4g}  κ_θ={seed.kappa_theta.item():.4g}",
         f"{indent}η_readout={seed.eta_readout.item():.4g}  λ={seed.lam.item():.4g}  "
         f"σ_f={seed.sigma_f.item():.4g}  σ_S={seed.sigma_s.item():.4g}  R={seed.cross_surround_radius}",
         f"{indent}κ_a={seed.kappa_a.item():.4g}  β_gap={seed.beta_gap.item():.4g}",
     ]
+    if seed.scales:
+        lines.append(
+            indent + "  ".join(
+                f"β_scale[1/{f}]={b:.4g}" for f, b in zip(seed.scales, seed.beta_scale.tolist())
+            )
+        )
+    return lines
 
 def format_renderer_param_lines(r, *, indent: str = "  ") -> list[str]:
     from hci.renderer import ModulationRenderer
@@ -781,7 +858,7 @@ def main():
     ap.add_argument("--cache_dir", default="cache")
     ap.add_argument("--output_dir", default="output")
     ap.add_argument("--checkpoints_dir", default="output/checkpoints")
-    ap.add_argument("--max_images", type=int, default=None)
+    ap.add_argument("-n", dest="max_images", type=int, default=None, help="Cap number of images")
     ap.add_argument("--epochs", type=int, default=TRAIN.EPOCHS)
     ap.add_argument("--lr", type=float, default=TRAIN.LR)
     ap.add_argument("--batch_size", type=int, default=TRAIN.BATCH_SIZE)
@@ -797,7 +874,7 @@ def main():
     ap.add_argument(
         "--debug-seed",
         action="store_true",
-        help="Run one batch, print seed stats and β_seed/β_coll/κ_θ/η_z/η_readout/λ/σ_f gradients, then exit",
+        help="Run one batch, print seed stats and β_seed/β_coll/κ_θ/η_z/η_readout/λ/σ_f/β_scale gradients, then exit",
     )
     args = ap.parse_args()
 
@@ -847,7 +924,7 @@ def main():
         optimizer, T_max=args.epochs, eta_min=args.lr * 0.1
     )
 
-    print(f"\nmodel: {format_model_param_summary(model)}")
+    print(f"\nmodel: {format_model_param_summary(model)}  scales={(1, *model.seed.scales)}")
 
     train_ds = HCIDataset(train_cache, fit_stems)
     train_loader = DataLoader(

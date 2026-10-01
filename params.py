@@ -32,7 +32,7 @@ L1 = SimpleNamespace(
     KAPPA_VM_INIT=2.0,
 )
 
-# ── Seed: η_z NR on |Z|, then collinear + surround + divisive readout (η_readout) ─
+# ── Seed: η_z NR on |Z|, then collinear + cross-scale + surround + divisive readout (η_readout) ─
 SEED = SimpleNamespace(
     EPS=1e-9,
     ETA_Z_INIT=10.0,
@@ -45,6 +45,10 @@ SEED = SimpleNamespace(
     SIGMA_F_MIN=1.0,
     KAPPA_A_INIT=8.0,
     BETA_GAP_INIT=0.5,
+    # Cross-scale facilitation: L0 → L1 re-run on the image pooled by each factor in SCALES,
+    # one learned gain per scale. () trains a single-scale model.
+    SCALES=(2, 4),
+    BETA_SCALE_INIT=0.25,
     FACIL_RADIUS=5,
     FACIL_MODE="collinear",
     CROSS_SURROUND_RADIUS=10,

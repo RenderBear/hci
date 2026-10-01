@@ -1,4 +1,4 @@
-r"""Cell-grid contour seed — per-orientation-bin NR, collinear, B-weighted surround, readout"""
+r"""Cell-grid contour seed — per-orientation-bin NR, collinear, cross-scale, B-weighted surround, readout"""
 
 from __future__ import annotations
 
@@ -44,6 +44,7 @@ _RHO_STE_TAU = float(getattr(SEED, "RHO_STE_TAU", 0.1))
 _SIGMA_F_MIN = float(getattr(SEED, "SIGMA_F_MIN", 1.0))
 _KAPPA_A_INIT = float(getattr(SEED, "KAPPA_A_INIT", 8.0))
 _BETA_GAP_INIT = float(getattr(SEED, "BETA_GAP_INIT", 0.5))
+_BETA_SCALE_INIT = float(getattr(SEED, "BETA_SCALE_INIT", 0.25))
 
 
 def _inv_softplus(x: float) -> float:
@@ -374,8 +375,10 @@ class ContourSeed(nn.Module):
         rho_ste_tau: float = _RHO_STE_TAU,
         kappa_a_init: float = _KAPPA_A_INIT,
         beta_gap_init: float = _BETA_GAP_INIT,
+        beta_scale_init: float = _BETA_SCALE_INIT,
         *,
         surround_radius: int | None = None,
+        scales: tuple[int, ...] = (),
         **kw,
     ):
         super().__init__()
@@ -411,6 +414,13 @@ class ContourSeed(nn.Module):
         self._kappa_a_raw = nn.Parameter(torch.tensor(_inv_softplus(kappa_a_init)))
         self._beta_gap_raw = nn.Parameter(torch.tensor(_inv_softplus(beta_gap_init)))
         self._sigma_s_raw = nn.Parameter(torch.tensor(_inv_softplus(sigma_s_init)))
+        self.scales = tuple(int(s) for s in scales)
+        if self.scales:
+            # Saved with the weights, so a checkpoint says which scales it was trained with.
+            self.register_buffer("scale_factors", torch.tensor(self.scales, dtype=torch.long))
+            self._beta_scale_raw = nn.Parameter(
+                torch.full((len(self.scales),), _inv_softplus(beta_scale_init))
+            )
 
     @property
     def kappa_vm(self) -> torch.Tensor:
@@ -451,6 +461,10 @@ class ContourSeed(nn.Module):
     @property
     def beta_gap(self) -> torch.Tensor:
         return Fn.softplus(self._beta_gap_raw).view(())
+
+    @property
+    def beta_scale(self) -> torch.Tensor:
+        return Fn.softplus(self._beta_scale_raw)
 
     @property
     def sigma_s(self) -> torch.Tensor:
@@ -521,7 +535,20 @@ class ContourSeed(nn.Module):
         # past line ends. Bridge: harmonic mean of the two lobes, non-zero only when support
         # exists on both sides, so it fills gaps without extending ends.
         bridge = 2.0 * f_fwd * f_bwd / (f_fwd + f_bwd + eps)
-        e = rho_nr * (self.beta_seed + self.beta_coll * rho_coll) + self.beta_gap * bridge
+        gain = self.beta_seed + self.beta_coll * rho_coll
+        if self.scales:
+            # Cross-scale: the same bin's response at coarser scales, through the same NR. It is
+            # a gain too, so a coarse edge strengthens fine cells without widening the contour.
+            if "rho_bin_coarse" not in cells_flat:
+                raise ValueError(
+                    f"seed has scales={self.scales} but cells_flat has no 'rho_bin_coarse'"
+                )
+            Rc = cells_flat["rho_bin_coarse"].to(device).float().reshape(-1, nH, nW, K)
+            Rc_sq = Rc * Rc
+            rho_nr_coarse = (Rc_sq / (Rc_sq + eta_z_sq + eps)) * ok.unsqueeze(-1)
+            rho_scale = (self.beta_scale.view(-1, 1, 1, 1) * rho_nr_coarse).sum(dim=0)
+            gain = gain + rho_scale
+        e = rho_nr * gain + self.beta_gap * bridge
 
         S = surround_bins_B_weighted(
             rho_nr,
@@ -552,6 +579,8 @@ class ContourSeed(nn.Module):
         cf_out["rho_nr_bins"] = rho_nr
         cf_out["rho_coll"] = (rho_coll * ok.unsqueeze(-1)).mean(dim=-1)
         cf_out["rho_coll_bins"] = rho_coll * ok.unsqueeze(-1)
+        if self.scales:
+            cf_out["rho_scale"] = rho_scale.mean(dim=-1)
         cf_out["fac"] = cf_out["rho_coll"]
         cf_out["exc"] = (e * ok.unsqueeze(-1)).mean(dim=-1)
         cf_out["sur"] = (S * ok.unsqueeze(-1)).mean(dim=-1)

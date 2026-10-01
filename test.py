@@ -32,15 +32,17 @@ from train import (
     HCIE2E,
     build_cells_flat,
     build_l0_pix,
+    coarse_rho_bins,
     report_checkpoint_compatibility,
+    scales_from_state_dict,
     upgrade_model_state_dict,
 )
 
 
 def build_model(ckpt, device):
-    m = HCIE2E(eps=SEED.EPS)
     sd = upgrade_model_state_dict(ckpt["model_state"])
     sd = upgrade_renderer_state_dict(sd, prefix="renderer.")
+    m = HCIE2E(eps=SEED.EPS, scales=scales_from_state_dict(sd))
     incompatible = m.load_state_dict(sd, strict=False)
     report_checkpoint_compatibility(incompatible, context="test build_model")
     return m.to(device).eval()
@@ -126,6 +128,14 @@ def run_image_inference(
         kappa_vm=model.seed.kappa_vm.detach(),
         num_orient_bins=int(L1.NUM_ORIENT_BINS),
     )
+    rho_coarse = None
+    if model.seed.scales:
+        with torch.no_grad():
+            rho_coarse = coarse_rho_bins(
+                ir_t, H0, W0, cells["nH"], cells["nW"], model.seed.scales,
+                model.l0_metric, device, notch=getattr(model, "l0_notch", None),
+                kappa_vm=model.seed.kappa_vm,
+            )
     del h2m, z1, z2, bm_t, ir_t
     gc.collect()
     cells["is_border"] |= (cells["cy"] + cells["P"] / 2 > H0) | (
@@ -139,6 +149,8 @@ def run_image_inference(
 
     Hp, Wp = ir_p.shape[:2]
     cells_flat = build_cells_flat(cells)
+    if rho_coarse is not None:
+        cells_flat["rho_bin_coarse"] = rho_coarse
     del cells, ir_p
     gc.collect()
 
@@ -196,7 +208,7 @@ def main():
         help="Dataset name shown in the report (default matches data/test: BRIND).",
     )
     ap.add_argument("--images", default="data/test/imgs")
-    ap.add_argument("--max_images", type=int, default=None)
+    ap.add_argument("-n", dest="max_images", type=int, default=None, help="Cap number of images")
     ap.add_argument("--test_gt", default="data/test/gt")
     ap.add_argument("--gt_format", default=None)
     ap.add_argument("--model", default="pretrained/final.pt")

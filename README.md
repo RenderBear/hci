@@ -9,7 +9,7 @@ A compact, fully distributed algorithm that extracts edges from RGB images throu
    L0 harmonics are summed over small, overlapping patches on a sparse cell grid. Each cell gets a dominant orientation `θ`.
 
 3. **Seed — facilitation and suppression**  
-   Cell responses pass through Naka–Rushton gain control, collinear support along contours, and cross-orientation surround suppression. Collinear support scales each cell's own response and bridges gaps that have support on both sides. A divisive readout yields per-cell contour density `ρ`.
+   Cell responses pass through Naka–Rushton gain control, collinear support along contours, cross-scale support, and cross-orientation surround suppression. Collinear support scales each cell's own response and bridges gaps that have support on both sides. Cross-scale support re-runs L0 and L1 on the image pooled 2× and 4×, and strengthens a cell when the same orientation responds at those coarser scales. A divisive readout yields per-cell contour density `ρ`.
 
 4. **Render — ridge back-projection**  
    Cell `ρ` is splatted back to full resolution with learned 1D kernels aligned to local `θ`, producing a soft boundary map. Non-max suppression yields the final edge map.
@@ -48,7 +48,7 @@ HCI/
 ├── hci/
 │   ├── L0.py                # pixel-level contrast
 │   ├── L1.py                # cell-level z₂ moments (E, C, θ)
-│   ├── seed.py              # η_z NR + collinear + surround → cell ρ for splat
+│   ├── seed.py              # η_z NR + collinear + cross-scale + surround → cell ρ for splat
 │   ├── renderer.py          # learned ridge projection
 │   ├── boundary_bench.py    # Berkeley boundary benchmark (ODS, OIS, AP)
 │   ├── cli.py               # `uv run train` / `test` / `infer` entry points
@@ -144,7 +144,7 @@ Outputs go to `--output_dir` (default: `output/results/`). Add `-d` / `--diagnos
 
 ### Pretrained model
 
-A pretrained checkpoint is included at `pretrained/final.pt` (learned L0 metric, seed, renderer). It's the default `--model` for **infer** and **test**, so you can run them without training your own weights. `test` and `train` default to BRIND in `data/`, which `scripts/brind.sh` creates:
+A pretrained checkpoint is included at `pretrained/final.pt` (learned L0 metric, seed, renderer). It is a single-scale model, trained before cross-scale support was added. It's the default `--model` for **infer** and **test**, so you can run them without training your own weights. `test` and `train` default to BRIND in `data/`, which `scripts/brind.sh` creates:
 
 ```bash
 # inference
@@ -165,7 +165,9 @@ Trains on BRIND in `data/train` by default:
 uv run train
 ```
 
-Main flags: `--train_imgs`, `--train_gt`, `--gt_format` (`png` / `mat`; auto-detected from the GT folder if omitted), `--epochs`, `--lr` (default `5e-2`), `--batch_size`, `--max_images`, `--device`, `--output_dir`, `--checkpoints_dir`, `--cache_dir`, `--num_workers`, `--grad_clip`, `--gt_min_agreement`. `--debug-seed` runs one batch and prints the seed's parameters and gradients.
+Main flags: `--train_imgs`, `--train_gt`, `--gt_format` (`png` / `mat`; auto-detected from the GT folder if omitted), `--epochs`, `--lr` (default `5e-2`), `--batch_size`, `-n` (cap the number of images), `--device`, `--output_dir`, `--checkpoints_dir`, `--cache_dir`, `--num_workers`, `--grad_clip`, `--gt_min_agreement`. `--debug-seed` runs one batch and prints the seed's parameters and gradients.
+
+Training also uses coarser scales. `SEED.SCALES` in `params.py` lists the pooling factors, `(2, 4)` by default, and training learns one gain per scale. Set it to `()` to train at full resolution only. A checkpoint records the scales it was trained with, so `test` and `infer` follow whichever checkpoint they load.
 
 ### BIPED
 
@@ -207,7 +209,7 @@ uv run test \
   --output_dir output/test_biped
 ```
 
-Quick smoke test: add `--max_images 10`.
+Quick smoke test: add `-n 10`.
 
 ### BRIND (edge maps)
 
@@ -309,7 +311,7 @@ uv run test \
   --output_dir output/test_nyudv2
 ```
 
-Quick smoke test: add `--max_images 20`.
+Quick smoke test: add `-n 20`.
 
 ### Test
 
@@ -329,7 +331,7 @@ The protocol follows the Berkeley benchmark (`hci/boundary_bench.py`). At each o
 | `--gt_format`  | auto                          | `png` or `mat` (BSDS)                                             |
 | `--model`      | `pretrained/final.pt`         | Checkpoint                                                        |
 | `--output_dir` | `output/test`                 | Output directory                                                  |
-| `--max_images` | all                           | Cap number of images                                              |
+| `-n`           | all                           | Cap number of images                                              |
 | `--device`     | CUDA if available             | `cpu`, `cuda`, or `mps`                                           |
 | `--diagnostics`| off                           | Save ρ and geometry maps per image under `output_dir/diagnostics/` |
 | `--tol`        | `0.0075`                      | Matching distance as a fraction of the image diagonal (NYUD convention: `0.011`) |
