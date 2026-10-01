@@ -44,6 +44,7 @@ HCI/
 ├── train.py                 # HCIE2E training
 ├── test.py                  # ODS, OIS, AP evaluation
 ├── infer.py                 # single-image inference + diagnostics
+├── scripts/                 # biped.sh, brind.sh, nyud.sh — fetch and lay out datasets
 ├── hci/
 │   ├── L0.py                # pixel-level contrast
 │   ├── L1.py                # cell-level z₂ moments (E, C, θ)
@@ -163,7 +164,7 @@ Main flags: `--epochs`, `--lr` (default `5e-2`), `--batch_size`, `--max_val_rati
 
 ### BIPED
 
-`BIPED/` is in `.gitignore`, place the dataset at the repo root yourself. Training uses `train.py` with the train RGB and edge-map folders below. Layout expected by the default commands (RGB + PNG edge maps):
+BIPED has 250 outdoor 1280×720 images with expert edge annotations: 200 train, 50 test. `scripts/biped.sh` writes this layout (RGB + PNG edge maps; `BIPED/` is in `.gitignore`):
 
 ```
 BIPED/edges/imgs/train/rgbr/real/           # training RGB (.jpg / .png)
@@ -172,12 +173,12 @@ BIPED/edges/imgs/test/rgbr/                 # test RGB
 BIPED/edges/edge_maps/test/rgbr/            # test GT edges
 ```
 
-If you have the Kaggle CLI set up (or you already downloaded/unzipped the dataset), you can generate this layout with:
+`--kaggle` downloads [xavysp/biped](https://www.kaggle.com/datasets/xavysp/biped) with the Kaggle CLI, run through `uvx`. It needs a Kaggle API token in `~/.kaggle/kaggle.json`, or `KAGGLE_USERNAME` and `KAGGLE_KEY`. If you downloaded BIPED yourself, pass the folder with `--src-dir`; when it contains both BIPED and BIPEDv2, v2 is used.
 
 ```bash
-sh scripts/biped.sh --version bipedv2 --kaggle   # recommended
-# or: sh scripts/biped.sh --version biped --src-dir /path/to/extracted/BIPED
-# optional: --data-root BIPEDv2
+sh scripts/biped.sh --kaggle
+# or: sh scripts/biped.sh --src-dir /path/to/downloaded/BIPED
+# optional: --data-root DIR (default: BIPED)
 ```
 
 **Train** on the BIPED train split (writes checkpoints under `output/checkpoints` unless overridden):
@@ -205,15 +206,15 @@ Quick smoke test: add `--max_images 10`. If your GT folder uses BSDS-style `.mat
 
 ### BRIND (edge maps)
 
-BRIND is a BSDS-based edge benchmark annotated for different discontinuity types (reflectance, illuminance, normal, depth) plus a combined `all` edge map.
-
-To remap BRIND into the HCI directory layout used by `train.py`/`test.py`:
+BRIND is BSDS500 re-annotated at the edge level by [RINDNet](https://github.com/MengyangPu/RINDNet) for four discontinuity types: reflectance, illumination, normal and depth. The published [BRIND](https://github.com/xavysp/BRIND) set merges them into one edge map per image, 300 train / 200 test. `scripts/brind.sh` clones it and writes the same `BRIND/edges/...` layout as BIPED. The per-type maps are only available from RINDNet.
 
 ```bash
-sh scripts/brind.sh --src-dir /path/to/extracted/BRIND --data-root BRIND --gt-type all
+sh scripts/brind.sh
+# or, from an existing clone: sh scripts/brind.sh --src-dir /path/to/BRIND
+# optional: --data-root DIR (default: BRIND)
 ```
 
-**Train** on BRIND (combined `all` edges by default):
+**Train** on BRIND:
 
 ```bash
 uv run train \
@@ -231,8 +232,6 @@ uv run test \
   --test_gt BRIND/edges/edge_maps/test/rgbr \
   --output_dir output/test_brind
 ```
-
-If the ground truth maps are stored as `.mat` files in your BRIND extraction, pass `--gt_format mat` to `test.py` and `--gt_format mat` to `train.py`.
 
 ### BSDS500
 
@@ -271,52 +270,45 @@ uv run test \
 
 ### NYUD v2 (edge maps)
 
-NYUD v2 is primarily an RGB-D dataset, but it is often used for edge detection through derived edge annotations. HCI matches RGB images and GT by filename stem (for example `img_5001.png` in both folders).
-
-Default layout after running `nyud.sh`:
+NYUD v2 is an RGB-D dataset. Edge detection uses the ground truth that [Gupta et al.](https://github.com/s-gupta/rcnn-depth) released for its 1449 labelled images: 795 train+val and 654 test. `scripts/nyud.sh` downloads their release (`eccv14-data.tgz`, about 900 MB) and writes:
 
 ```
 NYUDv2/
-  images/                            # RGB images (.jpg / .png)
-  GT/                                # edge GT maps (.png)
+  images/train/   # 795 RGB images (img_XXXX.png)
+  images/test/    # 654 RGB images
+  gt/train/       # ground truth, one BSDS-format groundTruth .mat per image
+  gt/test/
 ```
 
-**Train** on the downloaded NYUDv2 layout (writes checkpoints under `output/checkpoints` unless overridden):
+```bash
+sh scripts/nyud.sh
+# or, from an extracted copy: sh scripts/nyud.sh --src-dir /path/to/eccv14-data
+# optional: --data-root DIR (default: NYUDv2)
+```
+
+**Train** on the NYUD train split (`.mat` ground truth is detected automatically):
 
 ```bash
 uv run train \
-  --train_imgs NYUDv2/images \
-  --train_gt NYUDv2/GT \
+  --train_imgs NYUDv2/images/train \
+  --train_gt NYUDv2/gt/train \
   --cache_dir cache/nyudv2_train
 ```
 
 Use a dedicated `--cache_dir` so NYUD caches do not mix with other experiments. Lower `--batch_size` if you hit GPU memory limits.
 
-**Test** on the downloaded NYUDv2 layout:
+**Test** on the NYUD test split. NYUD results are reported with a matching distance of `0.011`, looser than BSDS's `0.0075`, because its ground truth is less precisely localised:
 
 ```bash
 uv run test \
   --dataset NYUDv2 \
-  --images NYUDv2/images \
-  --test_gt NYUDv2/GT \
+  --images NYUDv2/images/test \
+  --test_gt NYUDv2/gt/test \
+  --tol 0.011 \
   --output_dir output/test_nyudv2
 ```
 
 Quick smoke test: add `--max_images 20`.
-
-If your NYUD edge labels are stored as MAT files, add `--gt_format mat`.
-
-Optional split-based layout (if you create your own train/test split):
-
-```
-NYUDv2/
-  images/train/
-  images/test/
-  edges/train/
-  edges/test/
-```
-
-Use the corresponding split paths with `train.py` and `test.py`.
 
 ### Test
 
