@@ -12,10 +12,10 @@ Usage: sh scripts/nyud.sh [--src-dir DIR] [--data-root DIR]
 
 Downloads eccv14-data.tgz (~900 MB; extraction needs several GB of temporary space), or uses an
 extracted copy, and writes:
-  DATA_ROOT/images/train/img_XXXX.png   795 train+val images
-  DATA_ROOT/images/test/img_XXXX.png    654 test images
-  DATA_ROOT/gt/train/img_XXXX.mat       ground truth (BSDS groundTruth format)
-  DATA_ROOT/gt/test/img_XXXX.mat
+  DATA_ROOT/train/imgs   795 train+val images (img_XXXX.png)
+  DATA_ROOT/train/gt     ground truth, one BSDS-format groundTruth .mat per image
+  DATA_ROOT/test/imgs    654 test images
+  DATA_ROOT/test/gt
 
   --src-dir DIR    an extracted eccv14-data directory (contains data/ and benchmarkData/)
   --data-root DIR  output root (default: NYUDv2)
@@ -55,4 +55,4 @@ if [ -z "$SRC" ]; then
 fi
 
 uv run --project "$HERE/.." python "$HERE/nyud_prepare.py" --src "$SRC" --out "$ROOT"
-echo "NYUD ready in $ROOT (test with --tol 0.011)"
+echo "NYUD ready in $ROOT/{train,test} (test with --tol 0.011)"

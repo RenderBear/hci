@@ -8,10 +8,10 @@ usage() {
 Usage: sh scripts/biped.sh (--kaggle | --src-dir DIR) [--data-root DIR]
 
 Writes:
-  DATA_ROOT/edges/imgs/train/rgbr/real        200 train images (.jpg)
-  DATA_ROOT/edges/edge_maps/train/rgbr/real   200 train edge maps (.png)
-  DATA_ROOT/edges/imgs/test/rgbr              50 test images (.jpg)
-  DATA_ROOT/edges/edge_maps/test/rgbr         50 test edge maps (.png)
+  DATA_ROOT/train/imgs   200 train images (.jpg)
+  DATA_ROOT/train/gt     200 train edge maps (.png)
+  DATA_ROOT/test/imgs    50 test images (.jpg)
+  DATA_ROOT/test/gt      50 test edge maps (.png)
 
   --kaggle         download xavysp/biped with the Kaggle CLI (run through uvx). Needs a
                    Kaggle API token: ~/.kaggle/kaggle.json or KAGGLE_USERNAME/KAGGLE_KEY.
@@ -65,12 +65,6 @@ EOF
 EDGES=${PICK%/imgs/train/rgbr/real}
 echo "using $EDGES"
 
-mkdir -p "$ROOT/edges"
-if [ "$(cd "$EDGES" && pwd -P)" = "$(cd "$ROOT/edges" && pwd -P)" ]; then
-  echo "source is already $ROOT/edges; nothing to copy"
-  exit 0
-fi
-
 copy_set() {  # copy_set SRC_DIR DST_DIR EXT EXPECTED_COUNT
   [ -d "$1" ] || { echo "missing $1" >&2; exit 1; }
   mkdir -p "$2"
@@ -84,8 +78,8 @@ copy_set() {  # copy_set SRC_DIR DST_DIR EXT EXPECTED_COUNT
   [ "$n" -eq "$4" ] || echo "  warning: expected $4 files in $1" >&2
 }
 
-copy_set "$EDGES/imgs/train/rgbr/real" "$ROOT/edges/imgs/train/rgbr/real" jpg 200
-copy_set "$EDGES/edge_maps/train/rgbr/real" "$ROOT/edges/edge_maps/train/rgbr/real" png 200
-copy_set "$EDGES/imgs/test/rgbr" "$ROOT/edges/imgs/test/rgbr" jpg 50
-copy_set "$EDGES/edge_maps/test/rgbr" "$ROOT/edges/edge_maps/test/rgbr" png 50
-echo "BIPED ready in $ROOT/edges"
+copy_set "$EDGES/imgs/train/rgbr/real" "$ROOT/train/imgs" jpg 200
+copy_set "$EDGES/edge_maps/train/rgbr/real" "$ROOT/train/gt" png 200
+copy_set "$EDGES/imgs/test/rgbr" "$ROOT/test/imgs" jpg 50
+copy_set "$EDGES/edge_maps/test/rgbr" "$ROOT/test/gt" png 50
+echo "BIPED ready in $ROOT/{train,test}"

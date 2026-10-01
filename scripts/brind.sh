@@ -8,13 +8,13 @@ usage() {
 Usage: sh scripts/brind.sh [--src-dir DIR] [--data-root DIR]
 
 Clones https://github.com/xavysp/BRIND (or uses an existing clone) and writes:
-  DATA_ROOT/edges/imgs/train/rgbr/real        300 train images (.jpg)
-  DATA_ROOT/edges/edge_maps/train/rgbr/real   300 train edge maps (.png)
-  DATA_ROOT/edges/imgs/test/rgbr              200 test images (.jpg)
-  DATA_ROOT/edges/edge_maps/test/rgbr         200 test edge maps (.png)
+  DATA_ROOT/train/imgs   300 train images (.jpg)
+  DATA_ROOT/train/gt     300 train edge maps (.png)
+  DATA_ROOT/test/imgs    200 test images (.jpg)
+  DATA_ROOT/test/gt      200 test edge maps (.png)
 
   --src-dir DIR    existing BRIND clone (has train_imgs/, train_gt/, test_imgs/, test_gt/)
-  --data-root DIR  output root (default: BRIND)
+  --data-root DIR  output root (default: data, where train.py and test.py look by default)
 
 Only the combined edge map is published there; the per-type maps (reflectance,
 illumination, normal, depth) are at https://github.com/MengyangPu/RINDNet.
@@ -22,7 +22,7 @@ EOF
 }
 
 SRC=""
-ROOT="BRIND"
+ROOT="data"
 while [ $# -gt 0 ]; do
   case "$1" in
     --src-dir|--data-root)
@@ -59,8 +59,8 @@ copy_set() {  # copy_set SRC_DIR DST_DIR EXT EXPECTED_COUNT
   [ "$n" -eq "$4" ] || echo "  warning: expected $4 files in $1" >&2
 }
 
-copy_set "$SRC/train_imgs/imgs_all" "$ROOT/edges/imgs/train/rgbr/real" jpg 300
-copy_set "$SRC/train_gt/gt_all" "$ROOT/edges/edge_maps/train/rgbr/real" png 300
-copy_set "$SRC/test_imgs" "$ROOT/edges/imgs/test/rgbr" jpg 200
-copy_set "$SRC/test_gt" "$ROOT/edges/edge_maps/test/rgbr" png 200
-echo "BRIND ready in $ROOT/edges"
+copy_set "$SRC/train_imgs/imgs_all" "$ROOT/train/imgs" jpg 300
+copy_set "$SRC/train_gt/gt_all" "$ROOT/train/gt" png 300
+copy_set "$SRC/test_imgs" "$ROOT/test/imgs" jpg 200
+copy_set "$SRC/test_gt" "$ROOT/test/gt" png 200
+echo "BRIND ready in $ROOT/{train,test}"

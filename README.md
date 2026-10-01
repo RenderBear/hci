@@ -53,10 +53,10 @@ HCI/
 │   ├── boundary_bench.py    # Berkeley boundary benchmark (ODS, OIS, AP)
 │   ├── cli.py               # `uv run train` / `test` / `infer` entry points
 │   └── diagnostics_viz.py   # visualisation utilities
-├── data/                    
-│   ├── train/imgs, train/gt # training pairs
-│   ├── test/imgs, test/gt   # evaluation pairs
-│   └── infer/               # inference images
+├── data/                    # BRIND, the default dataset (scripts/brind.sh)
+│   ├── train/imgs, train/gt # 300 training pairs
+│   └── test/imgs, test/gt   # 200 evaluation pairs
+├── BIPED/, NYUDv2/          # other datasets, same {train,test}/{imgs,gt} layout (scripts/)
 ├── pretrained/
 │   └── final.pt             # bundled weights — infer / test without training
 └── output/
@@ -129,48 +129,53 @@ Expect `True` for the second value on the CUDA path. Training auto-selects `cuda
 
 ## Usage
 
+`uv run train`, `uv run test` and `uv run infer` run `train.py`, `test.py` and `infer.py` from the repo root. Without uv, run the scripts directly (`python test.py ...`) with the same flags.
+
 ### Inference input
 
-`infer.py` takes the path to the image with `-i` / `--image`:
+`infer` takes the path to the image with `-i` / `--image`:
 
 ```bash
-uv run infer -i data/infer/cat.png
-uv run infer -i ~/Pictures/cat.png
+uv run infer -i assets/base.png
+uv run infer -i ~/Pictures/photo.jpg
 ```
 
 Outputs go to `--output_dir` (default: `output/results/`). Add `-d` / `--diagnostics` for pinwheel, ρ maps, and overlay PNGs; add `-v` / `--verbose` to print learned parameters.
 
 ### Pretrained model
 
-A pretrained checkpoint is included at `pretrained/final.pt` (learned L0 metric, seed, renderer). It's the default `--model` for **infer** and **test**, so you can run them without training your own weights:
+A pretrained checkpoint is included at `pretrained/final.pt` (learned L0 metric, seed, renderer). It's the default `--model` for **infer** and **test**, so you can run them without training your own weights. `test` and `train` default to BRIND in `data/`, which `scripts/brind.sh` creates:
 
 ```bash
 # inference
-uv run infer -i data/infer/cat.png
+uv run infer -i assets/base.png
 
-# evaluation on a paired test set
-uv run test --images data/test/imgs --test_gt data/test/gt
+# evaluation on the BRIND test set
+sh scripts/brind.sh
+uv run test
 ```
 
 Training still writes new checkpoints under `output/checkpoints/`; pass `--model` to point at those instead.
 
 ### Train
 
+Trains on BRIND in `data/train` by default:
+
 ```bash
-uv run train --train_imgs data/train/imgs --train_gt data/train/gt
+uv run train
 ```
 
-Main flags: `--epochs`, `--lr` (default `5e-2`), `--batch_size`, `--max_val_ratio`, `--device`, `--output_dir`, `--checkpoints_dir`, `--cache_dir`, `--gt_format` (`png` / `mat`; auto-detected from GT dir if omitted).
+Main flags: `--train_imgs`, `--train_gt`, `--gt_format` (`png` / `mat`; auto-detected from the GT folder if omitted), `--epochs`, `--lr` (default `5e-2`), `--batch_size`, `--max_images`, `--device`, `--output_dir`, `--checkpoints_dir`, `--cache_dir`, `--num_workers`, `--grad_clip`, `--gt_min_agreement`. `--debug-seed` runs one batch and prints the seed's parameters and gradients.
 
 ### BIPED
 
-BIPED has 250 outdoor 1280×720 images with expert edge annotations: 200 train, 50 test. `scripts/biped.sh` writes this layout (RGB + PNG edge maps; `BIPED/` is in `.gitignore`):
+BIPED has 250 outdoor 1280×720 images with expert edge annotations: 200 train, 50 test. `scripts/biped.sh` writes (`BIPED/` is in `.gitignore`):
 
 ```
-BIPED/edges/imgs/train/rgbr/real/           # training RGB (.jpg / .png)
-BIPED/edges/edge_maps/train/rgbr/real/      # training GT edges (same stem per image)
-BIPED/edges/imgs/test/rgbr/                 # test RGB
-BIPED/edges/edge_maps/test/rgbr/            # test GT edges
+BIPED/train/imgs/   # 200 RGB images (.jpg)
+BIPED/train/gt/     # 200 edge maps (.png, same stem)
+BIPED/test/imgs/    # 50 RGB images
+BIPED/test/gt/      # 50 edge maps
 ```
 
 `--kaggle` downloads [xavysp/biped](https://www.kaggle.com/datasets/xavysp/biped) with the Kaggle CLI, run through `uvx`. It needs a Kaggle API token in `~/.kaggle/kaggle.json`, or `KAGGLE_USERNAME` and `KAGGLE_KEY`. If you downloaded BIPED yourself, pass the folder with `--src-dir`; when it contains both BIPED and BIPEDv2, v2 is used.
@@ -185,9 +190,9 @@ sh scripts/biped.sh --kaggle
 
 ```bash
 uv run train \
-  --train_imgs BIPED/edges/imgs/train/rgbr/real \
-  --train_gt BIPED/edges/edge_maps/train/rgbr/real \
-  --cache_dir cache/biped_train \
+  --train_imgs BIPED/train/imgs \
+  --train_gt BIPED/train/gt \
+  --cache_dir cache/biped_train
 ```
 
 Use a dedicated `--cache_dir` so BIPED caches do not mix with other experiments. Lower `--batch_size` if you hit GPU memory limits.
@@ -197,40 +202,37 @@ Use a dedicated `--cache_dir` so BIPED caches do not mix with other experiments.
 ```bash
 uv run test \
   --dataset BIPED \
-  --images BIPED/edges/imgs/test/rgbr \
-  --test_gt BIPED/edges/edge_maps/test/rgbr \
+  --images BIPED/test/imgs \
+  --test_gt BIPED/test/gt \
   --output_dir output/test_biped
 ```
 
-Quick smoke test: add `--max_images 10`. If your GT folder uses BSDS-style `.mat` files instead of PNG, pass `--gt_format mat`.
+Quick smoke test: add `--max_images 10`.
 
 ### BRIND (edge maps)
 
-BRIND is BSDS500 re-annotated at the edge level by [RINDNet](https://github.com/MengyangPu/RINDNet) for four discontinuity types: reflectance, illumination, normal and depth. The published [BRIND](https://github.com/xavysp/BRIND) set merges them into one edge map per image, 300 train / 200 test. `scripts/brind.sh` clones it and writes the same `BRIND/edges/...` layout as BIPED. The per-type maps are only available from RINDNet.
+BRIND is BSDS500 re-annotated at the edge level by [RINDNet](https://github.com/MengyangPu/RINDNet) for four discontinuity types: reflectance, illumination, normal and depth. The published [BRIND](https://github.com/xavysp/BRIND) set merges them into one edge map per image, 300 train / 200 test. The per-type maps are only available from RINDNet.
+
+BRIND is the default dataset. `scripts/brind.sh` clones it into `data/`, where `train` and `test` look when no paths are given:
+
+```
+data/train/imgs/   # 300 RGB images (.jpg)
+data/train/gt/     # 300 edge maps (.png, same stem)
+data/test/imgs/    # 200 RGB images
+data/test/gt/      # 200 edge maps
+```
 
 ```bash
 sh scripts/brind.sh
 # or, from an existing clone: sh scripts/brind.sh --src-dir /path/to/BRIND
-# optional: --data-root DIR (default: BRIND)
+# optional: --data-root DIR (default: data)
 ```
 
-**Train** on BRIND:
+**Train** and **test** on BRIND:
 
 ```bash
-uv run train \
-  --train_imgs BRIND/edges/imgs/train/rgbr/real \
-  --train_gt BRIND/edges/edge_maps/train/rgbr/real \
-  --cache_dir cache/brind_train
-```
-
-**Test** on BRIND:
-
-```bash
-uv run test \
-  --dataset BRIND \
-  --images BRIND/edges/imgs/test/rgbr \
-  --test_gt BRIND/edges/edge_maps/test/rgbr \
-  --output_dir output/test_brind
+uv run train
+uv run test
 ```
 
 ### BSDS500
@@ -250,7 +252,7 @@ uv run train \
   --train_imgs BSDS500/BSDS500/data/images/train \
   --train_gt BSDS500/BSDS500/data/groundTruth/train \
   --gt_format mat \
-  --cache_dir cache/bsds_train \
+  --cache_dir cache/bsds_train
 ```
 
 Use a dedicated `--cache_dir` so BSDS caches do not mix with BIPED or other runs. Lower `--batch_size` if you run out of memory.
@@ -273,11 +275,10 @@ uv run test \
 NYUD v2 is an RGB-D dataset. Edge detection uses the ground truth that [Gupta et al.](https://github.com/s-gupta/rcnn-depth) released for its 1449 labelled images: 795 train+val and 654 test. `scripts/nyud.sh` downloads their release (`eccv14-data.tgz`, about 900 MB) and writes:
 
 ```
-NYUDv2/
-  images/train/   # 795 RGB images (img_XXXX.png)
-  images/test/    # 654 RGB images
-  gt/train/       # ground truth, one BSDS-format groundTruth .mat per image
-  gt/test/
+NYUDv2/train/imgs/   # 795 RGB images (img_XXXX.png)
+NYUDv2/train/gt/     # ground truth, one BSDS-format groundTruth .mat per image
+NYUDv2/test/imgs/    # 654 RGB images
+NYUDv2/test/gt/
 ```
 
 ```bash
@@ -290,8 +291,8 @@ sh scripts/nyud.sh
 
 ```bash
 uv run train \
-  --train_imgs NYUDv2/images/train \
-  --train_gt NYUDv2/gt/train \
+  --train_imgs NYUDv2/train/imgs \
+  --train_gt NYUDv2/train/gt \
   --cache_dir cache/nyudv2_train
 ```
 
@@ -302,8 +303,8 @@ Use a dedicated `--cache_dir` so NYUD caches do not mix with other experiments. 
 ```bash
 uv run test \
   --dataset NYUDv2 \
-  --images NYUDv2/images/test \
-  --test_gt NYUDv2/gt/test \
+  --images NYUDv2/test/imgs \
+  --test_gt NYUDv2/test/gt \
   --tol 0.011 \
   --output_dir output/test_nyudv2
 ```
@@ -312,13 +313,13 @@ Quick smoke test: add `--max_images 20`.
 
 ### Test
 
-Walks a single image directory, pairs each image with ground truth by matching filename stems, and scores both the raw map (`c_eval`) and the NMS-thinned map (`s_eval`) with the BRIND boundary benchmark:
+Walks a single image directory, pairs each image with ground truth by matching filename stems, and scores both the raw map (`c_eval`) and the NMS-thinned map (`s_eval`) with the Berkeley boundary benchmark. Without path flags it evaluates BRIND in `data/test`:
 
 ```bash
 uv run test --model output/checkpoints/final.pt
 ```
 
-The protocol follows the Berkeley benchmark (`hci/boundary_bench.py`). At each of `--nthresh` thresholds, the saved 8-bit prediction is binarised and thinned (`bwmorph(·, 'thin', inf)`). It is then matched one-to-one against each annotator within `tol × image diagonal` pixels. ODS interpolates between thresholds, OIS uses each image's best threshold, and AP is the area under the PR curve resampled at 0.01 recall. With `.mat` ground truth each BRIND annotator is matched separately. A PNG ground-truth map counts as a single annotator, so a PNG made by merging annotators scores lower than the official per-annotator `.mat` evaluation. Scores from `test.py` before this change used a dilation match and are not comparable.
+The protocol follows the Berkeley benchmark (`hci/boundary_bench.py`). At each of `--nthresh` thresholds, the saved 8-bit prediction is binarised and thinned (`bwmorph(·, 'thin', inf)`). It is then matched one-to-one against each annotator within `tol × image diagonal` pixels. ODS interpolates between thresholds, OIS uses each image's best threshold, and AP is the area under the PR curve resampled at 0.01 recall. Each annotator in a `.mat` file is matched separately; BSDS500 has about five per image. A PNG ground-truth map counts as a single annotator. Scores from earlier versions of `test.py`, which used a dilation match, are not comparable.
 
 | Flag           | Default                       | Role                                                              |
 | -------------- | ----------------------------- | ----------------------------------------------------------------- |
@@ -330,6 +331,7 @@ The protocol follows the Berkeley benchmark (`hci/boundary_bench.py`). At each o
 | `--output_dir` | `output/test`                 | Output directory                                                  |
 | `--max_images` | all                           | Cap number of images                                              |
 | `--device`     | CUDA if available             | `cpu`, `cuda`, or `mps`                                           |
+| `--diagnostics`| off                           | Save ρ and geometry maps per image under `output_dir/diagnostics/` |
 | `--tol`        | `0.0075`                      | Matching distance as a fraction of the image diagonal (NYUD convention: `0.011`) |
 | `--nthresh`    | `99`                          | Number of thresholds                                              |
 | `--workers`    | `min(8, cores)`               | Benchmark processes (inference stays on `--device`)               |
@@ -344,10 +346,10 @@ Each `output_dir/{c_eval,s_eval}/` gets `results.json` (summary, PR curve, per-i
 Single-image edge detection on the image at the `-i` path.
 
 ```bash
-# data/infer/photo.png → output/results/
-uv run infer -i data/infer/photo.png
+# assets/base.png → output/results/
+uv run infer -i assets/base.png
 
-# image elsewhere + diagnostics
+# your own image and checkpoint, with diagnostics and learned parameters
 uv run infer -i /path/to/images/photo.png \
   --model output/checkpoints/final.pt -d -v
 ```
@@ -360,4 +362,8 @@ uv run infer -i /path/to/images/photo.png \
 | `-d`, `--diagnostics` | off                    | Save pinwheel, ρ maps, geometry, overlay, etc.                    |
 | `-t`, `--threshold` | `0.5`                     | Binarization threshold on the soft boundary map                   |
 | `--ridge-nms`  | on                            | Directional NMS along renderer θ; use `--no-ridge-nms` for raw map |
+| `-v`, `--verbose` | off                        | Print learned parameters and timings                              |
+| `--gt_dir`     | none                          | Ground-truth folder (same stem as the image) to colour diagnostics |
+| `--gt_format`  | auto                          | `png` or `mat` when `--gt_dir` is set                             |
+| `--shape_theta_bins` | `12`                    | Orientation bins in the `render_theta_bins` diagnostic            |
 | `--device`     | CUDA if available             | `cpu`, `cuda`, or `mps`                                           |

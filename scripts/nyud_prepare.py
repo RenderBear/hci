@@ -70,8 +70,8 @@ def main() -> None:
     sets = {"train": np.sort(train), "test": np.sort(splits["test"].ravel())}
 
     for name, ids in sets.items():
-        out_img = os.path.join(args.out, "images", name)
-        out_gt = os.path.join(args.out, "gt", name)
+        out_img = os.path.join(args.out, name, "imgs")
+        out_gt = os.path.join(args.out, name, "gt")
         os.makedirs(out_img, exist_ok=True)
         os.makedirs(out_gt, exist_ok=True)
         n_crop = n_derived = 0
