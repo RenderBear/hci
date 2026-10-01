@@ -31,8 +31,8 @@ Scores for `pretrained/final.pt` on the BRIND test set (200 images; the model wa
 
 | Output | ODS | OIS | AP |
 | --- | --- | --- | --- |
-| NMS-thinned map (`s_eval`) | 0.661 | 0.692 | 0.684 |
-| Raw soft map (`c_eval`) | 0.661 | 0.691 | 0.537 |
+| NMS-thinned map (`s_eval`) | 0.6862 | 0.7093 | 0.6992 |
+| Raw soft map (`c_eval`) | 0.6847 | 0.7076 | 0.555 |
 
 ## Structure
 
