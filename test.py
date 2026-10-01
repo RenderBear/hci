@@ -208,7 +208,7 @@ def main():
         help="Dataset name shown in the report (default matches data/test: BRIND).",
     )
     ap.add_argument("--images", default="data/test/imgs")
-    ap.add_argument("-n", dest="max_images", type=int, default=None, help="Cap number of images")
+    ap.add_argument("-n", type=int, default=None, help="Cap number of images")
     ap.add_argument("--test_gt", default="data/test/gt")
     ap.add_argument("--gt_format", default=None)
     ap.add_argument("--model", default="pretrained/final.pt")
@@ -253,8 +253,8 @@ def main():
         glob.glob(os.path.join(args.images, "*.jpg"))
         + glob.glob(os.path.join(args.images, "*.png"))
     )
-    if args.max_images is not None:
-        img_files = img_files[: max(0, args.max_images)]
+    if args.n is not None:
+        img_files = img_files[: max(0, args.n)]
 
     pairs = []
     for img_path in img_files:
@@ -283,7 +283,7 @@ def main():
             f"{', '.join(skipped[:15])}{tail}"
         )
 
-    cap = f"  max_images={args.max_images}" if args.max_images is not None else ""
+    cap = f"  n={args.n}" if args.n is not None else ""
     print(
         f"model={args.model}  device={device}  gt_format={gt_format}  "
         f"paired={len(pairs)}/{n_img} images-with-GT{cap}"
@@ -393,7 +393,7 @@ def main():
             "AP": s["AP"],
             "n_images": len(stems),
             "time": dt_total,
-            "max_images": args.max_images,
+            "n": args.n,
             "images_dir": args.images,
             "model": args.model,
             "preds_dir": pred_dirs[mode],

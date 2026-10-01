@@ -31,8 +31,8 @@ Scores for `pretrained/final.pt` on the BRIND test set (200 images; the model wa
 
 | Output | ODS | OIS | AP |
 | --- | --- | --- | --- |
-| NMS-thinned map (`s_eval`) | 0.6862 | 0.7093 | 0.6992 |
-| Raw soft map (`c_eval`) | 0.6847 | 0.7076 | 0.555 |
+| NMS-thinned map (`s_eval`) | 0.6915 | 0.7180 | 0.7197 |
+| Raw soft map (`c_eval`) | 0.6900 | 0.7151 | 0.5941 |
 
 ## Structure
 
@@ -144,7 +144,7 @@ Outputs go to `--output_dir` (default: `output/results/`). Add `-d` / `--diagnos
 
 ### Pretrained model
 
-A pretrained checkpoint is included at `pretrained/final.pt` (learned L0 metric, seed, renderer). It is a single-scale model, trained before cross-scale support was added. It's the default `--model` for **infer** and **test**, so you can run them without training your own weights. `test` and `train` default to BRIND in `data/`, which `scripts/brind.sh` creates:
+A pretrained checkpoint is included at `pretrained/final.pt` (learned L0 metric, seed, renderer). It's the default `--model` for **infer** and **test**, so you can run them without training your own weights. `test` and `train` default to BRIND in `data/`, which `scripts/brind.sh` creates:
 
 ```bash
 # inference

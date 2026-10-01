@@ -473,7 +473,7 @@ def precompute_split(
     gt_dir,
     cache_dir,
     gt_format,
-    max_images=None,
+    n=None,
     n_workers=None,
 ):
     os.makedirs(cache_dir, exist_ok=True)
@@ -483,8 +483,8 @@ def precompute_split(
     )
     if gt_format == "png" and os.path.abspath(image_dir) == os.path.abspath(gt_dir):
         img_files = [f for f in img_files if f.endswith(".jpg")]
-    if max_images is not None:
-        img_files = img_files[:max_images]
+    if n is not None:
+        img_files = img_files[:n]
 
     stems = []
     work = []
@@ -858,7 +858,7 @@ def main():
     ap.add_argument("--cache_dir", default="cache")
     ap.add_argument("--output_dir", default="output")
     ap.add_argument("--checkpoints_dir", default="output/checkpoints")
-    ap.add_argument("-n", dest="max_images", type=int, default=None, help="Cap number of images")
+    ap.add_argument("-n", type=int, default=None, help="Cap number of images")
     ap.add_argument("--epochs", type=int, default=TRAIN.EPOCHS)
     ap.add_argument("--lr", type=float, default=TRAIN.LR)
     ap.add_argument("--batch_size", type=int, default=TRAIN.BATCH_SIZE)
@@ -885,10 +885,10 @@ def main():
     )
     gt_format = args.gt_format or _detect_gt_format(args.train_gt)
 
-    mt = args.max_images if args.max_images is not None else "all"
+    mt = args.n if args.n is not None else "all"
     print(
         f"device={device}  gt_format={gt_format}  batch={args.batch_size}"
-        f"  max_images={mt}"
+        f"  n={mt}"
     )
     gt_agree_note = (
         f"  gt_min_agreement={args.gt_min_agreement:g}"
@@ -906,7 +906,7 @@ def main():
         args.train_gt,
         train_cache,
         gt_format,
-        max_images=args.max_images,
+        n=args.n,
     )
     print(f"  {len(fit_stems)} cached")
     if not fit_stems:
