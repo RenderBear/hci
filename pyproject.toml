@@ -13,6 +13,9 @@ dependencies = [
     "torch>=2.11.0",
 ]
 
+[project.optional-dependencies]
+baselines = ["opencv-python-headless>=4.10"]
+
 [project.scripts]
 train = "hci.cli:train"
 test = "hci.cli:test"
