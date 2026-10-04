@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from params import EVAL  # noqa: E402
-from hci.boundary_bench import collect, evaluate_image, write_bsr_files  # noqa: E402
+from hci.boundary_bench import collect, evaluate_image, exit_on_interrupt, write_bsr_files  # noqa: E402
 from baselines import canny, sobel  # noqa: E402
 
 
@@ -168,6 +168,7 @@ def main():
             todo = {k: v for k, v in todo.items() if k in args.methods}
         with ProcessPoolExecutor(
             max_workers=max(1, args.workers), mp_context=multiprocessing.get_context("spawn"),
+            initializer=exit_on_interrupt,
         ) as pool:
             for name, fn in todo.items():
                 run_method(name, fn, pairs, args, T, pool)

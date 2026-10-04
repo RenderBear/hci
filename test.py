@@ -25,7 +25,13 @@ from hci.renderer import (
     ridge_nms,
     upgrade_renderer_state_dict,
 )
-from hci.boundary_bench import collect, evaluate_image, score_image, write_bsr_files
+from hci.boundary_bench import (
+    collect,
+    evaluate_image,
+    exit_on_interrupt,
+    score_image,
+    write_bsr_files,
+)
 from hci.diagnostics_viz import viz_infer_rho, viz_infer_geometry
 from train import (
     HCIE2E,
@@ -313,6 +319,7 @@ def main():
     pending = deque()
     with ProcessPoolExecutor(
         max_workers=n_workers, mp_context=multiprocessing.get_context("spawn"),
+        initializer=exit_on_interrupt,
     ) as pool:
         for idx, (stem, img_path, gt_path) in enumerate(pairs):
             t0 = time.perf_counter()

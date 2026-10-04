@@ -17,6 +17,7 @@ the C++ code samples six at random.
 from __future__ import annotations
 
 import os
+import signal
 
 import numpy as np
 from scipy import ndimage
@@ -155,6 +156,17 @@ def evaluate_image(
 
 
 # ── collect_eval_bdry ────────────────────────────────────────────────────────
+
+def exit_on_interrupt() -> None:
+    """Process-pool initializer: let Ctrl-C end a scoring worker at once.
+
+    One evaluate_image call can spend minutes in compiled matching code that does not see
+    KeyboardInterrupt, and a pool worker that does see it only reports the job as failed and waits
+    for the next one. With the default action the worker dies on the signal, the pool breaks, and
+    the parent can exit without leaving workers behind.
+    """
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
 
 def fmeasure(r: np.ndarray, p: np.ndarray) -> np.ndarray:
     s = p + r
