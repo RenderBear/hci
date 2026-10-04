@@ -240,18 +240,6 @@ def _reflect_conv_hwk(
     return y.squeeze(0).permute(1, 2, 0)
 
 
-def _spatial_offsets(radius: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    offs = []
-    for dy in range(-radius, radius + 1):
-        for dx in range(-radius, radius + 1):
-            if dy == 0 and dx == 0:
-                continue
-            offs.append((dy, dx))
-    if not offs:
-        return torch.zeros(0, 2, device=device, dtype=dtype)
-    return torch.tensor(offs, device=device, dtype=dtype)
-
-
 def _gaussian_exponent(
     d2: torch.Tensor,
     sigma_sq: torch.Tensor,
@@ -304,27 +292,24 @@ def surround_bins_B_weighted(
     nH, nW, K = rho_nr.shape
     dtype, dev = rho_nr.dtype, rho_nr.device
     sigma_sq = (sigma_s * sigma_s).clamp_min(eps)
-    ks = 2 * int(radius) + 1
-    center = int(radius)
+    radius = int(radius)
+    if radius <= 0:
+        return torch.zeros_like(rho_nr)
+    ks = 2 * radius + 1
     B = B.to(dtype=dtype, device=dev)
     col_sum = B.sum(dim=0)
 
-    spatial = torch.zeros(1, 1, ks, ks, device=dev, dtype=dtype)
-    w_acc = torch.zeros((), device=dev, dtype=dtype)
-    offs = _spatial_offsets(radius, dev, dtype)
-    if offs.numel() == 0:
-        return torch.zeros_like(rho_nr)
-    dy = offs[:, 0]
-    dx = offs[:, 1]
-    d2 = (dy * dy + dx * dx).to(dtype=dtype)
-    g = _gaussian_exponent(d2, sigma_sq)
-    w_acc = g.sum()
-    for m in range(offs.shape[0]):
-        oy = int(dy[m].item()) + center
-        ox = int(dx[m].item()) + center
-        spatial[0, 0, oy, ox] = g[m]
+    # The surround is a Gaussian over every offset but the centre. exp(-(dy² + dx²)/2σ²) factors
+    # into a column pass and a row pass; the centre tap has weight 1 and is subtracted afterwards.
+    r = torch.arange(-radius, radius + 1, device=dev, dtype=dtype)
+    g = _gaussian_exponent(r * r, sigma_sq)
+    w_acc = g.sum() ** 2 - 1.0
 
-    smoothed = _reflect_conv_hwk(rho_nr, spatial.expand(K, 1, ks, ks), groups=K)
+    x = rho_nr.permute(2, 0, 1).unsqueeze(0)
+    x = Fn.pad(x, (radius, radius, radius, radius), mode="reflect")
+    x = Fn.conv2d(x, g.view(1, 1, ks, 1).expand(K, 1, ks, 1), groups=K)
+    x = Fn.conv2d(x, g.view(1, 1, 1, ks).expand(K, 1, 1, ks), groups=K)
+    smoothed = x.squeeze(0).permute(1, 2, 0) - rho_nr
     numer = torch.matmul(smoothed, B)
     denom = w_acc * col_sum.view(1, 1, K) + eps
     return numer / denom
@@ -513,7 +498,6 @@ class ContourSeed(nn.Module):
             ax_bin = ax_bin.reshape(nH, nW, K)
             ay_bin = ay_bin.reshape(nH, nW, K)
 
-        rho_t = cells_flat["rho_total"].to(device).reshape(nH, nW).float()
         bar_theta = self.theta_bins.to(device=device, dtype=rho_bin.dtype)
         B = self.B_orth.to(device=device, dtype=rho_bin.dtype)
 
@@ -586,11 +570,6 @@ class ContourSeed(nn.Module):
         cf_out["sur"] = (S * ok.unsqueeze(-1)).mean(dim=-1)
         cf_out["sur_bins"] = S * ok.unsqueeze(-1)
         cf_out["drive"] = rho_bin.mean(dim=-1) * ok
-        cf_out["E_rel"] = relative_energy(
-            rho_t, nH, nW, eps,
-            radius=self.cross_surround_radius,
-            sigma=float(self.surround_sigma),
-        )
         cf_out["g_R"] = cf_out["exc"]
         cf_out["g_E"] = cf_out["sur"]
         cf_out["rho_out_bins"] = rho_out

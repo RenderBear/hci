@@ -51,20 +51,11 @@ def z_from_l0_harmonics(
     return z1, z2
 
 
-def _extract_patches_torch(
-    t: torch.Tensor,
-    nH: int,
-    nW: int,
-    P: int,
-    S: int,
-) -> torch.Tensor:
-    patches = t.unfold(0, P, S).unfold(1, P, S)
-    return patches.contiguous().reshape(nH * nW, P * P)
-
-
 def _sum_pool2d(field: torch.Tensor, P: int, S: int) -> torch.Tensor:
-    x = field.unsqueeze(0).unsqueeze(0)
-    return F.avg_pool2d(x, kernel_size=P, stride=S).squeeze(0).squeeze(0) * (P * P)
+    """Sum over each P×P patch at stride S, for an (H, W) map or a (C, H, W) stack."""
+    x = field.reshape(1, -1, *field.shape[-2:])
+    y = F.avg_pool2d(x, kernel_size=P, stride=S, divisor_override=1)
+    return y.reshape(*field.shape[:-2], *y.shape[-2:])
 
 
 def compute_cell_moments(
@@ -99,18 +90,16 @@ def compute_cell_moments(
     if verbose:
         print(f"  grid {nH}x{nW} = {n} cells  (z₂ moments, K={K})")
 
+    # Every per-cell quantity below is a sum over the cell's patch of a per-pixel map, so it is
+    # computed on the pixel grid and box-summed rather than unfolded into (cells, P·P) patches.
     bm_float = border_mask.float()
-    bm_patches = _extract_patches_torch(bm_float, nH, nW, P, S)
-    is_border_flat = bm_patches.mean(dim=-1) > border_patch_max_frac
+    is_border_flat = (_sum_pool2d(bm_float, P, S) / (P * P)).reshape(-1) > border_patch_max_frac
 
-    z2_patches = _extract_patches_torch(z2, nH, nW, P, S)
-    PP = P * P
-
-    z2_abs = z2_patches.abs().to(torch.float32)
-    z2_abs_sum = z2_abs.sum(dim=-1)
+    z2_abs = z2.abs().to(torch.float32)
+    z2_abs_sum = _sum_pool2d(z2_abs, P, S).reshape(-1)
     rho_total_flat = z2_abs_sum.reshape(-1)
 
-    Z2 = z2_patches.sum(dim=-1)
+    Z2 = torch.complex(_sum_pool2d(z2.real, P, S), _sum_pool2d(z2.imag, P, S)).reshape(-1)
     rho_peak_cell = Z2.abs().to(torch.float32)
     rho_coherence_cell = torch.where(
         z2_abs_sum > eps,
@@ -124,34 +113,33 @@ def compute_cell_moments(
         0.5 * torch.atan2(Z2.imag, Z2.real + eps)
     ).to(torch.float32).reshape(-1)
 
-    ok_pix = (1.0 - bm_patches).clamp(0.0, 1.0)
-    theta_p = 0.5 * torch.atan2(z2_patches.imag, z2_patches.real + eps).to(torch.float32)
+    ok_pix = (1.0 - bm_float).clamp(0.0, 1.0)
+    theta_p = 0.5 * torch.atan2(z2.imag, z2.real + eps).to(torch.float32)
     bar_theta = (torch.arange(K, device=dev, dtype=torch.float32) * (math.pi / float(K))).view(1, 1, K)
     if isinstance(kappa_vm, torch.Tensor):
         kvm = kappa_vm.to(dev, dtype=torch.float32).reshape(())
     else:
         kvm = torch.tensor(float(kappa_vm), device=dev, dtype=torch.float32)
     kvm = kvm.clamp_min(0.0)
-    diff = 2.0 * (theta_p.unsqueeze(-1) - bar_theta)
+    diff = 2.0 * (theta_p.unsqueeze(0) - bar_theta.view(K, 1, 1))
     g = torch.exp(kvm * (torch.cos(diff) - 1.0))
-    w_mag = z2_abs.unsqueeze(-1) * g * ok_pix.unsqueeze(-1)
-    rho_bin_flat = w_mag.sum(dim=1)
+    w_mag = z2_abs.unsqueeze(0) * g * ok_pix.unsqueeze(0)
+
+    def _bin_sums(w_khw: torch.Tensor) -> torch.Tensor:
+        return _sum_pool2d(w_khw, P, S).permute(1, 2, 0).reshape(n, K)
+
+    rows = torch.arange(H, device=dev, dtype=torch.float32).unsqueeze(1).expand(H, W)
+    cols = torch.arange(W, device=dev, dtype=torch.float32).unsqueeze(0).expand(H, W)
+    rho_bin_flat = _bin_sums(w_mag)
     den_anch = rho_bin_flat + float(eps)
+    ax_bin_flat = _bin_sums(w_mag * cols) / den_anch
+    ay_bin_flat = _bin_sums(w_mag * rows) / den_anch
+
+    z2_ok_sum = _sum_pool2d(z2_abs * ok_pix, P, S).reshape(-1).clamp_min(float(eps))
+    rho_bin_coh_flat = rho_bin_flat / z2_ok_sum.unsqueeze(-1)
 
     pis = torch.arange(nH, device=dev).repeat_interleave(nW)
     pjs = torch.arange(nW, device=dev).repeat(nH)
-    offs = torch.arange(PP, device=dev)
-    ii = (offs // P).to(torch.float32).view(1, PP)
-    jj = (offs % P).to(torch.float32).view(1, PP)
-    rows_pix = pis.float().unsqueeze(1) * float(S) + ii
-    cols_pix = pjs.float().unsqueeze(1) * float(S) + jj
-    ax_bin_flat = (w_mag * cols_pix.unsqueeze(-1)).sum(dim=1) / den_anch
-    ay_bin_flat = (w_mag * rows_pix.unsqueeze(-1)).sum(dim=1) / den_anch
-
-    z2_ok_sum = (z2_abs * ok_pix).sum(dim=-1).clamp_min(float(eps))
-    rho_bin_coh_flat = rho_bin_flat / z2_ok_sum.unsqueeze(-1)
-
-    del z2_patches
 
     theta_flat = torch.where(is_border_flat, torch.zeros_like(theta_flat), theta_flat)
     rho_total_flat = torch.where(
@@ -180,8 +168,6 @@ def compute_cell_moments(
     ax_bin_flat = torch.where(ib_exp, cx_cell, ax_bin_flat)
     ay_bin_flat = torch.where(ib_exp, cy_cell, ay_bin_flat)
 
-    rows = torch.arange(H, device=dev, dtype=torch.float32).unsqueeze(1).expand(H, W)
-    cols = torch.arange(W, device=dev, dtype=torch.float32).unsqueeze(0).expand(H, W)
     mass_2d = _sum_pool2d(h2m, P, S)
     cx_num = _sum_pool2d(h2m * cols, P, S)
     cy_num = _sum_pool2d(h2m * rows, P, S)
