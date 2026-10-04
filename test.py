@@ -32,6 +32,7 @@ from train import (
     build_cells_flat,
     build_l0_pix,
     coarse_rho_bins,
+    default_device,
     report_checkpoint_compatibility,
     scales_from_state_dict,
     upgrade_model_state_dict,
@@ -234,9 +235,7 @@ def main():
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
-    device = torch.device(
-        args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
+    device = torch.device(args.device if args.device else default_device())
     gt_format = args.gt_format or _detect_gt_format(args.test_gt)
 
     ckpt = torch.load(args.model, map_location="cpu", weights_only=False)

@@ -288,6 +288,17 @@ def _backproject_deposit(
     ax_eff = ax_active + delta_n_active * cos_a
     ay_eff = ay_active - delta_n_active * sin_a
 
+    if device.type == "mps":
+        # On MPS the same sums, and their gradient, run in Metal kernels instead of chunked
+        # tensor passes.
+        from .splat_metal import splat_fused
+
+        return splat_fused(
+            rho_active, gate_active, alpha_active, ax_eff, ay_eff, cos_a, sin_a,
+            kappa_active, ext_s_active, h_perp, h_par, half_w, H, W,
+            claim_clip=_CLAIM_CLIP, with_theta=with_theta,
+        )
+
     ax_int = torch.floor(ax_eff).long()
     ay_int = torch.floor(ay_eff).long()
     ax_frac = ax_eff - ax_int.to(dtype=dtype)

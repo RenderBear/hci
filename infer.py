@@ -37,6 +37,7 @@ from train import (
     build_cells_flat,
     build_l0_pix,
     coarse_rho_bins,
+    default_device,
     format_l0_param_lines,
     format_l1_param_lines,
     format_seed_param_lines,
@@ -412,9 +413,7 @@ def main():
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
-    device = torch.device(
-        args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
+    device = torch.device(args.device if args.device else default_device())
     stem = os.path.splitext(os.path.basename(args.image))[0]
 
     ckpt = torch.load(args.model, map_location="cpu", weights_only=False)

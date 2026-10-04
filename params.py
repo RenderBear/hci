@@ -82,17 +82,17 @@ RENDER = SimpleNamespace(
     SIGMA_PERP_MAX=8.0,
     SPLAT_RADIUS_SIGMAS=3.0,
     THETA_SMOOTH_PASSES=0,
-    THINNING_IN=20,
+    THINNING_IN=30,
     THINNING_HIDDEN=12,
 )
 
 # ── Training ───────────────────────────────────────────────────────────────
 TRAIN = SimpleNamespace(
     LR=5e-2,
-    EPOCHS=20,
+    EPOCHS=30,
     BATCH_SIZE=4,
     GRAD_CLIP=1.0,
-    NUM_WORKERS=2,
+    NUM_WORKERS=0,
     GT_MIN_AGREEMENT=0.0,
     L0_CACHE_VERSION=3,
 )

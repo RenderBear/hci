@@ -158,8 +158,8 @@ def compute_cell_moments(
 
     ib_grid = is_border_flat.reshape(nH, nW)
 
-    cx_flat = pjs.double() * S + P / 2.0
-    cy_flat = pis.double() * S + P / 2.0
+    cx_flat = pjs.float() * S + P / 2.0
+    cy_flat = pis.float() * S + P / 2.0
     cx_grid = cx_flat.reshape(nH, nW)
     cy_grid = cy_flat.reshape(nH, nW)
 

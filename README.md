@@ -50,6 +50,7 @@ HCI/
 │   ├── L1.py                # cell-level z₂ moments (E, C, θ)
 │   ├── seed.py              # η_z NR + collinear + cross-scale + surround → cell ρ for splat
 │   ├── renderer.py          # learned ridge projection
+│   ├── splat_metal.py       # the renderer's splat as Metal kernels, used with --device mps
 │   ├── boundary_bench.py    # Berkeley boundary benchmark (ODS, OIS, AP)
 │   ├── cli.py               # `uv run train` / `test` / `infer` entry points
 │   └── diagnostics_viz.py   # visualisation utilities
@@ -125,7 +126,9 @@ Replace `cu128` with your tag. Do **not** run `pip install -r requirements.txt` 
 uv run python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
-Expect `True` for the second value on the CUDA path. Training auto-selects `cuda` when available (`device=cuda` in the log); pass `--device cpu` to force CPU.
+Expect `True` for the second value on the CUDA path. `train`, `test` and `infer` pick `cuda` when available, then `mps` on Apple silicon, then `cpu` (the choice is printed as `device=...`); pass `--device cpu` to force CPU.
+
+On `mps`, the renderer's splat and its gradient run as Metal kernels (`hci/splat_metal.py`) and compute the same sums as the CPU path, so results agree up to float rounding.
 
 ## Usage
 
@@ -165,7 +168,7 @@ Trains on BRIND in `data/train` by default:
 uv run train
 ```
 
-Main flags: `--train_imgs`, `--train_gt`, `--gt_format` (`png` / `mat`; auto-detected from the GT folder if omitted), `--epochs` (default `20`), `--lr` (default `5e-2`), `--batch_size`, `-n` (cap the number of images), `--device`, `--output_dir`, `--checkpoints_dir`, `--cache_dir`, `--num_workers`, `--grad_clip`, `--gt_min_agreement`, `--resume`. `--debug-seed` runs one batch and prints the seed's parameters and gradients.
+Main flags: `--train_imgs`, `--train_gt`, `--gt_format` (`png` / `mat`; auto-detected from the GT folder if omitted), `--epochs` (default `20`), `--lr` (default `5e-2`), `--batch_size`, `-n` (cap the number of images), `--device`, `--output_dir`, `--checkpoints_dir`, `--cache_dir`, `--num_workers` (default `0`: cached items load in milliseconds, and starting worker processes each epoch costs more than it saves), `--grad_clip`, `--gt_min_agreement`, `--resume`. `--debug-seed` runs one batch and prints the seed's parameters and gradients.
 
 Each epoch overwrites `intermediate.pt` in `--checkpoints_dir` with the weights, optimizer state, epoch number and loss history. To continue an interrupted run, repeat the command with `--resume`:
 
@@ -340,7 +343,7 @@ The protocol follows the Berkeley benchmark (`hci/boundary_bench.py`). At each o
 | `--model`      | `pretrained/final.pt`         | Checkpoint                                                        |
 | `--output_dir` | `output/test`                 | Output directory                                                  |
 | `-n`           | all                           | Cap number of images                                              |
-| `--device`     | CUDA if available             | `cpu`, `cuda`, or `mps`                                           |
+| `--device`     | CUDA, else MPS, else CPU      | `cpu`, `cuda`, or `mps`                                           |
 | `--diagnostics`| off                           | Save ρ and geometry maps per image under `output_dir/diagnostics/` |
 | `--tol`        | `0.0075`                      | Matching distance as a fraction of the image diagonal (NYUD convention: `0.011`) |
 | `--nthresh`    | `99`                          | Number of thresholds                                              |
@@ -376,4 +379,4 @@ uv run infer -i /path/to/images/photo.png \
 | `--gt_dir`     | none                          | Ground-truth folder (same stem as the image) to colour diagnostics |
 | `--gt_format`  | auto                          | `png` or `mat` when `--gt_dir` is set                             |
 | `--shape_theta_bins` | `12`                    | Orientation bins in the `render_theta_bins` diagnostic            |
-| `--device`     | CUDA if available             | `cpu`, `cuda`, or `mps`                                           |
+| `--device`     | CUDA, else MPS, else CPU      | `cpu`, `cuda`, or `mps`                                           |

@@ -185,6 +185,18 @@ def run_moments_cells_flat(
 run_l1_cells_flat = run_moments_cells_flat
 
 
+def _lerp_axis(x: torch.Tensor, pos: torch.Tensor, dim: int) -> torch.Tensor:
+    """Linear interpolation of x along dim at fractional indices pos, clamped to the ends."""
+    n = x.shape[dim]
+    pos = pos.clamp(0, n - 1)
+    i0 = pos.floor().long()
+    i1 = (i0 + 1).clamp(max=n - 1)
+    shape = [1] * x.dim()
+    shape[dim] = -1
+    w = (pos - i0).view(shape)
+    return x.index_select(dim, i0) * (1.0 - w) + x.index_select(dim, i1) * w
+
+
 def coarse_rho_bins(
     img: torch.Tensor,
     H0: int,
@@ -231,12 +243,21 @@ def coarse_rho_bins(
         nHc, nWc = int(cf_c["nH"]), int(cf_c["nW"])
         rho_c = cf_c["rho_bin"].reshape(nHc, nWc, K).permute(2, 0, 1).unsqueeze(0)
         # A fine cell centred at pixel c sits at coarse-grid index (c / f − P/2) / S.
-        gy = ((cy / f - P / 2.0) / S) / max(nHc - 1, 1) * 2.0 - 1.0
-        gx = ((cx / f - P / 2.0) / S) / max(nWc - 1, 1) * 2.0 - 1.0
-        grid = torch.stack(
-            [gx.view(1, nW).expand(nH, nW), gy.view(nH, 1).expand(nH, nW)], dim=-1,
-        ).unsqueeze(0)
-        up = F.grid_sample(rho_c, grid, mode="bilinear", padding_mode="border", align_corners=True)
+        iy = (cy / f - P / 2.0) / S
+        ix = (cx / f - P / 2.0) / S
+        if rho_c.device.type == "mps":
+            # grid_sample has no backward on MPS. The grid is separable, so the same bilinear
+            # sample with border clamping is one interpolation per axis.
+            up = _lerp_axis(_lerp_axis(rho_c, iy, dim=2), ix, dim=3)
+        else:
+            gy = iy / max(nHc - 1, 1) * 2.0 - 1.0
+            gx = ix / max(nWc - 1, 1) * 2.0 - 1.0
+            grid = torch.stack(
+                [gx.view(1, nW).expand(nH, nW), gy.view(nH, 1).expand(nH, nW)], dim=-1,
+            ).unsqueeze(0)
+            up = F.grid_sample(
+                rho_c, grid, mode="bilinear", padding_mode="border", align_corners=True,
+            )
         out.append(up.squeeze(0).permute(1, 2, 0).reshape(nH * nW, K))
     return torch.stack(out, dim=0)
 
@@ -838,6 +859,15 @@ def _detect_gt_format(gt_dir):
     return "png"
 
 
+def default_device() -> str:
+    """CUDA if present, else MPS (Apple silicon), else CPU."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def _format_hms(seconds: float) -> str:
     s = int(round(max(0.0, float(seconds))))
     h, rem = divmod(s, 3600)
@@ -897,9 +927,7 @@ def main():
             print(f"error: --resume checkpoint not found: {resume_path}")
             return
         resume = torch.load(resume_path, map_location="cpu", weights_only=False)
-    device = torch.device(
-        args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
+    device = torch.device(args.device if args.device else default_device())
     gt_format = args.gt_format or _detect_gt_format(args.train_gt)
 
     mt = args.n if args.n is not None else "all"
