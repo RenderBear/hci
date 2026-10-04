@@ -3,7 +3,6 @@ r"""test.py — HCI test-set evaluation with the Berkeley boundary benchmark (OD
 from __future__ import annotations
 
 import argparse
-import gc
 import glob
 import json
 import multiprocessing
@@ -88,7 +87,6 @@ def run_image_inference(
     ir_np = np.array(Image.open(img_path).convert("RGB"), dtype=np.float32) / 255.0
     ir_p, H0, W0 = pad_for_patch_grid(ir_np, L1.PATCH_SIZE, L1.PATCH_OVERLAP)
     del ir_np
-    gc.collect()
 
     ir_t = torch.from_numpy(ir_p).to(device)
     with torch.no_grad():
@@ -113,7 +111,6 @@ def run_image_inference(
         s_np, h1m, h2m, bm_np, h2m_lum=h2m_lum, h2m_chr=h2m_chr,
     )
     del h, vld, s, h1m, h2m_lum, h2m_chr
-    gc.collect()
 
     cells = compute_cell_moments(
         h2m,
@@ -137,7 +134,6 @@ def run_image_inference(
                 kappa_vm=model.seed.kappa_vm,
             )
     del h2m, z1, z2, bm_t, ir_t
-    gc.collect()
     cells["is_border"] |= (cells["cy"] + cells["P"] / 2 > H0) | (
         cells["cx"] + cells["P"] / 2 > W0
     )
@@ -145,14 +141,12 @@ def run_image_inference(
     nH, nW = cells["nH"], cells["nW"]
     proj = compute_render_features(z2_img, ir_p, cells, bm_np, eps=SEED.EPS)
     del z2_img, bm_np
-    gc.collect()
 
     Hp, Wp = ir_p.shape[:2]
     cells_flat = build_cells_flat(cells)
     if rho_coarse is not None:
         cells_flat["rho_bin_coarse"] = rho_coarse
     del cells, ir_p
-    gc.collect()
 
     cf_dev = {
         k: (v.to(device) if isinstance(v, torch.Tensor) else v)
@@ -196,7 +190,6 @@ def run_image_inference(
     bmap = bmap_t.cpu().numpy()[:H0, :W0]
     theta = theta_t.cpu().numpy()[:H0, :W0]
     del cf_dev, proj_dev, rho_out, branch, bmap_t, theta_t, cf_out
-    gc.collect()
     return bmap, theta, H0, W0
 
 
@@ -359,7 +352,6 @@ def main():
                 _report(*pending.popleft())
 
             del bmap_c, bmap_s, theta, gts
-            gc.collect()
 
         while pending:
             _report(*pending.popleft())

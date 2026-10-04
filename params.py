@@ -89,7 +89,7 @@ RENDER = SimpleNamespace(
 # ── Training ───────────────────────────────────────────────────────────────
 TRAIN = SimpleNamespace(
     LR=5e-2,
-    EPOCHS=15,
+    EPOCHS=20,
     BATCH_SIZE=4,
     GRAD_CLIP=1.0,
     NUM_WORKERS=2,

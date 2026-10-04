@@ -89,7 +89,6 @@ def run_l0_l1(img_path, device, metric=None, notch=None, *, kappa_vm, scales=())
     ir_np = np.array(Image.open(img_path).convert("RGB"), dtype=np.float32) / 255.0
     ir_p, H0, W0 = pad_for_patch_grid(ir_np, L1.PATCH_SIZE, L1.PATCH_OVERLAP)
     del ir_np
-    gc.collect()
 
     ir_t = torch.from_numpy(ir_p).to(device)
     with torch.no_grad():
@@ -117,7 +116,6 @@ def run_l0_l1(img_path, device, metric=None, notch=None, *, kappa_vm, scales=())
         s_np, h1m, h2m, bm_np, h2m_lum=h2m_lum, h2m_chr=h2m_chr,
     )
     del h, vld, s, h1m, h2m_lum, h2m_chr
-    gc.collect()
     _sync(device)
     timings["l0"] = time.perf_counter() - t0
 
@@ -136,7 +134,6 @@ def run_l0_l1(img_path, device, metric=None, notch=None, *, kappa_vm, scales=())
         num_orient_bins=int(getattr(L1, "NUM_ORIENT_BINS", 8)),
     )
     del h2m, z1, z2, bm_t
-    gc.collect()
     cells["is_border"] |= (cells["cy"] + cells["P"] / 2 > H0) | (
         cells["cx"] + cells["P"] / 2 > W0
     )
@@ -154,7 +151,6 @@ def run_l0_l1(img_path, device, metric=None, notch=None, *, kappa_vm, scales=())
     nH, nW = cells["nH"], cells["nW"]
     proj_info = compute_render_features(z2_image, ir_p, cells, bm_np, eps=SEED.EPS)
     del z2_image, bm_np
-    gc.collect()
 
     cells_flat = build_cells_flat(cells)
     if rho_coarse is not None:
@@ -173,7 +169,6 @@ def run_l0_l1(img_path, device, metric=None, notch=None, *, kappa_vm, scales=())
     is_border_grid = cells["is_border"].copy()
     Hp, Wp = ir_p.shape[:2]
     del cells, ir_p
-    gc.collect()
     _sync(device)
     timings["render_precompute"] = time.perf_counter() - t2
 

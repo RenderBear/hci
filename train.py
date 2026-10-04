@@ -2,7 +2,7 @@ r"""train.py — HCI training pipeline: z₂ moments + association-field seed + 
 
 from __future__ import annotations
 
-import argparse, gc, glob, json, os, time
+import argparse, gc, glob, json, math, os, time
 from multiprocessing import Pool, cpu_count
 
 import numpy as np
@@ -816,8 +816,8 @@ def format_model_param_summary(model: HCIE2E) -> str:
     return f"{n_tot} (L0={n_l0} seed={n_seed} renderer={n_r})"
 
 
-def save_checkpoint(model, path):
-    torch.save({"model_state": model.state_dict()}, path)
+def save_checkpoint(model, path, **train_state):
+    torch.save({"model_state": model.state_dict(), **train_state}, path)
 
 
 def report_checkpoint_compatibility(incompatible, context="checkpoint load"):
@@ -876,10 +876,27 @@ def main():
         action="store_true",
         help="Run one batch, print seed stats and β_seed/β_coll/κ_θ/η_z/η_readout/λ/σ_f/β_scale gradients, then exit",
     )
+    ap.add_argument(
+        "--resume",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="CKPT",
+        help="Continue training from a checkpoint (default: <checkpoints_dir>/intermediate.pt)",
+    )
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(args.checkpoints_dir, exist_ok=True)
+    intermediate_path = os.path.join(args.checkpoints_dir, "intermediate.pt")
+
+    resume = None
+    if args.resume is not None:
+        resume_path = args.resume or intermediate_path
+        if not os.path.exists(resume_path):
+            print(f"error: --resume checkpoint not found: {resume_path}")
+            return
+        resume = torch.load(resume_path, map_location="cpu", weights_only=False)
     device = torch.device(
         args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
     )
@@ -914,14 +931,38 @@ def main():
         return
     print(f"  training on all {len(fit_stems)}")
 
+    scales = tuple(SEED.SCALES)
+    if resume is not None:
+        resume_sd = upgrade_model_state_dict(resume["model_state"])
+        resume_sd = upgrade_renderer_state_dict(resume_sd, prefix="renderer.")
+        # Keep the scales the checkpoint was trained with, as test and infer do.
+        scales = scales_from_state_dict(resume_sd)
+
     model = HCIE2E(
         eps=SEED.EPS,
+        scales=scales,
     ).to(device)
+    if resume is not None:
+        incompatible = model.load_state_dict(resume_sd, strict=False)
+        report_checkpoint_compatibility(incompatible, context="train --resume")
 
     active_params = list(model.parameters())
     optimizer = torch.optim.Adam(active_params, lr=args.lr)
+    start_epoch = 0
+    history = []
+    if resume is not None and "optimizer_state" in resume:
+        optimizer.load_state_dict(resume["optimizer_state"])
+        start_epoch = int(resume["epoch"])
+        history = list(resume.get("history", []))
+        # Put the LR on this run's cosine schedule (--lr, --epochs) at start_epoch, so the
+        # same flags continue the original schedule and changed flags take effect.
+        eta_min = args.lr * 0.1
+        cos_t = math.cos(math.pi * start_epoch / args.epochs)
+        for g in optimizer.param_groups:
+            g["initial_lr"] = args.lr
+            g["lr"] = eta_min + (args.lr - eta_min) * (1 + cos_t) / 2
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=args.lr * 0.1
+        optimizer, T_max=args.epochs, eta_min=args.lr * 0.1, last_epoch=start_epoch - 1
     )
 
     print(f"\nmodel: {format_model_param_summary(model)}  scales={(1, *model.seed.scales)}")
@@ -949,12 +990,22 @@ def main():
         )
         return
 
+    if resume is not None:
+        if start_epoch >= args.epochs:
+            print(
+                f"\n{resume_path} is already at epoch {start_epoch}/{args.epochs};"
+                f" raise --epochs to train further."
+            )
+            return
+        if start_epoch:
+            print(f"\nresuming {resume_path} from epoch {start_epoch + 1}")
+        else:
+            print(f"\n{resume_path} has weights only: starting from them at epoch 1")
     print(f"\ntraining ({args.epochs} epochs)...\n")
-    history = []
     n_fit = len(fit_stems)
     dbg_img_step = max(1, n_fit // 5)
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         ep_loss = 0.0
         n_img = 0
@@ -1073,8 +1124,13 @@ def main():
             }
         )
 
-        intermediate_path = os.path.join(args.checkpoints_dir, "intermediate.pt")
-        save_checkpoint(model, intermediate_path)
+        save_checkpoint(
+            model,
+            intermediate_path,
+            optimizer_state=optimizer.state_dict(),
+            epoch=epoch + 1,
+            history=history,
+        )
         print(f"  saved {intermediate_path}")
 
     model_path = os.path.join(args.checkpoints_dir, "final.pt")

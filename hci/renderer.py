@@ -294,7 +294,7 @@ def _backproject_deposit(
 
     bar_theta_active = torch.atan2(sin_a, cos_a)
 
-    max_batch = max(1, 4_000_000 // P)
+    max_batch = max(1, 1_000_000 // P)
 
     do_ckpt = bool(use_checkpoint) and torch.is_grad_enabled()
 
