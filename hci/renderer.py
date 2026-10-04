@@ -264,6 +264,7 @@ def _backproject_deposit(
     H: int, W: int,
     eps: float = 1e-6,
     use_checkpoint: bool = True,
+    with_theta: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     A = rho_active.shape[0]
     device, dtype = rho_active.device, rho_active.dtype
@@ -327,15 +328,17 @@ def _backproject_deposit(
 
         log_neg_acc.scatter_add_(0, flat_idx.reshape(-1), log_neg.reshape(-1))
 
-        with torch.no_grad():
-            cl_det = (-torch.expm1(log_neg.detach())).to(torch.float32).reshape(-1)
-            idx_flat = flat_idx.reshape(-1)
-            cos2 = torch.cos(2.0 * bar_theta_active[b0:b1])
-            sin2 = torch.sin(2.0 * bar_theta_active[b0:b1])
-            cos2_expand = cos2.unsqueeze(1).expand(bs, P).reshape(-1)
-            sin2_expand = sin2.unsqueeze(1).expand(bs, P).reshape(-1)
-            mom_re.scatter_add_(0, idx_flat, cl_det * cos2_expand)
-            mom_im.scatter_add_(0, idx_flat, cl_det * sin2_expand)
+        # The moments only feed theta_star, which stays zero when the caller does not want it.
+        if with_theta:
+            with torch.no_grad():
+                cl_det = (-torch.expm1(log_neg.detach())).to(torch.float32).reshape(-1)
+                idx_flat = flat_idx.reshape(-1)
+                cos2 = torch.cos(2.0 * bar_theta_active[b0:b1])
+                sin2 = torch.sin(2.0 * bar_theta_active[b0:b1])
+                cos2_expand = cos2.unsqueeze(1).expand(bs, P).reshape(-1)
+                sin2_expand = sin2.unsqueeze(1).expand(bs, P).reshape(-1)
+                mom_re.scatter_add_(0, idx_flat, cl_det * cos2_expand)
+                mom_im.scatter_add_(0, idx_flat, cl_det * sin2_expand)
 
     bmap = -torch.expm1(log_neg_acc)
     theta_star = (0.5 * torch.atan2(mom_im, mom_re)).to(dtype=dtype)
@@ -652,6 +655,7 @@ def render_boundary_map_torch(
         h_par=renderer.h_par,
         kernel_h_w=renderer._kernel_h_w,
         H=H, W=W, eps=eps,
+        with_theta=return_dominant_theta,
     )
 
     ch = Hp if content_h is None else content_h
