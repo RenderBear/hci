@@ -4,8 +4,8 @@ Every (method, resolution, threads) cell runs in a fresh subprocess. Memory is t
 over one cold call, measured after imports, model load and image decode, so it counts the
 detector's working buffers (and, for HCI, PyTorch's first-call allocations) but not the runtime
 itself. Time is the median of warm calls. Canny and Sobel time one run on the grayscale image (for
-Canny at its ODS threshold from compare.py); HCI times test.py's ``run_image_inference`` plus
-``ridge_nms``, i.e. image to final edge map, which includes decoding the input file.
+Canny at its ODS threshold from compare.py); HCI times test.py's ``run_image_inference``, i.e.
+image to final NMS-thinned edge map, which includes decoding the input file.
 
 Canny and Sobel run on the CPU. HCI runs on ``--device``: CUDA if present, else MPS, else CPU, as
 in train.py, test.py and infer.py. Peak RSS only covers host memory, so on a GPU the HCI rows also
@@ -56,7 +56,6 @@ def worker(args) -> dict:
 
         torch.set_num_threads(args.threads or torch.get_num_threads())
         from baselines.compare import _load_test_module
-        from hci.renderer import ridge_nms
 
         T = _load_test_module()
         device = torch.device(args.device or T.default_device())
@@ -70,8 +69,7 @@ def worker(args) -> dict:
         inputs = paths
 
         def run(path):
-            bmap, theta, _, _ = T.run_image_inference(model, path, device)
-            return ridge_nms(bmap, theta=theta)
+            return T.run_image_inference(model, path, device)[1]
     else:
         import cv2
 

@@ -15,14 +15,13 @@ import numpy as np
 import torch
 from PIL import Image
 
-from params import L0, L1, SEED, EVAL
-from hci.L0 import compute_l0_rgb, compute_interior
-from hci.L1 import z_from_l0_harmonics, pad_for_patch_grid, compute_cell_moments
+from params import L1, SEED, EVAL
+from hci.L0 import compute_interior
+from hci.L1 import pad_for_patch_grid
 from hci.renderer import (
-    compute_render_features,
     render_boundary_map_torch,
-    proj_to_device,
     ridge_nms,
+    ridge_nms_torch,
     upgrade_renderer_state_dict,
 )
 from hci.boundary_bench import (
@@ -35,11 +34,12 @@ from hci.boundary_bench import (
 from hci.diagnostics_viz import viz_infer_rho, viz_infer_geometry
 from train import (
     HCIE2E,
-    build_cells_flat,
-    build_l0_pix,
+    build_l0_pix_live,
     coarse_rho_bins,
     default_device,
+    proj_info_from_grid,
     report_checkpoint_compatibility,
+    run_moments_cells_flat,
     scales_from_state_dict,
     upgrade_model_state_dict,
 )
@@ -90,79 +90,28 @@ def run_image_inference(
     diagnostics_dir: str | None = None,
     stem: str | None = None,
 ):
-
+    """Image file -> raw map, NMS-thinned map, orientation map (cropped to the image), H0, W0."""
     ir_np = np.array(Image.open(img_path).convert("RGB"), dtype=np.float32) / 255.0
     ir_p, H0, W0 = pad_for_patch_grid(ir_np, L1.PATCH_SIZE, L1.PATCH_OVERLAP)
-    del ir_np
-
-    ir_t = torch.from_numpy(ir_p).to(device)
-    with torch.no_grad():
-        h, vld, _, _, _, s, h1m, h2m, h2m_lum, h2m_chr = compute_l0_rgb(
-            ir_t,
-            eta_lum=L0.ETA_LUM,
-            eta_chr=L0.ETA_CHR,
-            gamma=L0.GAMMA,
-            offsets=L0.OFFSETS,
-            metric=getattr(model, "l0_metric", None),
-            notch=getattr(model, "l0_notch", None),
-        )
-    bm_t = ~compute_interior(ir_p.shape[0], ir_p.shape[1], device)
-    z1, z2 = z_from_l0_harmonics(s, bm_t)
-    _ = z1
-
-    s_np = s.cpu().numpy()
-    bm_np = bm_t.cpu().numpy()
-    z2_img = (s_np[..., 2] + 1j * s_np[..., 3]).astype(np.complex64)
-    z2_img[bm_np] = 0.0
-    l0_pix = build_l0_pix(
-        s_np, h1m, h2m, bm_np, h2m_lum=h2m_lum, h2m_chr=h2m_chr,
-    )
-    del h, vld, s, h1m, h2m_lum, h2m_chr
-
-    cells = compute_cell_moments(
-        h2m,
-        z2,
-        L1.PATCH_SIZE,
-        border_mask=bm_t,
-        patch_overlap=L1.PATCH_OVERLAP,
-        border_patch_max_frac=L1.BORDER_PATCH_MAX_FRAC,
-        eps=L1.EPS,
-        device=device,
-        verbose=False,
-        kappa_vm=model.seed.kappa_vm.detach(),
-        num_orient_bins=int(L1.NUM_ORIENT_BINS),
-    )
-    rho_coarse = None
-    if model.seed.scales:
-        with torch.no_grad():
-            rho_coarse = coarse_rho_bins(
-                ir_t, H0, W0, cells["nH"], cells["nW"], model.seed.scales,
-                model.l0_metric, device, notch=getattr(model, "l0_notch", None),
-                kappa_vm=model.seed.kappa_vm,
-            )
-    del h2m, z1, z2, bm_t, ir_t
-    cells["is_border"] |= (cells["cy"] + cells["P"] / 2 > H0) | (
-        cells["cx"] + cells["P"] / 2 > W0
-    )
-
-    nH, nW = cells["nH"], cells["nW"]
-    proj = compute_render_features(z2_img, ir_p, cells, bm_np, eps=SEED.EPS)
-    del z2_img, bm_np
-
     Hp, Wp = ir_p.shape[:2]
-    cells_flat = build_cells_flat(cells)
-    if rho_coarse is not None:
-        cells_flat["rho_bin_coarse"] = rho_coarse
-    del cells, ir_p
+    notch = getattr(model, "l0_notch", None)
 
-    cf_dev = {
-        k: (v.to(device) if isinstance(v, torch.Tensor) else v)
-        for k, v in cells_flat.items()
-    }
-    l0_dev = {k: v.to(device) for k, v in l0_pix.items()}
-    proj_dev = proj_to_device(proj, device)
-
+    # The path training takes in prepare_batch: everything stays on the device until the maps
+    # are final.
     with torch.no_grad():
+        ir_t = torch.from_numpy(ir_p).to(device)
+        bm_t = ~compute_interior(Hp, Wp, device)
+        l0_dev = build_l0_pix_live(ir_t, bm_t, model.l0_metric, device, notch=notch)
+        cf_dev = run_moments_cells_flat(
+            l0_dev, bm_t, H0, W0, device, kappa_vm=model.seed.kappa_vm,
+        )
+        if model.seed.scales:
+            cf_dev["rho_bin_coarse"] = coarse_rho_bins(
+                ir_t, H0, W0, cf_dev["nH"], cf_dev["nW"], model.seed.scales,
+                model.l0_metric, device, notch=notch, kappa_vm=model.seed.kappa_vm,
+            )
+        proj_dev = proj_info_from_grid(Hp, Wp, L1.PATCH_SIZE, L1.PATCH_OVERLAP)
+
         rho_out, branch, _, _, _, cf_out, _ = model.seed(cells_flat=cf_dev)
         bmap_t, theta_t = render_boundary_map_torch(
             rho_out,
@@ -194,10 +143,14 @@ def run_image_inference(
             p_geom = os.path.join(diagnostics_dir, f"{stem}_geometry.png")
             viz_infer_geometry(rho_coll, sur, is_b, p_geom)
 
-    bmap = bmap_t.cpu().numpy()[:H0, :W0]
-    theta = theta_t.cpu().numpy()[:H0, :W0]
-    del cf_dev, proj_dev, rho_out, branch, bmap_t, theta_t, cf_out
-    return bmap, theta, H0, W0
+        bmap_t, theta_t = bmap_t[:H0, :W0], theta_t[:H0, :W0]
+        # On a GPU, thin before copying the maps to the host. The CPU keeps the NumPy NMS.
+        nms_t = None if device.type == "cpu" else ridge_nms_torch(bmap_t, theta_t)
+
+    bmap = bmap_t.cpu().numpy()
+    theta = theta_t.cpu().numpy()
+    bmap_nms = ridge_nms(bmap, theta=theta) if nms_t is None else nms_t.cpu().numpy()
+    return bmap, bmap_nms, theta, H0, W0
 
 
 def main():
@@ -323,14 +276,13 @@ def main():
     ) as pool:
         for idx, (stem, img_path, gt_path) in enumerate(pairs):
             t0 = time.perf_counter()
-            bmap_c, theta, H0, W0 = run_image_inference(
+            bmap_c, bmap_s, theta, H0, W0 = run_image_inference(
                 model,
                 img_path,
                 device,
                 diagnostics_dir=diag_dir,
                 stem=stem if diag_dir else None,
             )
-            bmap_s = ridge_nms(bmap_c, theta=theta)
             dt = time.perf_counter() - t0
             gts = _load_gt(gt_path, gt_format)
 

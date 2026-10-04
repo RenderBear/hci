@@ -752,6 +752,32 @@ def ridge_nms(mag, *, theta=None, grad_norm_floor=1e-7):
     return np.where(keep, m_work, 0.0).astype(np.float32)
 
 
+def ridge_nms_torch(mag: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+    """ridge_nms with a given theta, on the tensors' device.
+
+    The two look-ups along the normal are bilinear with edge clamping, as map_coordinates does
+    with mode="nearest", but in float32, so a few pixels on the keep/drop boundary can differ.
+    """
+    H, W = mag.shape
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=mag.device, dtype=mag.dtype),
+        torch.arange(W, device=mag.device, dtype=mag.dtype),
+        indexing="ij",
+    )
+    nx, ny = torch.cos(theta), -torch.sin(theta)
+
+    def sample(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        grid = torch.stack(
+            [x / max(W - 1, 1) * 2.0 - 1.0, y / max(H - 1, 1) * 2.0 - 1.0], dim=-1,
+        ).unsqueeze(0)
+        return F.grid_sample(
+            mag[None, None], grid, mode="bilinear", padding_mode="border", align_corners=True,
+        )[0, 0]
+
+    keep = (mag >= sample(yy + ny, xx + nx)) & (mag >= sample(yy - ny, xx - nx))
+    return torch.where(keep, mag, torch.zeros_like(mag))
+
+
 def ridge_nms_binary(mag, threshold, *, theta=None, grad_norm_floor=1e-7):
     return (
         ridge_nms(mag, theta=theta, grad_norm_floor=grad_norm_floor) >= threshold

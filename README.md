@@ -38,9 +38,9 @@ Speed and memory, measured on MPS (Apple M4) with `baselines/speed.py`.
 
 | Resolution | Time | Host memory | GPU memory |
 | --- | --- | --- | --- |
-| 481×321 | 104 ms | 170 MB | 1.2 GB |
-| 1280×720 | 284 ms | 271 MB | 1.2 GB |
-| 1920×1080 | 637 ms | 402 MB | 3.4 GB |
+| 481×321 | 80 ms | 157 MB | 1.2 GB |
+| 1280×720 | 231 ms | 213 MB | 1.2 GB |
+| 1920×1080 | 546 ms | 280 MB | 3.3 GB |
 
 ## Structure
 
