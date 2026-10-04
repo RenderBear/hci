@@ -165,7 +165,15 @@ Trains on BRIND in `data/train` by default:
 uv run train
 ```
 
-Main flags: `--train_imgs`, `--train_gt`, `--gt_format` (`png` / `mat`; auto-detected from the GT folder if omitted), `--epochs`, `--lr` (default `5e-2`), `--batch_size`, `-n` (cap the number of images), `--device`, `--output_dir`, `--checkpoints_dir`, `--cache_dir`, `--num_workers`, `--grad_clip`, `--gt_min_agreement`. `--debug-seed` runs one batch and prints the seed's parameters and gradients.
+Main flags: `--train_imgs`, `--train_gt`, `--gt_format` (`png` / `mat`; auto-detected from the GT folder if omitted), `--epochs` (default `20`), `--lr` (default `5e-2`), `--batch_size`, `-n` (cap the number of images), `--device`, `--output_dir`, `--checkpoints_dir`, `--cache_dir`, `--num_workers`, `--grad_clip`, `--gt_min_agreement`, `--resume`. `--debug-seed` runs one batch and prints the seed's parameters and gradients.
+
+Each epoch overwrites `intermediate.pt` in `--checkpoints_dir` with the weights, optimizer state, epoch number and loss history. To continue an interrupted run, repeat the command with `--resume`:
+
+```bash
+uv run train --resume
+```
+
+`--resume` reads `intermediate.pt` from `--checkpoints_dir`; pass a path (`--resume other.pt`) to use another checkpoint. Training picks up at the next epoch and runs to `--epochs`, with the learning rate taken from the cosine schedule for the current `--lr` and `--epochs`. A checkpoint that holds only weights, such as `final.pt`, is used as the starting point for a full run from epoch 1.
 
 Training also uses coarser scales. `SEED.SCALES` in `params.py` lists the pooling factors, `(2, 4)` by default, and training learns one gain per scale. Set it to `()` to train at full resolution only. A checkpoint records the scales it was trained with, so `test` and `infer` follow whichever checkpoint they load.
 
